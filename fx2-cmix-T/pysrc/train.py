@@ -12,6 +12,9 @@ from pysrc.data import CollatedArticlesDataLoader
 from pysrc.model import InitializeScales
 from pysrc.optimizer import make_optimizers, OptimizerConfig
 from pysrc.logger import Logger, LoggerConfig
+from pysrc.cmix_loss import CmixMixtureLoss, MixtureLossConfig
+import os
+import torch
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +24,9 @@ class TrainingConfig:
     optimizer_config: OptimizerConfig
     window_size_schedule: Callable[[float], int | Int[Tensor, ""]] | None
     logger_config: LoggerConfig
+    # train against cmix (pysrc/cmix_loss.py) instead of plain cross-entropy;
+    # the data loader must then have a cmix_bits_filename
+    mixture_loss: MixtureLossConfig | None = None
 
 
 def train(
@@ -28,9 +34,23 @@ def train(
     model: DDP | Transformer,
     data: CollatedArticlesDataLoader,
     cfg: TrainingConfig,
-) -> None:
+) -> CmixMixtureLoss | None:
+    """returns the trained stand-in mixer when cfg.mixture_loss is set"""
     model.train()
     optimizers = make_optimizers(raw_model, cfg.optimizer_config)
+
+    mixture: CmixMixtureLoss | None = None
+    mixer_optimizer: torch.optim.AdamW | None = None
+    if cfg.mixture_loss is not None:
+        assert data.cmix_bits_filename is not None, (
+            "the mixture loss needs the data loader's cmix_bits_filename"
+        )
+        mixture = CmixMixtureLoss(cfg.mixture_loss).to(data.device)
+        mixer_optimizer = torch.optim.AdamW(
+            mixture.parameters(),
+            lr=cfg.mixture_loss.mixer_learning_rate,
+            weight_decay=0.0,
+        )
 
     initialize_scales(raw_model=raw_model, model=model, data=data, cfg=cfg)
 
@@ -61,14 +81,31 @@ def train(
         total_step_unmasked_tokens: Int[Tensor, ""] = 0  # type: ignore
         total_step_tokens: int = 0
         for micro_batch in batch.micro_batches:
-            loss = model(
-                input_tokens=micro_batch.input_tokens,
-                priors=micro_batch.priors,
-                loss_mask=micro_batch.loss_mask,
-                output_tokens=micro_batch.output_tokens,
-                cumulative_sequence_lengths=micro_batch.cumulative_sequence_lengths,
-                override_window_size=window_size,
-            )
+            if mixture is None:
+                loss = model(
+                    input_tokens=micro_batch.input_tokens,
+                    priors=micro_batch.priors,
+                    loss_mask=micro_batch.loss_mask,
+                    output_tokens=micro_batch.output_tokens,
+                    cumulative_sequence_lengths=micro_batch.cumulative_sequence_lengths,
+                    override_window_size=window_size,
+                )
+            else:
+                logits = model(
+                    input_tokens=micro_batch.input_tokens,
+                    priors=micro_batch.priors,
+                    loss_mask=micro_batch.loss_mask,
+                    output_tokens=micro_batch.output_tokens,
+                    cumulative_sequence_lengths=micro_batch.cumulative_sequence_lengths,
+                    override_window_size=window_size,
+                    return_logits=True,
+                )
+                loss = mixture(
+                    logits,
+                    micro_batch.output_tokens,
+                    micro_batch.cmix_bit_logits,
+                    micro_batch.loss_mask,
+                )
             total_step_loss += loss.detach()
             total_step_unmasked_tokens += micro_batch.loss_mask.long().sum()
             loss = loss / data.gradient_accumulation_steps
@@ -77,6 +114,26 @@ def train(
 
         optimizers.step()
         optimizers.zero_grad()
+        if mixture is not None:
+            # the mixer is outside DDP: average its gradients by hand so all
+            # ranks keep identical mixer weights
+            if dist.is_initialized():
+                for p in mixture.parameters():
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            mixer_optimizer.step()
+            mixer_optimizer.zero_grad()
+
+        # end of an epoch: keep a checkpoint so a late failure does not lose
+        # the whole run (CHECKPOINT_PREFIX, e.g. models/6m-q4-A)
+        checkpoint_prefix: str | None = os.environ.get("CHECKPOINT_PREFIX")
+        if (
+            checkpoint_prefix
+            and float(batch.epoch).is_integer()
+            and (not dist.is_initialized() or dist.get_rank() == 0)
+        ):
+            torch.save(raw_model.state_dict(), f"{checkpoint_prefix}.epoch.tch")
+            if mixture is not None:
+                torch.save(mixture.state_dict(), f"{checkpoint_prefix}.epoch.mixer.tch")
 
         logger.train_step(
             epoch=batch.epoch,
@@ -85,6 +142,7 @@ def train(
             learning_rates=learning_rates,
             last_step=batch.is_last,
         )
+    return mixture
 
 
 @inference_mode()

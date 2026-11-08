@@ -5,6 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 
 namespace fx2 {
 namespace opt {
@@ -187,21 +192,318 @@ inline void run_g4_768(const QDense& m, const uint8_t* act, Epi& epi) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// AVX-VNNI variants (vpdpbusd: u8 x s8 -> int32, accumulated). Bit-identical
+// to the vpmaddubsw kernels above: the activations/weights and therefore the
+// exact int32 dot products are the same (the AVX2 path never saturates, see
+// qmat.h), only the partition of the integer sum differs. Selected at run
+// time when the CPU supports AVX-VNNI; CMIX_NO_VNNI=1 forces the AVX2 path.
+// ---------------------------------------------------------------------------
+bool detect_vnni() {
+  if (const char* e = std::getenv("CMIX_NO_VNNI"))
+    if (*e && *e != '0') return false;
+#ifdef _MSC_VER
+  int r[4];
+  __cpuidex(r, 0, 0);
+  if (r[0] < 7) return false;
+  __cpuidex(r, 7, 1);
+  return (r[0] >> 4) & 1;
+#else
+  unsigned a, b, c, d;
+  if (!__get_cpuid_count(7, 1, &a, &b, &c, &d)) return false;
+  return (a >> 4) & 1;
+#endif
+}
+const bool g_vnni = detect_vnni();
+
+// AVX512-VNNI (Ice Lake / Tiger Lake, e.g. the contest's i7-1165G7): the same
+// vpdpbusd on ymm registers in its EVEX encoding (needs AVX512VL), for CPUs
+// without the VEX-encoded AVX-VNNI. CMIX_NO_VNNI=1 disables it as well.
+bool detect_vnni512() {
+  if (const char* e = std::getenv("CMIX_NO_VNNI"))
+    if (*e && *e != '0') return false;
+#ifdef _MSC_VER
+  int r[4];
+  __cpuidex(r, 0, 0);
+  if (r[0] < 7) return false;
+  __cpuidex(r, 1, 0);
+  if (!((r[2] >> 27) & 1)) return false;  // OSXSAVE
+  __cpuidex(r, 7, 0);
+  const unsigned b = r[1], c = r[2];
+#else
+  unsigned a, b0, c0, d;
+  if (!__get_cpuid(1, &a, &b0, &c0, &d) || !((c0 >> 27) & 1)) return false;
+  unsigned b, c;
+  if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+#endif
+  const bool f = (b >> 16) & 1;    // AVX512F
+  const bool vl = (b >> 31) & 1;   // AVX512VL
+  const bool vnni = (c >> 11) & 1; // AVX512_VNNI
+  if (!(f && vl && vnni)) return false;
+  // XCR0: SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM state enabled by the OS
+  const unsigned long long xcr0 = _xgetbv(0);
+  return (xcr0 & 0xE6) == 0xE6;
+}
+const bool g_vnni512 = !g_vnni && detect_vnni512();
+
+template <int NC, int PFN, class Epi>
+__attribute__((target("avxvnni"), noinline)) void run_g8_vnni(
+    const QDense& m, const uint8_t* act, Epi& epi) {
+  const uint8_t* gp = m.arena;
+  constexpr ptrdiff_t GB = 64 + NC * 256;
+  const int ng = m.ngroups;
+  for (int g = 0; g < ng; g++, gp += GB) {
+    const __m256i* w = reinterpret_cast<const __m256i*>(gp + 64);
+    const __m256i z = _mm256_setzero_si256();
+    __m256i av = _mm256_load_si256(reinterpret_cast<const __m256i*>(act));
+    __m256i s0 = _mm256_dpbusd_avx_epi32(z, av, w[0]);
+    __m256i s1 = _mm256_dpbusd_avx_epi32(z, av, w[1]);
+    __m256i s2 = _mm256_dpbusd_avx_epi32(z, av, w[2]);
+    __m256i s3 = _mm256_dpbusd_avx_epi32(z, av, w[3]);
+    __m256i s4 = _mm256_dpbusd_avx_epi32(z, av, w[4]);
+    __m256i s5 = _mm256_dpbusd_avx_epi32(z, av, w[5]);
+    __m256i s6 = _mm256_dpbusd_avx_epi32(z, av, w[6]);
+    __m256i s7 = _mm256_dpbusd_avx_epi32(z, av, w[7]);
+    for (int k = 0; k < PFN; k++)
+      _mm_prefetch(reinterpret_cast<const char*>(gp) + 2048 + 64 * k,
+                   _MM_HINT_T0);
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#endif
+    for (int c = 1; c < NC; c++) {
+      const __m256i* wc = w + c * 8;
+      for (int k = 0; k < PFN; k++)
+        _mm_prefetch(reinterpret_cast<const char*>(gp) + c * 256 + 2048 +
+                         64 * k,
+                     _MM_HINT_T0);
+      av = _mm256_load_si256(reinterpret_cast<const __m256i*>(act + 32 * c));
+      s0 = _mm256_dpbusd_avx_epi32(s0, av, wc[0]);
+      s1 = _mm256_dpbusd_avx_epi32(s1, av, wc[1]);
+      s2 = _mm256_dpbusd_avx_epi32(s2, av, wc[2]);
+      s3 = _mm256_dpbusd_avx_epi32(s3, av, wc[3]);
+      s4 = _mm256_dpbusd_avx_epi32(s4, av, wc[4]);
+      s5 = _mm256_dpbusd_avx_epi32(s5, av, wc[5]);
+      s6 = _mm256_dpbusd_avx_epi32(s6, av, wc[6]);
+      s7 = _mm256_dpbusd_avx_epi32(s7, av, wc[7]);
+    }
+    __m256i p01 = _mm256_hadd_epi32(s0, s1);
+    __m256i p23 = _mm256_hadd_epi32(s2, s3);
+    __m256i p45 = _mm256_hadd_epi32(s4, s5);
+    __m256i p67 = _mm256_hadd_epi32(s6, s7);
+    __m256i q0 = _mm256_hadd_epi32(p01, p23);
+    __m256i q1 = _mm256_hadd_epi32(p45, p67);
+    __m256i sums = _mm256_add_epi32(_mm256_permute2x128_si256(q0, q1, 0x20),
+                                    _mm256_permute2x128_si256(q0, q1, 0x31));
+    sums = _mm256_sub_epi32(
+        sums, _mm256_load_si256(reinterpret_cast<const __m256i*>(gp)));
+    epi(g, sums, reinterpret_cast<const float*>(gp + 32));
+  }
+}
+
+template <int PFN, class Epi>
+__attribute__((target("avxvnni"), noinline)) void run_g4_768_vnni(
+    const QDense& m, const uint8_t* act, Epi& epi) {
+  const uint8_t* gp = m.arena;
+  constexpr ptrdiff_t GB = 32 + 24 * 128;
+  const int ng = m.ngroups;
+  for (int g = 0; g < ng; g++, gp += GB) {
+    const __m256i* w = reinterpret_cast<const __m256i*>(gp + 32);
+    __m256i d0 = _mm256_setzero_si256(), d1 = d0, d2 = d0, d3 = d0;
+    for (int c = 0; c < 24; c++) {
+      if (PFN) {
+        _mm_prefetch(reinterpret_cast<const char*>(w) + c * 128 + 2048,
+                     _MM_HINT_T0);
+        if (PFN > 1)
+          _mm_prefetch(reinterpret_cast<const char*>(w) + c * 128 + 2112,
+                       _MM_HINT_T0);
+      }
+      __m256i av = _mm256_load_si256(reinterpret_cast<const __m256i*>(act + 32 * c));
+      d0 = _mm256_dpbusd_avx_epi32(d0, av, w[c * 4 + 0]);
+      d1 = _mm256_dpbusd_avx_epi32(d1, av, w[c * 4 + 1]);
+      d2 = _mm256_dpbusd_avx_epi32(d2, av, w[c * 4 + 2]);
+      d3 = _mm256_dpbusd_avx_epi32(d3, av, w[c * 4 + 3]);
+    }
+    __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1),
+                                  _mm256_hadd_epi32(d2, d3));
+    __m128i sums = _mm_add_epi32(_mm256_castsi256_si128(h),
+                                 _mm256_extracti128_si256(h, 1));
+    sums = _mm_sub_epi32(
+        sums, _mm_load_si128(reinterpret_cast<const __m128i*>(gp)));
+    epi.g4(g, sums, reinterpret_cast<const float*>(gp + 16));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VNNI + packed nibbles (QDense::packed). Halves the weight bytes streamed per
+// token (the matmuls are L3-bandwidth-bound on recent Intel cores, where the
+// int8 dot units are no longer the limit). Weight vector j of a chunk holds
+// rows 2j / 2j+1 in the low / high nibbles as u = w+7 in [0,14]; vpdpbusd
+// takes u as its signed operand, so each dot is sum act*(w+7) =
+// sum act*w + 7*sum(act). The exact correction 7*sum(act) over the zero-padded
+// stride is subtracted with the row's corr: the int32 dots, and everything
+// after them, are bit-identical to the unpacked kernels.
+// CMIX_QMAT_UNPACKED=1 keeps the unpacked arenas (A/B comparison).
+// ---------------------------------------------------------------------------
+bool detect_packed() {
+  if (!g_vnni && !g_vnni512) return false;
+  if (const char* e = std::getenv("CMIX_QMAT_UNPACKED"))
+    if (*e && *e != '0') return false;
+  return true;
+}
+const bool g_packed = detect_packed();
+
+// 7 * sum of the n (multiple of 32) activation bytes
+inline int32_t act_corr7(const uint8_t* act, int n) {
+  __m256i acc = _mm256_setzero_si256();
+  const __m256i z = _mm256_setzero_si256();
+  for (int i = 0; i < n; i += 32)
+    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(act + i)), z));
+  __m128i t = _mm_add_epi64(_mm256_castsi256_si128(acc),
+                            _mm256_extracti128_si256(acc, 1));
+  t = _mm_add_epi64(t, _mm_unpackhi_epi64(t, t));
+  return 7 * static_cast<int32_t>(_mm_cvtsi128_si64(t));
+}
+
+// Weight-stream prefetch hint. CMIX_QMAT_PF_NTA=1: non-temporal (the streamed
+// weights then displace less of L2, where the KV caches and KDA states live).
+// A hint only: the results are identical either way.
+bool detect_pf_nta() {
+  const char* e = std::getenv("CMIX_QMAT_PF_NTA");
+  return e && *e && *e != '0';
+}
+const bool g_pf_nta = detect_pf_nta();
+inline void qm_pf(const char* p) {
+  if (g_pf_nta) _mm_prefetch(p, _MM_HINT_NTA);
+  else _mm_prefetch(p, _MM_HINT_T0);
+}
+
+#define QM_PACKED_KERNELS(SUF, TGT, DP) \
+template <int NC, int PFN, class Epi>                                             \
+__attribute__((target(TGT), noinline)) void run_g8_vnni4##SUF(                    \
+    const QDense& m, const uint8_t* act, Epi& epi) {                              \
+  const __m256i corr7 = _mm256_set1_epi32(act_corr7(act, NC * 32));               \
+  const __m256i m0F = _mm256_set1_epi8(0x0F);                                     \
+  const uint8_t* gp = m.arena;                                                    \
+  constexpr ptrdiff_t GB = 64 + NC * 128;                                         \
+  const int ng = m.ngroups;                                                       \
+  for (int g = 0; g < ng; g++, gp += GB) {                                        \
+    const __m256i* w = reinterpret_cast<const __m256i*>(gp + 64);                 \
+    __m256i s0 = _mm256_setzero_si256(), s1 = s0, s2 = s0, s3 = s0,               \
+            s4 = s0, s5 = s0, s6 = s0, s7 = s0;                                   \
+_Pragma("clang loop unroll(disable)")                                             \
+    for (int c = 0; c < NC; c++) {                                                \
+      const __m256i* wc = w + c * 4;                                              \
+      if (PFN) {                                                                  \
+        qm_pf(reinterpret_cast<const char*>(wc) + 2048);                          \
+        qm_pf(reinterpret_cast<const char*>(wc) + 2048 + 64);                     \
+      }                                                                           \
+      const __m256i av =                                                          \
+          _mm256_load_si256(reinterpret_cast<const __m256i*>(act + 32 * c));      \
+      { const __m256i wv = _mm256_load_si256(wc + 0);                             \
+        s0 = DP(s0, av, _mm256_and_si256(wv, m0F));                               \
+        s1 = DP(s1, av, _mm256_and_si256(_mm256_srli_epi16(wv, 4), m0F)); }       \
+      { const __m256i wv = _mm256_load_si256(wc + 1);                             \
+        s2 = DP(s2, av, _mm256_and_si256(wv, m0F));                               \
+        s3 = DP(s3, av, _mm256_and_si256(_mm256_srli_epi16(wv, 4), m0F)); }       \
+      { const __m256i wv = _mm256_load_si256(wc + 2);                             \
+        s4 = DP(s4, av, _mm256_and_si256(wv, m0F));                               \
+        s5 = DP(s5, av, _mm256_and_si256(_mm256_srli_epi16(wv, 4), m0F)); }       \
+      { const __m256i wv = _mm256_load_si256(wc + 3);                             \
+        s6 = DP(s6, av, _mm256_and_si256(wv, m0F));                               \
+        s7 = DP(s7, av, _mm256_and_si256(_mm256_srli_epi16(wv, 4), m0F)); }       \
+    }                                                                             \
+    __m256i p01 = _mm256_hadd_epi32(s0, s1);                                      \
+    __m256i p23 = _mm256_hadd_epi32(s2, s3);                                      \
+    __m256i p45 = _mm256_hadd_epi32(s4, s5);                                      \
+    __m256i p67 = _mm256_hadd_epi32(s6, s7);                                      \
+    __m256i q0 = _mm256_hadd_epi32(p01, p23);                                     \
+    __m256i q1 = _mm256_hadd_epi32(p45, p67);                                     \
+    __m256i sums = _mm256_add_epi32(_mm256_permute2x128_si256(q0, q1, 0x20),      \
+                                    _mm256_permute2x128_si256(q0, q1, 0x31));     \
+    sums = _mm256_sub_epi32(                                                      \
+        _mm256_sub_epi32(sums, corr7),                                            \
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(gp)));                 \
+    epi(g, sums, reinterpret_cast<const float*>(gp + 32));                        \
+  }                                                                               \
+}                                                                                 \
+                                                                                  \
+template <int PFN, class Epi>                                                     \
+__attribute__((target(TGT), noinline)) void run_g4_768_vnni4##SUF(                \
+    const QDense& m, const uint8_t* act, Epi& epi) {                              \
+  const __m128i corr7 = _mm_set1_epi32(act_corr7(act, 768));                      \
+  const __m256i m0F = _mm256_set1_epi8(0x0F);                                     \
+  const uint8_t* gp = m.arena;                                                    \
+  constexpr ptrdiff_t GB = 32 + 24 * 64;                                          \
+  const int ng = m.ngroups;                                                       \
+  for (int g = 0; g < ng; g++, gp += GB) {                                        \
+    const __m256i* w = reinterpret_cast<const __m256i*>(gp + 32);                 \
+    __m256i d0 = _mm256_setzero_si256(), d1 = d0, d2 = d0, d3 = d0;               \
+    for (int c = 0; c < 24; c++) {                                                \
+      if (PFN && (c & 1) == 0)                                                    \
+        qm_pf(reinterpret_cast<const char*>(w + c * 2) + 2048);                    \
+      const __m256i av =                                                          \
+          _mm256_load_si256(reinterpret_cast<const __m256i*>(act + 32 * c));      \
+      const __m256i w01 = _mm256_load_si256(w + c * 2);                           \
+      const __m256i w23 = _mm256_load_si256(w + c * 2 + 1);                       \
+      d0 = DP(d0, av, _mm256_and_si256(w01, m0F));                                \
+      d1 = DP(                                                                    \
+          d1, av, _mm256_and_si256(_mm256_srli_epi16(w01, 4), m0F));              \
+      d2 = DP(d2, av, _mm256_and_si256(w23, m0F));                                \
+      d3 = DP(                                                                    \
+          d3, av, _mm256_and_si256(_mm256_srli_epi16(w23, 4), m0F));              \
+    }                                                                             \
+    __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1),                      \
+                                  _mm256_hadd_epi32(d2, d3));                     \
+    __m128i sums = _mm_add_epi32(_mm256_castsi256_si128(h),                       \
+                                 _mm256_extracti128_si256(h, 1));                 \
+    sums = _mm_sub_epi32(                                                         \
+        _mm_sub_epi32(sums, corr7),                                               \
+        _mm_load_si128(reinterpret_cast<const __m128i*>(gp)));                    \
+    epi.g4(g, sums, reinterpret_cast<const float*>(gp + 16));                     \
+  }                                                                               \
+}
+
+QM_PACKED_KERNELS(, "avxvnni", _mm256_dpbusd_avx_epi32)
+// EVEX encoding on ymm: AVX512-VNNI + AVX512VL (no zmm registers are used)
+QM_PACKED_KERNELS(_512, "avx512vnni,avx512vl,avx512f", _mm256_dpbusd_epi32)
+#undef QM_PACKED_KERNELS
+
+template <int NC, int PFN, class Epi>
+inline void run_g8_any(const QDense& m, const uint8_t* act, Epi& epi) {
+  if (m.packed) {
+    if (g_vnni) run_g8_vnni4<NC, PFN>(m, act, epi);
+    else run_g8_vnni4_512<NC, PFN>(m, act, epi);
+  }
+  else if (g_vnni) run_g8_vnni<NC, PFN>(m, act, epi);
+  else run_g8<NC, PFN>(m, act, epi);
+}
+
+template <int PFN, class Epi>
+inline void run_g4_768_any(const QDense& m, const uint8_t* act, Epi& epi) {
+  if (m.packed) {
+    if (g_vnni) run_g4_768_vnni4<PFN>(m, act, epi);
+    else run_g4_768_vnni4_512<PFN>(m, act, epi);
+  }
+  else if (g_vnni) run_g4_768_vnni<PFN>(m, act, epi);
+  else run_g4_768<PFN>(m, act, epi);
+}
+
 template <int PFN, class Epi>
 inline void dispatch(const QDense& m, const uint8_t* act, Epi& epi) {
   switch (m.d_in) {
     case 64:
-      run_g8<2, PFN>(m, act, epi);
+      run_g8_any<2, PFN>(m, act, epi);
       break;
     case 192:
-      run_g8<6, PFN>(m, act, epi);
+      run_g8_any<6, PFN>(m, act, epi);
       break;
     case 205:
     case 224:
-      run_g8<7, PFN>(m, act, epi);
+      run_g8_any<7, PFN>(m, act, epi);
       break;
     case 768:
-      run_g4_768<(PFN > 0 ? 2 : 0)>(m, act, epi);
+      run_g4_768_any<(PFN > 0 ? 2 : 0)>(m, act, epi);
       break;
     default:
       die("unsupported d_in");
@@ -317,7 +619,7 @@ int qgemv_relu2q(const QDense& m, const uint8_t* act, float s_next,
   if (m.rows_padded > 768) die("relu2q epilogue requires d_out<=768");
   alignas(64) float y[768];
   EpiF32 e{y};
-  run_g8<6, PFN_DEFAULT>(m, act, e);
+  run_g8_any<6, PFN_DEFAULT>(m, act, e);
   // phase 2a: relu^2 + quantize, two groups (16 outputs) per iteration
   const __m256 vs = _mm256_set1_ps(s_next);
   const __m256 v127 = _mm256_set1_ps(127.0f);
@@ -377,7 +679,7 @@ void qgemv_quant_bias(const QDense& m, const uint8_t* act, float s_next,
   if (m.rows_padded > 768) die("quant_bias epilogue requires d_out<=768");
   alignas(64) float y[768];
   EpiF32 e{y};
-  run_g8<6, PFN_DEFAULT>(m, act, e);
+  run_g8_any<6, PFN_DEFAULT>(m, act, e);
   const __m256 vs = _mm256_set1_ps(s_next);
   const __m256 vlo = _mm256_set1_ps(-128.0f);
   const __m256 vhi = _mm256_set1_ps(127.0f);
@@ -417,7 +719,8 @@ size_t qdense_bytes(int d_out, int d_in) {
   const int gr = qmat_group_rows(d_in);
   const int stride = qmat_round_up(d_in, 32);
   const int ng = qmat_round_up(d_out, gr) / gr;
-  const size_t gb = (gr == 8 ? 64 : 32) + static_cast<size_t>(stride) * gr;
+  const size_t gb = (gr == 8 ? 64 : 32) +
+                    static_cast<size_t>(stride) * gr / (g_packed ? 2 : 1);
   return static_cast<size_t>(ng) * gb;
 }
 
@@ -434,9 +737,11 @@ QDense qdense_build(uint8_t* dst, const int8_t* qw, const float* fold,
   m.rows_padded = qmat_round_up(d_out, m.group_rows);
   m.ngroups = m.rows_padded / m.group_rows;
   m.bytes = qdense_bytes(d_out, d_in);
+  m.packed = g_packed;
   const int G = m.group_rows;
   const size_t meta = G == 8 ? 64 : 32;
-  const size_t gb = meta + static_cast<size_t>(m.stride) * G;
+  const size_t gb =
+      meta + static_cast<size_t>(m.stride) * G / (m.packed ? 2 : 1);
   for (int g = 0; g < m.ngroups; g++) {
     uint8_t* gp = dst + g * gb;
     int32_t* corr = reinterpret_cast<int32_t*>(gp);
@@ -448,6 +753,23 @@ QDense qdense_build(uint8_t* dst, const int8_t* qw, const float* fold,
         for (int i = 0; i < d_in; i++) s += qw[static_cast<size_t>(row) * d_in + i];
       corr[r] = 128 * s;
       scl[r] = row < d_out ? fold[row] : 0.0f;
+    }
+    if (m.packed) {
+      auto wt = [&](int row, int col) -> int {
+        if (row >= d_out || col >= d_in) return 0;
+        const int v = qw[static_cast<size_t>(row) * d_in + col];
+        if (v < -7 || v > 7) die("weight out of [-7,7]");
+        return v;
+      };
+      uint8_t* wp = gp + meta;
+      for (int c = 0; c < m.nchunk; c++)
+        for (int j = 0; j < G / 2; j++) {
+          const int r0 = g * G + 2 * j;
+          for (int b = 0; b < 32; b++)
+            *wp++ = static_cast<uint8_t>(((wt(r0 + 1, 32 * c + b) + 7) << 4) |
+                                         (wt(r0, 32 * c + b) + 7));
+        }
+      continue;
     }
     int8_t* w = reinterpret_cast<int8_t*>(gp + meta);
     for (int c = 0; c < m.nchunk; c++)

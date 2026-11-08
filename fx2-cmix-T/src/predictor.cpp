@@ -1,4 +1,13 @@
 #include "predictor.h"
+#include "prof.h"
+#include "tune.h"
+#ifdef CMIX_PROFILE
+namespace {
+long g_tf_steps = 0;
+void TfProfReport() { fx2::opt::prof_print(1.0, g_tf_steps); }
+struct TfProfRegistrar { TfProfRegistrar() { atexit(TfProfReport); } } g_tf_prof_registrar;
+}
+#endif
 #include <vector>
 #include <stdlib.h>
 #include <stdio.h>
@@ -6,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <immintrin.h>
+#include "../cpp_infer/src/opt/vec_math.h"
 #ifdef __F16C__
 #include <immintrin.h>
 #endif
@@ -221,17 +232,47 @@ Predictor::Predictor(const std::vector<bool>& vocab,
     // The loss of the loaded distributions is the transformer's loss.
     print_transformer_loss_ = true;
   }
+  neutral_transformer_ = options.neutral_transformer;
+  if (neutral_transformer_) uniform_probs_.assign(vocab_size_, 1.0f);
+  if (!options.save_cmix_bits.empty()) {
+    cmix_bits_writer_.reset(new HalfFileWriter(options.save_cmix_bits));
+  }
   if (!options.transformer_weights.empty() && !ppmd_only_ &&
-      !transformer_probs_reader_) {
+      !transformer_probs_reader_ && !neutral_transformer_) {
     if (vocab_size_ != 205) {
       Fail("the transformer was trained on the enwik9 vocabulary of 205 "
           "bytes, but this input has a vocabulary of %u bytes", vocab_size_);
     }
     transformer_.reset(new fx2::opt::TransformerOpt(
-        options.transformer_weights.c_str(), fx2::opt::AttnKind::KVI8));
+        options.transformer_weights.c_str(),
+        tune::Get("attn_f32", 0) ? fx2::opt::AttnKind::KVF32 : fx2::opt::AttnKind::KVI8));
     half_scratch_.resize(vocab_size_);
     transformer_probs_.resize(vocab_size_);
     print_transformer_loss_ = true;
+    dyn_lr_ = tune::Get("dyn_lr", 3e-4);
+    dyn_blr_ = tune::Get("dyn_blr", 0);
+    dyn_decay_ = tune::Get("dyn_decay", 0);
+    dyn_mode_ = (int)tune::Get("dyn_mode", 1);
+    dyn_l1_ = tune::Get("dyn_l1", 1) != 0;
+    dyn_fx_ = tune::Get("dyn_fx", 0) != 0;
+    dyn2_lr_ = tune::Get("dyn2_lr", 0);
+    dyn2_layers_ = (uint32_t)tune::Get("dyn2_layers", 2048);
+    if (dyn2_lr_ != 0) {
+      transformer_->set_capture_layers(dyn2_layers_);
+      dyn2_W_.assign((size_t)12 * 768 * kDynPad, 0.0f);
+      dyn2_row_.reserve(12 * 768);
+      dyn2_f_.reserve(12 * 768);
+    }
+    if (dyn_lr_ != 0 || dyn_blr_ != 0 || dyn2_lr_ != 0) {
+      dyn_g_.assign(kDynPad, 0.0f);
+      dyn_W_.assign((size_t)vocab_size_ * kDynHidden, 0.0f);
+      dyn_b_.assign(vocab_size_, 0.0f);
+      dyn_h_.assign(kDynHidden, 0.0f);
+      dyn_hp_.assign(kDynHidden, 0.0f);
+      dyn_s_.assign(vocab_size_, 0.0f);
+      dyn_q_.assign(kDynPad, 0.0f);
+      dyn_z_.assign(kDynPad, 0.0f);
+    }
     if (!options.save_transformer_probs.empty()) {
       transformer_probs_writer_.reset(
           new HalfFileWriter(options.save_transformer_probs));
@@ -273,11 +314,15 @@ unsigned long long Predictor::GetNumModels() {
   num += 1;  // ppmd byte model (a constant input with
              // --load-transformer-probs)
   num += byte_mixer_->NumOutputs();
+  if (dyn_mixer_) num += dyn_mixer_->NumOutputs();
   return num;
 }
 
 void Predictor::AddMixer(int layer, const unsigned long long& context,
     float learning_rate) {
+  learning_rate = tune::Get("lr" + std::to_string(layer) + "_" +
+      std::to_string(layer == 0 ? mixer_0_.size() : mixer_1_.size()),
+      learning_rate);
   if (layer == 0) {
     mixer_0_.emplace_back(
         layers_[layer].Inputs(), layers_[layer].ExtraInputs(), context,
@@ -299,7 +344,7 @@ void Predictor::AddBracket() {
 }
 
 void Predictor::AddPPMD() {
-  byte_model_.emplace(25, 14000, manager_.bit_context_, vocab_);
+  byte_model_.emplace(25, (int)tune::Get("ppmd_mb", 14000), manager_.bit_context_, vocab_);
 }
 
 void Predictor::AddWord() {
@@ -379,12 +424,16 @@ void Predictor::AddMixers() {
   // allocated. Nothing after this point draws from rand(), so skipping the
   // lstm's initialization does not shift any other model's random state.
   byte_mixer_.emplace(1, manager_.bit_context_, vocab_,
-      vocab_size, transformer_ ? nullptr :
+      vocab_size, (transformer_ || neutral_transformer_) ? nullptr :
       new Lstm(vocab_size, vocab_size, 200, 1, 128, 0.03, 10));
+  if (!dyn_W_.empty() && dyn_mode_ == 1) {
+    dyn_mixer_.emplace(1, manager_.bit_context_, vocab_, vocab_size, nullptr);
+    dyn_scratch_.assign(vocab_size, 1.0f);
+  }
 
   for (int i = 0; i < 2; ++i) {
     layers_.emplace_back(sigmoid_,
-        1.0e-4);
+        tune::Get("input_eps", 5.0e-5));
   }
 
   unsigned long long input_size = GetNumModels();
@@ -414,13 +463,22 @@ void Predictor::AddMixers() {
   AddMixer(0, manager_.mx16, 0.005);
   AddMixer(0, manager_.mx14, 0.005);
   AddMixer(0, manager_.mx15, 0.005);
+  tf_mixer_buckets_ = (int)tune::Get("tf_mixer_buckets", 0);
+  tf_mixer_mode_ = (int)tune::Get("tf_mixer_mode", 0);
+  if (tf_mixer_buckets_ > 0 && tune::Get("tf_mixer_l0", 1)) {
+    AddMixer(0, tf_ctx_, tune::Get("tf_mixer_lr", 0.002));
+  }
 
-  input_size = mixer_0_.size() + auxiliary_size_;
+  input_size = mixer_0_.size() + auxiliary_size_ + (dyn_mixer_ && dyn_l1_ ? 1 : 0);
   layers_[1].SetNumModels(input_size);
 
-  AddMixer(1,manager_.zero_context_, 0.0003);
+  // l1_ctx 1: the final mixer selects its weights by the transformer
+  // confidence context (needs tf_mixer_buckets > 0)
+  AddMixer(1, tune::Get("l1_ctx", 0) ? tf_ctx_ : manager_.zero_context_, 0.00015);
 
   layers_[0].SetExtraInputSize(mixer_0_.size());
+  prefetch_mixers_ = tune::Get("prefetch_mixers", 1) != 0;
+  tune::CheckAllUsed();
 
 }
 int lstmpr=0, lstmex=0;
@@ -433,9 +491,11 @@ float Predictor::Predict() {
     if (p > 0.999f) p = 0.999f;
     return p;
   }
+  PROF_BEGIN();
   unsigned int input_index = 0;
   auto bracket_model_output = bracket_model_->Predict()[0];
   layers_[0].SetInput(input_index++, bracket_model_output);
+  PROF_MARK(bracket_pred);
 
   const auto& fxcm_model_outputs = fxcm_model_->Predict();
   for (unsigned int j = 0; j < fxcm_model_outputs.size(); ++j) {
@@ -443,6 +503,7 @@ float Predictor::Predict() {
     ++input_index;
   }
   auto fxcm_model_index = input_index - 1;
+  PROF_MARK(fxcm_pred);
   
 
   for (unsigned int i = 0; i < direct_models_.size(); ++i) {
@@ -453,6 +514,7 @@ float Predictor::Predict() {
     }
   }
 
+  PROF_MARK(direct_pred);
   for (unsigned int i = 0; i < match_models_.size(); ++i) {
     const std::valarray<float>& outputs = match_models_[i].Predict();
     for (unsigned int j = 0; j < outputs.size(); ++j) {
@@ -461,6 +523,7 @@ float Predictor::Predict() {
     }
   }
  
+  PROF_MARK(match_pred);
   for (unsigned int i = 0; i < indirect_ns_models_.size(); ++i) {
     const std::valarray<float>& outputs = indirect_ns_models_[i].Predict();
     for (unsigned int j = 0; j < outputs.size(); ++j) {
@@ -469,6 +532,7 @@ float Predictor::Predict() {
     }
   }
  
+  PROF_MARK(indirect_pred);
  for (unsigned int i = 0; i < indirect_r_models_.size(); ++i) {
     const std::valarray<float>& outputs = indirect_r_models_[i].Predict();
     for (unsigned int j = 0; j < outputs.size(); ++j) {
@@ -476,14 +540,17 @@ float Predictor::Predict() {
       ++input_index;
     }
   }
+  PROF_MARK(indirect_r_pred);
   layers_[0].SetInput(input_index++,
       byte_model_ ? byte_model_->Predict()[0] : 0.5f);
+  PROF_MARK(ppmd_pred);
 
   float byte_mixer_override = -1;
 
   if (byte_mixer_output == 0 || byte_mixer_output == 1) byte_mixer_override = byte_mixer_output;
   layers_[0].SetInput(input_index++, byte_mixer_output);
   auto byte_mixer_index = input_index - 1;
+  if (dyn_mixer_) layers_[0].SetInput(input_index++, dyn_output_);
 
   float auxiliary_average = Sigmoid::Logistic(layers_[0].Inputs()[fxcm_model_index]) + Sigmoid::Logistic(layers_[0].Inputs()[byte_mixer_index]);
   auxiliary_average /= auxiliary_size_;
@@ -494,15 +561,20 @@ float Predictor::Predict() {
     layers_[0].SetExtraInput(i, p);
     layers_[1].SetStretchedInput(i, p);
   }
+  PROF_MARK(mixer0_mix);
   layers_[1].SetStretchedInput(mixer_0_.size(), layers_[0].Inputs()[fxcm_model_index]);
   layers_[1].SetStretchedInput(mixer_0_.size() + 1, layers_[0].Inputs()[byte_mixer_index]);
+  if (dyn_mixer_ && dyn_l1_)
+    layers_[1].SetStretchedInput(mixer_0_.size() + 2, layers_[0].Inputs()[byte_mixer_index + 1]);
 
   float p = Sigmoid::Logistic(mixer_1_[0].Mix());
+  PROF_MARK(mixer1_mix);
   p = sse_.Predict(p);
+  PROF_MARK(sse_pred);
   if (byte_mixer_override >= 0) {
-    return byte_mixer_override;
+    return last_pred_ = byte_mixer_override;
   }
-  return p;
+  return last_pred_ = p;
 }
 
 void Predictor::WritePpmdProbs() {
@@ -555,6 +627,7 @@ void Predictor::TransformerByteUpdate() {
     Fail("transformer: byte 0x%02x is not in the vocabulary",
         manager_.bit_context_);
   }
+  if (dyn_valid_) DynLearn(token);
   memmove(separator_window_, separator_window_ + 1,
       sizeof(separator_window_) - 1);
   separator_window_[sizeof(separator_window_) - 1] = (unsigned char)token;
@@ -568,10 +641,15 @@ void Predictor::TransformerByteUpdate() {
     // The next token starts a fresh context; its distribution is the ppmd's.
     HalvesToFloats(half_scratch_.data(), probs_scratch_.data(), vocab_size_);
     article_tokens_ = 0;
+    dyn_valid_ = false;
   } else {
     if (article_tokens_ == 1) transformer_->begin_article();
     transformer_->step((uint8_t)token, half_scratch_.data(),
         transformer_probs_.data());
+#ifdef CMIX_PROFILE
+    ++g_tf_steps;
+#endif
+    if (!dyn_W_.empty()) DynApply();  // mode 0: replaces transformer_probs_
     FloatsToHalves(transformer_probs_.data(), half_scratch_.data(),
         vocab_size_);
     HalvesToFloats(half_scratch_.data(), probs_scratch_.data(), vocab_size_);
@@ -585,6 +663,129 @@ void Predictor::TransformerByteUpdate() {
   // With --transformer-only there is no byte mixer: probs_scratch_ is the
   // final destination of the distribution (and what the loss is measured on).
   if (byte_mixer_) byte_mixer_->SetProbs(probs_scratch_.data());
+  if (dyn_mixer_) {
+    // the adapted distribution, or (no transformer step) the same as above
+    const float* src = dyn_valid_ ? dyn_q_.data() : probs_scratch_.data();
+    for (unsigned int i = 0; i < vocab_size_; ++i)
+      dyn_scratch_[i] = src[i] >= 1e-6f ? src[i] : 1e-6f;
+    dyn_mixer_->SetProbs(dyn_scratch_.data());
+  }
+}
+
+// Adds the learned correction to the transformer's last logits and replaces
+// transformer_probs_ with the softmax of the result.
+void Predictor::DynApply() {
+  const float* __restrict z = transformer_->last_logits();
+  const float* __restrict hs = transformer_->last_hidden();
+  float* __restrict h = dyn_h_.data();
+  float* __restrict zz = dyn_z_.data();
+  float* __restrict q = dyn_q_.data();
+  float* __restrict W = dyn_W_.data();
+  const float* __restrict b = dyn_b_.data();
+  const float* __restrict hp = dyn_hp_.data();
+  const float* __restrict sg = dyn_s_.data();
+  const int n = (int)vocab_size_;
+  const bool pending = dyn_pending_;
+  const __m256 vk = _mm256_set1_ps(1.0f - dyn_decay_);
+  for (int j = 0; j < kDynHidden; ++j) h[j] = hs[j];
+  float mx = -1e30f;
+  for (int i = 0; i < n; ++i) {
+    float* __restrict w = W + (size_t)i * kDynHidden;
+    if (pending) {
+      // the SGD step DynLearn deferred (one pass over W instead of two)
+      const __m256 vs = _mm256_set1_ps(sg[i]);
+      for (int j = 0; j < kDynHidden; j += 8)
+        _mm256_storeu_ps(w + j, _mm256_fmadd_ps(vs, _mm256_loadu_ps(hp + j),
+                                                _mm256_mul_ps(vk, _mm256_loadu_ps(w + j))));
+    }
+    // fixed-order 4-accumulator dot product (192 = 6 x 32)
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    for (int j = 0; j < kDynHidden; j += 32) {
+      a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + j), _mm256_loadu_ps(h + j), a0);
+      a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + j + 8), _mm256_loadu_ps(h + j + 8), a1);
+      a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + j + 16), _mm256_loadu_ps(h + j + 16), a2);
+      a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w + j + 24), _mm256_loadu_ps(h + j + 24), a3);
+    }
+    __m256 a = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    __m128 r = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    zz[i] = z[i] + b[i] + _mm_cvtss_f32(r);
+  }
+  if (!dyn2_W_.empty()) {
+    dyn2_row_.clear();
+    dyn2_f_.clear();
+    for (int l = 0; l < 12; ++l) {
+      if (!((dyn2_layers_ >> l) & 1)) continue;
+      const uint16_t* idx;
+      const uint8_t* qa;
+      const int nnz = transformer_->mlp_acts(l, &idx, &qa);
+      for (int k = 0; k < nnz; ++k) {
+        const int u = idx[k];
+        if (!qa[u]) continue;
+        const float f = qa[u] * (1.0f / 16);
+        const uint32_t row = (uint32_t)(l * 768 + u);
+        dyn2_row_.push_back(row);
+        dyn2_f_.push_back(f);
+        const float* __restrict w2 = &dyn2_W_[(size_t)row * kDynPad];
+        const __m256 vf = _mm256_set1_ps(f);
+        for (int i = 0; i < kDynPad; i += 8)
+          _mm256_storeu_ps(zz + i, _mm256_fmadd_ps(vf, _mm256_loadu_ps(w2 + i),
+                                                   _mm256_loadu_ps(zz + i)));
+      }
+    }
+  }
+  for (int i = 0; i < n; ++i)
+    if (zz[i] > mx) mx = zz[i];
+  // own polynomial exp (not the CRT's, whose code path may depend on the
+  // CPU), so that compressor and decompressor agree on any machine
+  const __m256 vmx = _mm256_set1_ps(mx);
+  for (int i = n; i < kDynPad; ++i) zz[i] = mx;
+  __m256 vsum = _mm256_setzero_ps();
+  for (int i = 0; i < kDynPad; i += 8) {
+    __m256 e = fx2::exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(zz + i), vmx));
+    _mm256_storeu_ps(q + i, e);
+  }
+  for (int i = n; i < kDynPad; ++i) q[i] = 0;
+  for (int i = 0; i < kDynPad; i += 8) vsum = _mm256_add_ps(vsum, _mm256_loadu_ps(q + i));
+  __m128 r = _mm_add_ps(_mm256_castps256_ps128(vsum), _mm256_extractf128_ps(vsum, 1));
+  r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+  r = _mm_add_ss(r, _mm_movehdup_ps(r));
+  const float inv = 1.0f / _mm_cvtss_f32(r);
+  for (int i = 0; i < n; ++i) q[i] *= inv;
+  if (dyn_mode_ == 0) {
+    for (int i = 0; i < n; ++i) transformer_probs_[i] = q[i];
+  }
+  dyn_pending_ = false;
+  dyn_valid_ = true;
+}
+
+// One SGD step on -ln q(token) for the prediction DynApply made last. The
+// bias is updated here; the update of W is deferred to the next DynApply,
+// which applies it in the same pass as its dot products (bit-identical: the
+// same operations on the same values, W is not read in between).
+void Predictor::DynLearn(int token) {
+  float* __restrict b = dyn_b_.data();
+  const float* __restrict q = dyn_q_.data();
+  const int n = (int)vocab_size_;
+  const float keep = 1.0f - dyn_decay_;
+  for (int i = 0; i < n; ++i) {
+    const float g = q[i] - (i == token ? 1.0f : 0.0f);
+    b[i] = b[i] * keep - dyn_blr_ * g;
+    dyn_s_[i] = -(dyn_lr_ * g);
+    dyn_g_[i] = g;
+  }
+  for (size_t k = 0; k < dyn2_row_.size(); ++k) {
+    float* __restrict w2 = &dyn2_W_[(size_t)dyn2_row_[k] * kDynPad];
+    const float* __restrict g = dyn_g_.data();
+    const __m256 vs = _mm256_set1_ps(-(dyn2_lr_ * dyn2_f_[k]));
+    for (int i = 0; i < kDynPad; i += 8)
+      _mm256_storeu_ps(w2 + i, _mm256_fmadd_ps(vs, _mm256_loadu_ps(g + i),
+                                               _mm256_loadu_ps(w2 + i)));
+  }
+  dyn_hp_.swap(dyn_h_);
+  dyn_pending_ = true;
+  dyn_valid_ = false;
 }
 
 // Accumulates -ln p(byte) for the byte that just completed, where p is the
@@ -637,38 +838,58 @@ void Predictor::Perceive(int bit) {
     }
     return;
   }
+  if (cmix_bits_writer_) {
+    float q = last_pred_;
+    if (q < 1e-6f) q = 1e-6f;
+    if (q > 1 - 1e-6f) q = 1 - 1e-6f;
+    const float logit = std::log(q / (1 - q));
+    cmix_bits_writer_->Write(&logit, 1);
+  }
+  PROF_BEGIN();
   bracket_model_->Perceive(bit);
+  PROF_MARK(bracket_perc);
 
   for (unsigned int i = 0; i < direct_models_.size(); ++i) {
     direct_models_[i].Perceive(bit);
   }
+  PROF_MARK(direct_perc);
   for (unsigned int i = 0; i < match_models_.size(); ++i) {
     match_models_[i].Perceive(bit);
   }
+  PROF_MARK(match_perc);
   for (unsigned int i = 0; i < indirect_ns_models_.size(); ++i) {
     indirect_ns_models_[i].Perceive(bit);
   }
+  PROF_MARK(indirect_perc);
   for (unsigned int i = 0; i < indirect_r_models_.size(); ++i) {
     indirect_r_models_[i].Perceive(bit);
   }
+  PROF_MARK(indirect_r_perc);
 
   if (byte_model_) byte_model_->Perceive(bit);
+  PROF_MARK(ppmd_perc);
 
   byte_mixer_->Perceive(bit);
+  if (dyn_mixer_) dyn_mixer_->Perceive(bit);
+  PROF_MARK(bytemixer_perc);
 
   for (auto& mixer: mixer_0_) {
     mixer.Perceive(bit);
   }
+  PROF_MARK(mixer0_perc);
   for (auto& mixer: mixer_1_) {
     mixer.Perceive(bit);
   }
+  PROF_MARK(mixer1_perc);
 
   sse_.Perceive(bit);
+  PROF_MARK(sse_perc);
 
   bool byte_update = false;
   if (manager_.bit_context_ >= 128) byte_update = true;
 
   manager_.UpdateContexts(bit);
+  PROF_MARK(ctx_update);
   if (byte_update) {
     if (print_transformer_loss_) AccumulateTransformerLoss();
     bracket_model_->ByteUpdate();
@@ -687,12 +908,16 @@ void Predictor::Perceive(int bit) {
       indirect_r_models_[i].ByteUpdate();
     }
 
+    PROF_MARK(models_byteupd);
     if (byte_model_) {
       byte_model_->ByteUpdate();
       if (ppmd_probs_writer_) WritePpmdProbs();
+      PROF_MARK(ppmd_byteupd);
 
       if (transformer_) {
         TransformerByteUpdate();
+      } else if (neutral_transformer_) {
+        byte_mixer_->SetProbs(uniform_probs_.data());
       } else {
         const std::valarray<float>& p = byte_model_->BytePredict();
         for (unsigned int j = 0; j < 256; ++j) {
@@ -706,11 +931,34 @@ void Predictor::Perceive(int bit) {
       // the byte-level distribution comes from the file instead.
       LoadTransformerProbs();
     }
+    PROF_MARK(transformer);
   }
   byte_mixer_output = byte_mixer_->Predict()[0];
-  lstmpr=Discretize(byte_mixer_output);
-  lstmex=byte_mixer_->ex;
+  if (dyn_mixer_) dyn_output_ = dyn_mixer_->Predict()[0];
+  lstmpr=Discretize(dyn_fx_ && dyn_mixer_ ? dyn_output_ : byte_mixer_output);
+  lstmex=dyn_fx_ && dyn_mixer_ ? dyn_mixer_->ex : byte_mixer_->ex;
+  PROF_MARK(bytemixer_pred);
   fxcm_model_->Perceive(bit);
+  PROF_MARK(fxcm_update);
+  if (prefetch_mixers_) {
+    for (auto& mixer : mixer_0_) mixer.Prefetch();
+  }
+  if (tf_mixer_buckets_ > 0) {
+    int b = (int)(byte_mixer_output * tf_mixer_buckets_);
+    if (b >= tf_mixer_buckets_) b = tf_mixer_buckets_ - 1;
+    if (b < 0) b = 0;
+    unsigned long long ctx = b;
+    // mode 1: also the bit position; mode 2: also the partial byte
+    unsigned int partial = byte_update ? 1 : manager_.bit_context_;
+    if (tf_mixer_mode_ == 1) {
+      int pos = 0;
+      while ((1u << (pos + 1)) <= partial) ++pos;
+      ctx = ctx * 8 + pos;
+    } else if (tf_mixer_mode_ == 2) {
+      ctx = ctx * 256 + partial;
+    }
+    tf_ctx_ = ctx;
+  }
   if (byte_update)manager_.bit_context_ = 1;
 }
 

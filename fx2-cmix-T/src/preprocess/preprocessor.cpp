@@ -9,6 +9,22 @@
 
 namespace preprocessor {
 
+bool g_vocab_safe_lengths = false;
+
+static void WriteSegmentHeader(FILE* out, int type, int len) {
+  putc(type, out);
+  if (g_vocab_safe_lengths) {
+    for (int shift = 28; shift >= 0; shift -= 4) {
+      putc('a' + ((len >> shift) & 15), out);
+    }
+  } else {
+    putc((len >> 24) & 0xFF, out);
+    putc((len >> 16) & 0xFF, out);
+    putc((len >> 8) & 0xFF, out);
+    putc(len & 0xFF, out);
+  }
+}
+
 bool IsAscii(int byte) {
   if (byte >= 9 && byte <= 13) return true;
   if (byte >= 32 && byte <= 126) return true;
@@ -191,7 +207,7 @@ void EncodeSegment(FILE* in, FILE* out, int n, const std::string& temp_path,
   if ((*block_stats)[0] / n > 0.95) {
     (*block_stats)[0] = n;
     for (unsigned int i = 1; i < block_stats->size(); ++i) (*block_stats)[i] = 0;
-    fprintf(out, "%c%c%c%c%c", TEXT, n>>24, n>>16, n>>8, n);
+    WriteSegmentHeader(out, TEXT, n);
     encode_text(in, out, n, temp_path, dictionary);
     return;
   }
@@ -202,7 +218,7 @@ void EncodeSegment(FILE* in, FILE* out, int n, const std::string& temp_path,
     fseek(in, begin, SEEK_SET);
     int len=int(end-begin);
     if (len>0) {
-      fprintf(out, "%c%c%c%c%c", type, len>>24, len>>16, len>>8, len);
+      WriteSegmentHeader(out, type, len);
       switch(type) {
         default: {
           encode_default(in, out, len); break;
@@ -250,10 +266,15 @@ int DecodeByte(FILE* in, FILE* dictionary) {
     if (c == EOF) return -1;
     reset=1;
     type=(Filetype)c;
-    len=getc(in)<<24;
-    len|=getc(in)<<16;
-    len|=getc(in)<<8;
-    len|=getc(in);
+    if (g_vocab_safe_lengths) {
+      len = 0;
+      for (int i = 0; i < 8; ++i) len = (len << 4) | ((getc(in) - 'a') & 15);
+    } else {
+      len=getc(in)<<24;
+      len|=getc(in)<<16;
+      len|=getc(in)<<8;
+      len|=getc(in);
+    }
     if (len<0) len=1;
     if (type == TEXT) reset_text_decoder(in, dictionary);
   }

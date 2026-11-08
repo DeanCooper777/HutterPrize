@@ -5,6 +5,19 @@
 #include <stdlib.h>
 #include <malloc.h>
 
+// Executable names. On Windows the self-extracting files must carry an .exe
+// extension to be runnable, and subprocesses go through cmd.exe.
+#ifdef _WIN32
+#define CMIX_EXE "cmix.exe"
+#define ARCHIVE_EXE "archive9.exe"
+#define RUN_PREFIX ".\\"
+#define malloc_trim(x) ((void)0)
+#else
+#define CMIX_EXE "cmix"
+#define ARCHIVE_EXE "archive9"
+#define RUN_PREFIX "./"
+#endif
+
 #include <string>
 
 // The dictionary is a fixed asset of this submission (dictionary/english.dic).
@@ -128,7 +141,7 @@ int selfextract_comp() {
 
 // open itslef to read auxilary data (dictionary and neworder)
   FILE *f = NULL, *fo = NULL;
-  f = OpenSelf("cmix");
+  f = OpenSelf(CMIX_EXE);
 
   // get the size of the whole binary
   fseek(f, 0, SEEK_END);
@@ -136,7 +149,7 @@ int selfextract_comp() {
   fseek(f, 0, SEEK_SET);
 
   // read the whole binary to memory
-  unsigned char *p1 = ReadWholeFile(f, fsize, "cmix");
+  unsigned char *p1 = ReadWholeFile(f, fsize, CMIX_EXE);
   fclose(f);
 
   // read header info
@@ -172,10 +185,10 @@ int selfextract_comp() {
   fwrite(p1 + decmpressor_binary_size + header.dict_size + header.new_article_order_size, header.tf_weights_size, 1, fo);
   fclose(fo);
 //  std::cout << "Decompressing the file with the new article order..." << std::endl;
-  RunSubprocess("./cmix -d .new_article_order.comp .new_article_order");
+  RunSubprocess(RUN_PREFIX CMIX_EXE " -d .new_article_order.comp .new_article_order");
 
 //  std::cout << "Decompressing dictionary..." << std::endl;
-  RunSubprocess("./cmix -d .dict.comp .dict");
+  RunSubprocess(RUN_PREFIX CMIX_EXE " -d .dict.comp .dict");
   VerifyDictionary(".dict");
   free(p1);
   malloc_trim(0);
@@ -191,13 +204,13 @@ int selfextract_comp() {
 int selfextract_decomp() {
   HeaderInfo header;
   FILE *f = NULL, *fo = NULL;
-  f = OpenSelf("archive9");
+  f = OpenSelf(ARCHIVE_EXE);
 
   fseek(f, 0, SEEK_END);
   size_t fsize = ftell(f);
   fseek(f, 0, SEEK_SET);
 
-  unsigned char *p1 = ReadWholeFile(f, fsize, "archive9");
+  unsigned char *p1 = ReadWholeFile(f, fsize, ARCHIVE_EXE);
   fclose(f);
 
   // read header info
@@ -215,7 +228,7 @@ int selfextract_decomp() {
   fwrite(p1 + decmpressor_binary_size, header.dict_size, 1, fo);
   fclose(fo);
 
-  RunSubprocess("./archive9 -d .dict.comp_decomp .dict");//_decomp
+  RunSubprocess(RUN_PREFIX ARCHIVE_EXE " -d .dict.comp_decomp .dict");//_decomp
   VerifyDictionary(".dict");
 
   fo = fopen(".tfweights", "wb");

@@ -7,6 +7,9 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include "preprocess/preprocessor.h"
 #include "preprocess/dictionary.h"
@@ -84,6 +87,16 @@ int Help() {
   printf("                                      --save-ppmd-probs; requires a mode that runs\n");
   printf("                                      the transformer: -e, argument-less enwik9\n");
   printf("                                      decompression, or -c/-n with --transformer\n");
+  printf("    --raw-stream                      (training data; -n only) code the input\n");
+  printf("                                      verbatim, without -n's block headers\n");
+  printf("    --official-vocab                  (training data; compression only) use the\n");
+  printf("                                      official 205-byte enwik9 vocabulary\n");
+  printf("    --no-transformer                  (training data; compression only) run the\n");
+  printf("                                      full cmix with a neutral (uniform) input in\n");
+  printf("                                      place of the transformer, and no lstm\n");
+  printf("    --save-cmix-bits <file>           (training data; compression only) write the\n");
+  printf("                                      final prediction for every coded bit as a\n");
+  printf("                                      float16 logit of P(bit = 1), 8 per byte\n");
   printf("    --transformer <weights>           (testing; -c, -n and -d only) replace the\n");
   printf("                                      lstm with the pretrained transformer, as -e\n");
   printf("                                      and argument-less decompression do with the\n");
@@ -108,8 +121,28 @@ struct ExtractionOptions {
   // Testing option: dump of the distributions passed downstream in place of
   // the lstm's output (see PredictorOptions::save_transformer_probs).
   std::string save_transformer_probs;
+  // Diagnostic option (Windows port): write the byte vocabulary the
+  // compressor derived from its input (256 bytes, 0/1 each).
+  std::string save_vocab;
+  // Training-data option: run cmix with the transformer's slot neutral (the
+  // byte mixer carries a uniform distribution; no lstm, no transformer).
+  bool no_transformer = false;
+  // Training-data option: use the official 205-byte enwik9 vocabulary even
+  // without the transformer (and on Linux), so the columns of
+  // --save-ppmd-probs match the transformer's token ids.
+  bool official_vocab = false;
+  // Training-data option (-n only): code the input file verbatim as the
+  // preprocessed stream, without -n's block headers. Used to replay the exact
+  // stream an -e run codes (rebuilt from its --save-ppmd-bytes tokens) on
+  // another machine. The archive cannot be decompressed.
+  bool raw_stream = false;
+  // Training-data option: write cmix's final prediction for every coded bit
+  // as a float16 logit ln(p/(1-p)) of p = P(bit = 1), 8 per byte.
+  std::string save_cmix_bits;
   bool AnySet() const {
-    return ppmd_only || transformer_only || bytes_only ||
+    return ppmd_only || transformer_only || bytes_only || no_transformer ||
+        official_vocab || raw_stream ||
+        !save_cmix_bits.empty() ||
         !save_ppmd_bytes.empty() ||
         !save_article_boundaries.empty() || !save_ppmd_probs.empty() ||
         !load_transformer_probs.empty();
@@ -165,6 +198,21 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
       options.transformer_only = true;
       continue;
     }
+    if (arg == "--raw-stream") {
+      if (options.raw_stream) UsageError("duplicate --raw-stream");
+      options.raw_stream = true;
+      continue;
+    }
+    if (arg == "--official-vocab") {
+      if (options.official_vocab) UsageError("duplicate --official-vocab");
+      options.official_vocab = true;
+      continue;
+    }
+    if (arg == "--no-transformer") {
+      if (options.no_transformer) UsageError("duplicate --no-transformer");
+      options.no_transformer = true;
+      continue;
+    }
     if (arg == "--bytes-only") {
       if (options.bytes_only) UsageError("duplicate --bytes-only");
       options.bytes_only = true;
@@ -179,6 +227,8 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
       value = &options.load_transformer_probs;
     }
     else if (arg == "--transformer") value = &options.transformer;
+    else if (arg == "--save-vocab") value = &options.save_vocab;
+    else if (arg == "--save-cmix-bits") value = &options.save_cmix_bits;
     else if (arg == "--save-transformer-probs") {
       value = &options.save_transformer_probs;
     }
@@ -204,6 +254,10 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
   // created, so they are not checked here).
   if (!options.transformer.empty()) {
     RequireReadableFile("--transformer weights file", options.transformer);
+  }
+  if (!options.save_vocab.empty() && mode != 'c' && mode != 'n' &&
+      mode != 'e') {
+    UsageError("--save-vocab can only be used when compressing (-c, -n, -e)");
   }
   if (!options.load_transformer_probs.empty()) {
     RequireReadableFile("--load-transformer-probs file",
@@ -262,6 +316,22 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
         "transformer: -e, argument-less enwik9 decompression, or -c/-n with "
         "--transformer");
   }
+  if (options.no_transformer && (options.ppmd_only ||
+      options.transformer_only || options.bytes_only ||
+      !options.load_transformer_probs.empty() ||
+      !options.save_transformer_probs.empty())) {
+    UsageError("--no-transformer runs the full cmix without its transformer; "
+        "it cannot be combined with --ppmd-only, --transformer-only, "
+        "--bytes-only or the transformer-probs options");
+  }
+  if (enwik9_decompression &&
+      (options.no_transformer || !options.save_cmix_bits.empty())) {
+    UsageError("--no-transformer and --save-cmix-bits are compression-only");
+  }
+  if (!options.save_cmix_bits.empty() &&
+      (options.ppmd_only || options.transformer_only || options.bytes_only)) {
+    UsageError("--save-cmix-bits needs the full cmix model");
+  }
   if (options.ppmd_only && options.bytes_only) {
     UsageError("--ppmd-only and --bytes-only cannot be used together");
   }
@@ -307,8 +377,8 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
           "to save");
     }
     if (options.save_ppmd_bytes.empty() &&
-        options.save_article_boundaries.empty()) {
-      UsageError("--bytes-only without --save-ppmd-bytes or "
+        options.save_article_boundaries.empty() && options.save_vocab.empty()) {
+      UsageError("--bytes-only without --save-ppmd-bytes, --save-vocab or "
           "--save-article-boundaries would produce no output at all");
     }
   }
@@ -642,10 +712,18 @@ void SaveArticleBoundaries(const std::string& temp_path,
   if (first_marker < 0) {
     Fail("--save-article-boundaries: no line-start page marker found");
   }
+  // The first separator follows the block header and phda9's text header
+  // line. Upstream's Linux stream has it at 28; the header line holds a
+  // data-dependent number whose dictionary encoding can be longer (our
+  // Windows build: 32), so only require it to be near the start.
   if (wrt && first_marker != 28) {
-    Fail("--save-article-boundaries: first separator at offset %lld, "
-        "expected 28 (right after the block and preprocessor headers)",
-        first_marker);
+    if (first_marker > 64) {
+      Fail("--save-article-boundaries: first separator at offset %lld, "
+          "expected near 28 (right after the block and preprocessor headers)",
+          first_marker);
+    }
+    fprintf(stderr, "note: first separator at offset %lld (upstream's "
+        "Linux stream: 28)\n", first_marker);
   }
   if (boundaries.size() != old_boundaries.size() + 1) {
     Fail("--save-article-boundaries: %zu boundaries, expected %zu (the "
@@ -786,7 +864,19 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   *input_bytes = ftell(data_in);
   fseek(data_in, 0L, SEEK_SET);
 
-  if (enable_preprocess) {
+#ifdef _WIN32
+  preprocessor::g_vocab_safe_lengths = !transformer_weights.empty();
+#endif
+  if (extraction.raw_stream) {
+    if (enable_preprocess) {
+      Fail("--raw-stream can only be used with -n");
+    }
+    std::vector<char> buffer(1 << 20);
+    size_t got;
+    while ((got = fread(buffer.data(), 1, buffer.size(), data_in)) > 0) {
+      fwrite(buffer.data(), 1, got, temp_out);
+    }
+  } else if (enable_preprocess) {
     fprintf(stderr, "\rpreprocessing...");
     fflush(stderr);
     preprocessor::Encode(data_in, temp_out, *input_bytes, temp_path,
@@ -812,6 +902,50 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   } else {
     ExtractVocab(temp_bytes, &temp_in, &vocab);
     temp_in.seekg(0, std::ios::beg);
+  }
+
+  if (!extraction.save_vocab.empty()) {
+    FILE* f = fopen(extraction.save_vocab.c_str(), "wb");
+    if (f == NULL) Fail("cannot open %s", extraction.save_vocab.c_str());
+    int n = 0;
+    for (int i = 0; i < 256; ++i) {
+      fputc(vocab[i] ? 1 : 0, f);
+      n += vocab[i] ? 1 : 0;
+    }
+    fclose(f);
+    printf("\rsaved vocabulary of %d bytes to %s\n", n,
+        extraction.save_vocab.c_str());
+  }
+#ifdef _WIN32
+  // Windows port: the transformer's token ids are indices into the exact
+  // 205-byte vocabulary of the official build (read from the header of the
+  // published archive9). Our preprocessed stream contains the same content
+  // bytes, but the set extracted from it can differ (phda9 output depends on
+  // uninitialized stack memory, so its length differs between compilers, and
+  // partial files lack some bytes). Use the official set whenever the
+  // transformer runs; the vocabulary travels in the archive header, so the
+  // decoder needs no extra information.
+  const bool force_official_vocab =
+      !transformer_weights.empty() || extraction.official_vocab;
+#else
+  // Training data on Linux (--official-vocab): the stream rebuilt from our
+  // Windows build's tokens lacks one of the 205 bytes, so the vocabulary
+  // derived from it would shift the columns of --save-ppmd-probs.
+  const bool force_official_vocab = extraction.official_vocab;
+#endif
+  if (force_official_vocab && temp_bytes >= kMinVocabFileSize) {
+    static const unsigned char kOfficialVocab[32] = {
+        0xe8, 0x16, 0x04, 0x00, 0xff, 0xff, 0xff, 0x03, 0x01, 0xfc, 0x0f,
+        0xf9, 0xfe, 0xff, 0xff, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    for (int i = 0; i < 256; ++i) {
+      bool official = (kOfficialVocab[i / 8] >> (i % 8)) & 1;
+      if (vocab[i] && !official) {
+        Fail("the input contains byte 0x%02x, which is not in the 205-byte "
+            "vocabulary the transformer was trained on", i);
+      }
+      vocab[i] = official;
+    }
   }
 
   if (!extraction.save_ppmd_bytes.empty()) {
@@ -842,6 +976,8 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   predictor_options.num_input_bytes = temp_bytes;
   predictor_options.transformer_weights = transformer_weights;
   predictor_options.save_transformer_probs = extraction.save_transformer_probs;
+  predictor_options.neutral_transformer = extraction.no_transformer;
+  predictor_options.save_cmix_bits = extraction.save_cmix_bits;
   Predictor p(vocab, predictor_options);
   if (enable_preprocess && !extraction.ppmd_only && !extraction.transformer_only) {
     // Pretraining only affects the models --ppmd-only and --transformer-only
@@ -865,6 +1001,9 @@ bool RunDecompression(const std::string& input_path,
     FILE* dictionary, unsigned long long* input_bytes,
     unsigned long long* output_bytes, const ExtractionOptions& extraction,
     const std::string& transformer_weights = "") {
+#ifdef _WIN32
+  preprocessor::g_vocab_safe_lengths = !transformer_weights.empty();
+#endif
   std::ifstream data_in(input_path, std::ios::in | std::ios::binary);
   if (!data_in.is_open()) {
     Fail("cannot open input file %s", input_path.c_str());
@@ -1094,11 +1233,11 @@ int main(int argc, char** argv) {
     write("header4archive.dat", header);
 
     cat("dec1w", output_path.c_str(), "dec2");
-    cat("dec2", "header4archive.dat", "archive9");
+    cat("dec2", "header4archive.dat", ARCHIVE_EXE);
 
     // make the decompressor binary executable
     char mode[] = "0777";
-    char buf[100] = "archive9";
+    char buf[100] = ARCHIVE_EXE;
     int i = strtol(mode, 0, 8);
     chmod(buf, i);
 

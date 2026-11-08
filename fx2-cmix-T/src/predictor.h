@@ -81,6 +81,12 @@ struct PredictorOptions {
   // article-start tokens the transformer cannot predict) is appended to
   // this file, in the format of save_ppmd_probs.
   std::string save_transformer_probs;
+  // Training data: run without the transformer (and without the lstm); the
+  // byte mixer carries a uniform distribution instead.
+  bool neutral_transformer = false;
+  // Training data: append cmix's final prediction for every coded bit, as a
+  // float16 logit ln(p/(1-p)) of p = P(bit = 1).
+  std::string save_cmix_bits;
 };
 
 // Buffered writer converting floats to float16 (IEEE half precision).
@@ -148,6 +154,11 @@ class Predictor {
   
   std::optional<Bracket> bracket_model_;
   size_t auxiliary_size_ = 2; // 0 -> fxcm, 1 -> byte_mixer
+  // Context of the optional transformer-confidence mixer (tune.h:
+  // tf_mixer_buckets > 0): the byte mixer's bit probability, bucketed.
+  unsigned long long tf_ctx_ = 0;
+  int tf_mixer_buckets_ = 0, tf_mixer_mode_ = 0;
+  bool prefetch_mixers_ = false;
   SSE sse_;
   llvm::SmallVector<MixerInput,2> layers_;
   llvm::SmallVector<Mixer, 23> mixer_0_;
@@ -186,6 +197,43 @@ class Predictor {
   // training data loader's split_article_lengths; each piece is a fresh
   // transformer context.
   unsigned long long article_tokens_ = 0;
+  bool neutral_transformer_ = false;
+  std::vector<float> uniform_probs_;
+  std::unique_ptr<HalfFileWriter> cmix_bits_writer_;
+  float last_pred_ = 0.5f;
+
+  // Online adaptation of the transformer's output layer ("dynamic
+  // evaluation"): an fp32 correction dyn_W_ (205 x 192) and bias dyn_b_ are
+  // added to the transformer's (post-softcap) logits and trained by SGD on
+  // the cross-entropy of each token as it becomes known. Both directions run
+  // the identical updates, so the decompressor reproduces the predictions.
+  // Disabled (and bit-identical to before) when dyn_lr and dyn_blr are 0.
+  static constexpr int kDynHidden = 192;
+  static constexpr int kDynPad = 208;  // vocabulary rounded up to 8
+  float dyn_lr_ = 0, dyn_blr_ = 0, dyn_decay_ = 0;
+  bool dyn_valid_ = false;  // dyn_h_/dyn_q_ hold the last prediction
+  bool dyn_pending_ = false;  // a deferred W update (dyn_s_, dyn_hp_)
+  std::vector<float> dyn_hp_, dyn_s_;
+  // second correction from the transformer's sparse MLP activations of the
+  // layers in dyn2_layers_ (bitmask): logits += sum over active units k of
+  // f_k * dyn2_W_[layer][k] (a 208-vector), trained like dyn_W_
+  float dyn2_lr_ = 0;
+  uint32_t dyn2_layers_ = 0;
+  std::vector<float> dyn2_W_;      // [12][768][kDynPad]
+  std::vector<uint32_t> dyn2_row_; // active rows of the last prediction
+  std::vector<float> dyn2_f_;      // and their feature values
+  std::vector<float> dyn_g_;       // gradient q - onehot (kDynPad)
+  std::vector<float> dyn_W_, dyn_b_, dyn_h_, dyn_q_, dyn_z_;
+  // dyn_mode 0: the adapted distribution replaces the transformer's;
+  // 1: it is an additional mixer input (dyn_mixer_), the original stays
+  int dyn_mode_ = 0;
+  bool dyn_l1_ = false;  // also an input of the final mixer
+  bool dyn_fx_ = false;  // fxcm sees the adapted prediction (lstmpr)
+  float dyn_output_ = 0.5f;
+  std::optional<ByteMixer> dyn_mixer_;
+  std::vector<float> dyn_scratch_;
+  void DynLearn(int token);
+  void DynApply();
 };
 
 #endif

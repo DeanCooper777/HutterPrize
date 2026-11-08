@@ -42,6 +42,12 @@ from pysrc.attention_function import (
 from pysrc.quantization import Quantize, Quantization
 
 
+def varlen_cpu_values(cu_seqlens: Tensor | None) -> Tensor | None:
+    """the host copy of a varlen boundary tensor that pysrc/data.py attaches
+    (as .cpu_values), or None; fla syncs to fetch it itself when it is None"""
+    return getattr(cu_seqlens, "cpu_values", None) if cu_seqlens is not None else None
+
+
 ActivationFunctionName = Literal["gelu", "new_gelu", "relu_squared"]
 WeightInit = Literal["kaiming_uniform", "normal", "zero"]
 
@@ -450,6 +456,7 @@ class CastedFusedConvolutionSiLU(Module):
             weight=weight.type_as(x),
             activation="silu",
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=varlen_cpu_values(cu_seqlens),
         )
         return output
 
@@ -834,7 +841,19 @@ class KimiLinearAttention(Module):
             assert cumulative_sequence_lengths.size(0) == 1 and batch_size == 1, (
                 "with variable length kimi linear attention, batch size must be 1"
             )
-            cu_seqlens = cumulative_sequence_lengths.squeeze(0)
+            # one squeezed tensor (and host copy) per micro batch, shared by
+            # all layers: fla caches prepare_chunk_indices by argument
+            # identity, and a fresh tensor per layer missed that cache, so
+            # every layer's causal conv recomputed the indices on the host
+            # and copied them over with a blocking copy (18 GPU drains per
+            # micro batch, 2026-11-07)
+            cu_seqlens = getattr(cumulative_sequence_lengths, "squeezed", None)
+            if cu_seqlens is None:
+                cu_seqlens = cumulative_sequence_lengths.squeeze(0)
+                cpu_values = getattr(cumulative_sequence_lengths, "cpu_values", None)
+                if cpu_values is not None:
+                    cu_seqlens.cpu_values = cpu_values.squeeze(0).to(torch.int64)  # type: ignore[attr-defined]
+                cumulative_sequence_lengths.squeezed = cu_seqlens  # type: ignore[attr-defined]
 
         queries = self.query_projection(x, initialize_scales=initialize_scales)
         keys = self.key_projection(x, initialize_scales=initialize_scales)
@@ -881,6 +900,7 @@ class KimiLinearAttention(Module):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=varlen_cpu_values(cu_seqlens),
         )
 
         output = self.output_fused_norm_gate(output, output_gate)
@@ -1322,7 +1342,12 @@ class Transformer(Module):
         cumulative_sequence_lengths: Int[Tensor, "batch document"] | None,
         override_window_size: int | Int[Tensor, ""] | None = None,
         initialize_scales: InitializeScales = InitializeScales(None, None),
+        return_logits: bool = False,
     ) -> Float[Tensor, ""]:
+        """summed cross-entropy over the unmasked positions, or with
+        return_logits the logits themselves (used by the cmix mixture loss,
+        pysrc/cmix_loss.py, which is computed outside the module so that its
+        mixer weights are never exported with the transformer)"""
         assert input_tokens.shape == output_tokens.shape
         assert input_tokens.ndim == 2
 
@@ -1337,6 +1362,8 @@ class Transformer(Module):
         logits = self.last_activation_to_logits(
             activation, priors=priors, initialize_scales=initialize_scales
         )
+        if return_logits:
+            return logits
 
         loss = cross_entropy(
             logits.view(-1, logits.size(-1)),

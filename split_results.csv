@@ -1,0 +1,7 @@
+date,file,mode,variant,schedule,cmixA,cmixB,total_bytes,seconds
+20261105-191821,enwik6,lstm,unsplit,-,,,175244,227
+20261105-191821,enwik6,lstm,most-different,1x179563 + restx269345,82175,99121,181305,245
+20261105-191821,enwik6,lstm,best-lzma-proxy,1x404018 + restx179563,117071,63802,180882,243
+20261105-191821,enwik6,transformer,unsplit,-,,,131850,226
+20261105-191821,enwik6,transformer,most-different,1x179563 + restx269345,61801,72921,134731,253
+20261105-191821,enwik6,transformer,best-lzma-proxy,1x404018 + restx179563,87811,46658,134478,248

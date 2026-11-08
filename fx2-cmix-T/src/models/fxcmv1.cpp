@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <memory>
+#include <immintrin.h>
+#include "../tune.h"
 #define NDEBUG  // remove for debugging (turns on Array bound checks)
 #include <assert.h>
 
@@ -1461,9 +1463,24 @@ inline int mix3(const int s, StateMap& sm) {
     return 1;
   }
 }
+// Prefetch the 128-byte buckets that mix() is about to look up at this bit
+// (bpos 0, 2 and 5 hash in c0; the other bits stay inside the bucket found
+// then). The tables are hundreds of MB, so each lookup is a DRAM miss; issuing
+// all of them up front lets the misses overlap instead of serializing inside
+// mix(). Only a hint: nothing is modified, so the output is unchanged.
+inline void prefetch() const {
+  const int bp = x.bpos;
+  if (bp != 0 && bp != 2 && bp != 5) return;
+  for (int i = 0; i < cn; ++i) {
+    if ((cxtMask >> (cn - i)) & 1) continue;  // disabled context
+    const char* b = (const char*)&t[(cxt[i] + x.c0) & tmask];
+    _mm_prefetch(b, _MM_HINT_T0);
+    _mm_prefetch(b + 64, _MM_HINT_T0);
+  }
+}
 // Zero prediction
 inline void mix4() {
-    x.mxInputs1.add(0); 
+    x.mxInputs1.add(0);
     if (skip2==1)x.mxInputs1.add(0);
     x.mxInputs1.add(0);
     x.mxInputs1.add(0);
@@ -3214,6 +3231,9 @@ ContextMap1 cmC1[8];
 // large state memory, per context max 14 uniqe contexts state sets
 // for large amount of large contexts
 ContextMap2 cmC2[18];
+// Prefetch the cmC2 buckets of each bit before they are looked up (tune
+// fxcm_prefetch=0 disables; the output is identical either way).
+static bool fxcm_prefetch = true;
 APM<256>  apmA0;
 APM<0x8000*2>  apmA1;
 APM<0x8000*2>  apmA2;
@@ -3236,6 +3256,7 @@ BracketContext<U16> htcxt;
 SparseMatchModel smatch; // 2 inputs to fp
 
 void PredictorInit() {
+    fxcm_prefetch = tune::Get("fxcm_prefetch", 1) != 0;
     n3bState=n2bState=0xffffffff;
     pr=2048;
     // Match
@@ -4508,7 +4529,11 @@ int modelPrediction(int c0,int bpos,int c4){
 
     //indirectBrByte
     const int c0b=c0<<(8-bpos);
-    
+
+    // bpos 0: all contexts were just set above; start every big-table lookup
+    // of this bit (bpos 2 and 5 were started earlier, in update1).
+    if (fxcm_prefetch && bpos == 0) for (auto& m : cmC2) m.prefetch();
+
     scmA[0].mix(sscmrate);
     scmA[1].mix(sscmrate);
     scmA[2].mix(sscmrate);
@@ -4709,6 +4734,10 @@ void update1() {
     x.bpos=(x.bpos+1)&7;
     x.bposshift=7-x.bpos;
     x.c0shift_bpos=(x.c0<<1)^(256>>(x.bposshift));
+    // c0 of the next bit is known: start its bucket lookups now, so they
+    // overlap the mixer updates below and the rest of the bit's models.
+    if (fxcm_prefetch && (x.bpos == 2 || x.bpos == 5))
+        for (auto& m : cmC2) m.prefetch();
 
     mxA[0].update(x.y);
     mxA[1].update(x.y);

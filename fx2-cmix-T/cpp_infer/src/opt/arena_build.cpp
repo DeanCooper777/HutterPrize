@@ -1,6 +1,12 @@
 #include "arena_build.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -27,16 +33,26 @@ constexpr size_t round64(size_t x) { return (x + 63) & ~size_t(63); }
 
 void HugeBuf::alloc(size_t n) {
   bytes = (n + (size_t(2) << 20) - 1) & ~((size_t(2) << 20) - 1);
+#ifdef _WIN32
+  void* m = ::VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                           PAGE_READWRITE);
+  if (m == nullptr) die("VirtualAlloc failed");
+#else
   void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) die("mmap failed");
   ::madvise(m, bytes, MADV_HUGEPAGE);
+#endif
   std::memset(m, 0, bytes);  // touch every page
   p = static_cast<uint8_t*>(m);
 }
 
 HugeBuf::~HugeBuf() {
+#ifdef _WIN32
+  if (p) ::VirtualFree(p, 0, MEM_RELEASE);
+#else
   if (p) ::munmap(p, bytes);
+#endif
 }
 
 void OptModel::load(const char* weights_path) {

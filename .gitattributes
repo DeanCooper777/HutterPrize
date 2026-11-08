@@ -1,0 +1,6 @@
+# shell and Python scripts run on Linux pods: keep LF on Windows checkouts
+*.sh text eol=lf
+*.py text eol=lf
+makefile text eol=lf
+*.tfwc2 binary
+*.tch binary

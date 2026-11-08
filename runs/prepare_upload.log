@@ -1,0 +1,18 @@
+/c/Dean/Projects/HutterPrize/runs/upload:
+total 273486
+drwxr-xr-x 1 dwc 197609         0 Nov  6 15:44 .
+drwxr-xr-x 1 dwc 197609         0 Nov  6 15:43 ..
+-rw-r--r-- 1 dwc 197609    973712 Nov  6 15:44 article-boundaries.int32
+drwxr-xr-x 1 dwc 197609         0 Nov  6 15:44 ref
+-rw-r--r-- 1 dwc 197609    759862 Nov  6 15:43 src.tar.gz
+-rw-r--r-- 1 dwc 197609 278302343 Nov  6 15:44 stream.bin.gz
+-rw-r--r-- 1 dwc 197609        77 Nov  6 15:44 stream.sha256
+-rw-r--r-- 1 dwc 197609        83 Nov  6 15:44 tokens.sha256
+
+/c/Dean/Projects/HutterPrize/runs/upload/ref:
+total 1667972
+drwxr-xr-x 1 dwc 197609          0 Nov  6 15:44 .
+drwxr-xr-x 1 dwc 197609          0 Nov  6 15:44 ..
+-rw-r--r-- 1 dwc 197609   64000000 Nov  6 15:51 bits.prefix
+-rw-r--r-- 1 dwc 197609 1640000000 Nov  6 15:44 probs.prefix
+-rw-r--r-- 1 dwc 197609    4000000 Nov  6 15:44 stream.prefix

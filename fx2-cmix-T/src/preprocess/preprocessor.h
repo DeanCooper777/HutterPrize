@@ -10,6 +10,13 @@ namespace preprocessor {
 
 typedef enum {DEFAULT, TEXT=7} Filetype;
 
+// Windows port: when set, segment lengths are written as 8 letters 'a'..'p'
+// (one per nibble) instead of 4 raw bytes, so that the length -- which
+// differs between builds, see README -- never adds a byte outside the
+// 205-byte vocabulary the transformer was trained on. Encoder and decoder
+// must agree; runner.cpp sets it whenever the transformer is enabled.
+extern bool g_vocab_safe_lengths;
+
 void Encode(FILE* in, FILE* out, unsigned long long n, const std::string&
     temp_path, FILE* dictionary);
 

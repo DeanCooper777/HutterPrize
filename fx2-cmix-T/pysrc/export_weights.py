@@ -25,8 +25,11 @@ from pysrc.model import (
 )
 from pysrc.quantization import Quantization
 
-MODEL_FILENAME = "models/6m-q4-fp32.tch"
-OUTPUT_FILENAME = "cpp_infer/data/weights.bin"
+import os as _os
+
+# EXPORT_MODEL / EXPORT_OUTPUT override the paths (e.g. for a retrained model)
+MODEL_FILENAME = _os.environ.get("EXPORT_MODEL", "models/6m-q4-fp32.tch")
+OUTPUT_FILENAME = _os.environ.get("EXPORT_OUTPUT", "cpp_infer/data/weights.bin")
 MAGIC = b"FX2TFW01"
 ROPE_SEQUENCE_LENGTH = 131072
 
@@ -108,6 +111,7 @@ def make_reference_config() -> TransformerConfig:
         rope_base=10_000,
         half_truncate_rope=False,
         query_key_norm=True,
+        query_key_norm_gain=False,
         kimi_linear_d_head=64,
         kimi_linear_n_heads=3,
         kimi_linear_convolution_size=4,
@@ -393,7 +397,7 @@ def main() -> None:
     assert torch.cuda.is_available()
     import os
 
-    os.makedirs("cpp_infer/data", exist_ok=True)
+    os.makedirs(os.path.dirname(OUTPUT_FILENAME) or ".", exist_ok=True)
     model = load_reference_model(torch.device("cuda"))
     export_weights(model, OUTPUT_FILENAME)
 

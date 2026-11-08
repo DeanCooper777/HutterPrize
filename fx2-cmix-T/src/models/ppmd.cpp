@@ -4,13 +4,21 @@
 
 #include "ppmd.h"
 #include <cstring>
-#include <sys/mman.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <fcntl.h>
+#else
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <process.h>
+#include <psapi.h>
+#endif
 #include <cstdio>
+#include "../tune.h"
 
 namespace PPMD {
 
@@ -30,9 +38,25 @@ typedef unsigned long long qword;
 // This will reduce RAM usage, but will be slower as well. *Warning*: this will
 // write a *lot* of data to disk, so can reduce the lifespan of SSDs. Not
 // recommended for normal usage.
+//
+// Windows port: the heap is a view of a file mapping (a FILE_ATTRIBUTE_TEMPORARY,
+// delete-on-close file), so it is not charged to the process's commit, and the
+// periodic "remap" below becomes a working-set trim (VirtualUnlock on unlocked
+// pages releases them from the working set; dirty pages go to the modified
+// list and are written to the file by the OS). The contents, and therefore the
+// output, are identical to the RAM heap. tune parameter ppmd_disk=0 selects
+// the RAM heap. The file name carries the process id, so parallel runs in one
+// directory do not share it.
 bool mmap_to_disk = true;
 qword mmap_size;
+#ifdef _WIN32
+static char mmap_path[64] = "ppm.temp";
+static HANDLE mmap_file = INVALID_HANDLE_VALUE, mmap_mapping = NULL;
+static unsigned long long trim_every = 20000;  // bytes between checks (0: never)
+static unsigned long long ws_budget = 0;       // trim only above this working set
+#else
 static constexpr char mmap_path[] = "ppm.temp";
+#endif
 
 const int ORealMAX=256;
 
@@ -140,6 +164,7 @@ uint U2B( uint NU ) {
 int StartSubAllocator( qword SASize ) {
   qword t = SASize << 20U;
 
+#ifndef _WIN32
   if (mmap_to_disk) {
     mmap_size = t;
     int fd = open(mmap_path, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0664);
@@ -159,7 +184,34 @@ int StartSubAllocator( qword SASize ) {
       exit(EXIT_FAILURE);
     }
     close(fd);
-  } else {
+  } else
+#else
+  if (mmap_to_disk) {
+    mmap_size = t;
+    snprintf(mmap_path, sizeof mmap_path, "ppm.%d.temp", _getpid());
+    mmap_file = CreateFileA(mmap_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        NULL);
+    if (mmap_file == INVALID_HANDLE_VALUE) {
+      fprintf(stderr, "ppmd: cannot create %s (error %lu)\n", mmap_path,
+          GetLastError());
+      exit(EXIT_FAILURE);
+    }
+    mmap_mapping = CreateFileMappingA(mmap_file, NULL, PAGE_READWRITE,
+        (DWORD)(t >> 32), (DWORD)t, NULL);
+    if (!mmap_mapping) {
+      fprintf(stderr, "ppmd: cannot map %s (error %lu)\n", mmap_path,
+          GetLastError());
+      exit(EXIT_FAILURE);
+    }
+    HeapStart = (byte*)MapViewOfFile(mmap_mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!HeapStart) {
+      fprintf(stderr, "ppmd: cannot map view (error %lu)\n", GetLastError());
+      exit(EXIT_FAILURE);
+    }
+  } else
+#endif
+  {
     HeapStart = new byte[t];
   }
 
@@ -188,7 +240,19 @@ qword GetUsedMemory() {
 }
 
 void StopSubAllocator() {
-  if( SubAllocatorSize ) SubAllocatorSize=0, delete[] HeapStart;
+  if( SubAllocatorSize ) {
+    SubAllocatorSize=0;
+    if (!mmap_to_disk) delete[] HeapStart;
+#ifdef _WIN32
+    else {
+      UnmapViewOfFile(HeapStart);
+      CloseHandle(mmap_mapping);
+      CloseHandle(mmap_file);  // FILE_FLAG_DELETE_ON_CLOSE removes the file
+      mmap_mapping = NULL;
+      mmap_file = INVALID_HANDLE_VALUE;
+    }
+#endif
+  }
 
 }
 
@@ -1368,14 +1432,21 @@ unsigned long long counter_ = 0;
 
 PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
     const std::vector<bool>& vocab) : ByteModel(vocab), byte_(bit_context) {
+  mmap_to_disk = tune::Get("ppmd_disk", 1) != 0;
+#ifdef _WIN32
+  trim_every = (unsigned long long)tune::Get("ppmd_trim", 20000);
+  ws_budget = (unsigned long long)tune::Get("ppmd_ws_mb", 8500) << 20;
+#endif
   ppmd_model_.reset(new ppmd_Model());
   ppmd_model_->Init(order,memory,1,0);
 }
 
 PPMD::~PPMD() {
+#ifndef _WIN32
   if (mmap_to_disk) {
     remove(mmap_path);
   }
+#endif
 }
 
 void PPMD::ByteUpdate() {
@@ -1388,6 +1459,7 @@ void PPMD::ByteUpdate() {
   }
   ByteModel::ByteUpdate();
   probs_ /= probs_.sum();
+#ifndef _WIN32
   if (mmap_to_disk && counter_ % 20000 == 0) {
     // The suballocator keeps absolute pointers into the heap (pText,
     // UnitsStart, LoUnit, HiUnit, AuxUnit, MinContext, MaxContext,
@@ -1409,6 +1481,23 @@ void PPMD::ByteUpdate() {
     }
     close(fd);
   }
+#else
+  if (mmap_to_disk && trim_every && counter_ % trim_every == 0) {
+    // Same effect as the remap above: drop the heap's pages from the working
+    // set (they stay in the file / standby list, contents unchanged; VirtualUnlock
+    // fails with ERROR_NOT_LOCKED by design). Every trim makes the next accesses
+    // soft-fault the pages back (+25% PPMD time on enwik7 if done every 20000
+    // bytes), so it is done only once the process working set exceeds
+    // ppmd_ws_mb (default 8500 MB, under the contest's 10 GB; 0 = always, as
+    // upstream's remap).
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!ws_budget ||
+        (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) &&
+         pmc.WorkingSetSize > ws_budget)) {
+      VirtualUnlock(ppmd_model_->HeapStart, mmap_size);
+    }
+  }
+#endif
 }
 
 } // namespace PPMD

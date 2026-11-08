@@ -16,6 +16,9 @@ class MicroBatch:
     loss_mask: Bool[Tensor, "batch position"]
     priors: Float[Tensor, "batch position vocabulary_size"]
     cumulative_sequence_lengths: Int32[Tensor, "batch document"]
+    # cmix's per-bit logits (without the transformer) for each OUTPUT token,
+    # when the loader has a cmix_bits_filename (cmix mixture loss)
+    cmix_bit_logits: Float[Tensor, "batch position 8"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +49,13 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
     device: torch.device
     rank: int
     world_size: int
+    # optional: `cmix --no-transformer --save-cmix-bits` output (float16, 8
+    # logits per token, in token order) for the cmix mixture loss
+    cmix_bits_filename: str | None = None
 
+    _cmix_bits: np.ndarray | None = field(
+        init=False, repr=False, compare=False, default=None
+    )
     _tokens: np.ndarray = field(init=False, repr=False, compare=False)
     _priors: np.ndarray = field(init=False, repr=False, compare=False)
     _article_starts: np.ndarray = field(init=False, repr=False, compare=False)
@@ -142,6 +151,20 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             rng.permutation(n_articles) for _ in range(self.epochs)
         ]
 
+        cmix_bits: np.ndarray | None = None
+        if self.cmix_bits_filename is not None:
+            cmix_bits_bytes: int = os.path.getsize(self.cmix_bits_filename)
+            assert cmix_bits_bytes == n_tokens * 8 * float16_size, (
+                f"{self.cmix_bits_filename} holds {cmix_bits_bytes} bytes, "
+                f"expected 8 float16 per token ({n_tokens * 16})"
+            )
+            cmix_bits = np.memmap(
+                self.cmix_bits_filename,
+                dtype=np.float16,
+                mode="r",
+                shape=(n_tokens, 8),
+            )
+        object.__setattr__(self, "_cmix_bits", cmix_bits)
         object.__setattr__(self, "_tokens", tokens)
         object.__setattr__(self, "_priors", priors)
         object.__setattr__(self, "_article_starts", article_starts)
@@ -208,6 +231,11 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             dtype=torch.float16,
             pin_memory=pin,
         )
+        cmix_bits = (
+            zeros((1, n_positions, 8), dtype=torch.float16, pin_memory=pin)
+            if self._cmix_bits is not None
+            else None
+        )
 
         boundaries: list[int] = [0]
         position: int = 0
@@ -231,6 +259,12 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             priors[0, position : position + length] = torch.from_numpy(
                 np.array(self._priors[start : end - 1])
             )
+            if cmix_bits is not None:
+                # cmix's bits row g are its predictions while coding token g,
+                # so they pair with the OUTPUT tokens [start + 1, end)
+                cmix_bits[0, position : position + length] = torch.from_numpy(
+                    np.array(self._cmix_bits[start + 1 : end])
+                )
 
             position += length
             boundaries.append(position)
@@ -243,13 +277,22 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             boundaries.append(n_positions)
 
         cumulative_sequence_lengths = tensor([boundaries], dtype=torch.int32)
+        # fla's varlen kernels need the boundaries on the host; given only the
+        # device tensor they copy it back at every call, a stream sync each
+        # (~0.5 s per micro batch, 2026-11-07). The model passes this host copy
+        # on as cu_seqlens_cpu (pysrc/model.py, varlen_cpu_values).
+        cumulative_sequence_lengths_device = cumulative_sequence_lengths.to(self.device)
+        cumulative_sequence_lengths_device.cpu_values = cumulative_sequence_lengths  # type: ignore[attr-defined]
 
         return MicroBatch(
             input_tokens=input_tokens.to(self.device, non_blocking=pin),
             output_tokens=output_tokens.to(self.device, non_blocking=pin),
             loss_mask=loss_mask.to(self.device, non_blocking=pin),
             priors=priors.to(self.device, non_blocking=pin),
-            cumulative_sequence_lengths=cumulative_sequence_lengths.to(self.device),
+            cumulative_sequence_lengths=cumulative_sequence_lengths_device,
+            cmix_bit_logits=cmix_bits.to(self.device, non_blocking=pin)
+            if cmix_bits is not None
+            else None,
         )
 
     def _iter_no_prefetch(self) -> Iterator[Batch]:

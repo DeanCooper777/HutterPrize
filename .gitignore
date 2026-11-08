@@ -1,0 +1,42 @@
+# Large or re-downloadable inputs
+/enwik9
+/data/
+/reference/
+/sde-external-*.tar.xz
+/tools/
+/node_modules/
+/package.json
+/package-lock.json
+/progress.log
+
+# Build outputs (rebuild with build.ps1)
+/build/
+*.o
+*.exe
+*.obj
+
+# Run outputs: keep only scripts, tune files and short logs
+/runs/**
+!/runs/*/
+!/runs/*.log
+!/runs/**/*.sh
+!/runs/**/*.tune
+!/runs/**/*.csv
+!/runs/**/*.md
+/runs/upload/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+fx2-cmix-T/data/
+wandb/
+
+# Intermediate checkpoints (the .tfwc2 weights and the final checkpoints are kept)
+fx2-cmix-T/models/*-Aold*.tch
+fx2-cmix-T/models/*-Aopt*.tch
+fx2-cmix-T/models/*.mixer.tch
+
+# Runtime temporaries
+*.cmix.temp
+ppm*.temp

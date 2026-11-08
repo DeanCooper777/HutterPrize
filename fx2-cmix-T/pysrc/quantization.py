@@ -120,7 +120,10 @@ class Quantize(Module):
             self.initialize_scale(blocks, steps=initialize_scales_steps)
             return input
 
-        fake_quantized: Tensor = QuantizeFunction.apply(  # type: ignore
+        quantize_function = (
+            FusedQuantizeFunction if FUSED_QUANT and input.is_cuda else QuantizeFunction
+        )
+        fake_quantized: Tensor = quantize_function.apply(  # type: ignore
             blocks, self.scale.view(-1), self.quant, return_ints
         )
 
@@ -148,6 +151,139 @@ def _stretched_elastic_params(buckets: int) -> tuple[float, float]:
     if buckets == 4:
         return 2.0, 0.5
     raise ValueError(f"no StretchedElasticQuant params for buckets={buckets}")
+
+
+# Fused fake quantization (2026-11-07). The eager QuantizeFunction below runs
+# ~10 elementwise kernels per direction over every activation, in fp32, and
+# saves a full fp32 copy for backward; on run A that was ~72% of GPU time
+# (memory bound, the model's matmuls are small). The fused path compiles just
+# the elementwise math into one kernel per direction and saves the input
+# instead of the fp32 copy. The bf16 rounding of the scales stays in eager
+# code, outside the compiled region (torch.compile of the whole model used to
+# drop it). FUSED_QUANT=0 selects the eager reference.
+import os as _os
+
+FUSED_QUANT: bool = _os.environ.get("FUSED_QUANT", "1") != "0"
+
+# one compiled kernel per (shape, dtype, buckets): the model has a few dozen,
+# more than dynamo's default of 8 per function, past which it fails (with
+# fullgraph=True) or falls back to eager. In torch 2.12 dynamo's config is per thread (autograd runs
+# backward on its own thread, which still saw 8), so it is set in whichever
+# thread calls the compiled functions; hasattr() is False on the config
+# module, hence the try.
+def _raise_recompile_limits() -> None:
+    if torch._dynamo.config.recompile_limit >= 1024:
+        return
+    for name in ("recompile_limit", "accumulated_recompile_limit"):
+        try:
+            setattr(torch._dynamo.config, name, 1024)
+        except (AttributeError, KeyError):
+            pass
+
+
+# Inductor's default division is not IEEE round-to-nearest: on real weights
+# and activations a few values per tensor land on a rounding boundary of
+# x / scale and quantize to the neighbouring level (2026-11-07). This option
+# makes it divide exactly like eager.
+_COMPILE_OPTIONS = {"eager_numerics.division_rounding": True}
+
+
+def _prepared_scale(flat_scale: Tensor, quant: Quantization) -> Tensor:
+    scale = flat_scale.unsqueeze(0).unsqueeze(-1)
+    scale = scale.to(quant.scale_dtype).to(quant.arithmetic_dtype)
+    if quant.epsilon is not None:
+        epsilon = tensor(quant.epsilon, dtype=scale.dtype, device=scale.device)
+        scale = (2 * (scale >= 0).type_as(scale) - 1) * scale.abs().maximum(epsilon)
+    return scale
+
+
+def _fq_quantized(x: Tensor, buckets: int, qmin: int, qmax: int) -> Tensor:
+    if buckets == 2:
+        return 2 * (x >= 0).type_as(x) - 1
+    if buckets in (3, 4):
+        n_levels, shift = _stretched_elastic_params(buckets)
+        clamped = x.clamp(-_STRETCHED_ELASTIC_CLIP_VAL, _STRETCHED_ELASTIC_CLIP_VAL)
+        return ((clamped * n_levels - shift).round() + shift) / n_levels
+    return x.round().clamp(qmin, qmax)
+
+
+@torch.compile(dynamic=False, fullgraph=True, options=_COMPILE_OPTIONS)
+def _fq_forward(
+    blocks: Tensor, scale: Tensor, buckets: int, qmin: int, qmax: int,
+    return_ints: bool,
+) -> Tensor:
+    x = blocks.to(scale.dtype) / scale
+    q = _fq_quantized(x, buckets, qmin, qmax)
+    if return_ints:
+        return q.to(torch.int64)
+    return (scale * q).to(blocks.dtype)
+
+
+@torch.compile(dynamic=False, fullgraph=True, options=_COMPILE_OPTIONS)
+def _fq_backward(
+    grad_out: Tensor, blocks: Tensor, scale: Tensor, buckets: int, qmin: int,
+    qmax: int,
+) -> tuple[Tensor, Tensor]:
+    x = blocks.to(scale.dtype) / scale
+    g = grad_out.to(scale.dtype)
+    if buckets == 2:
+        lo, hi = -1.0, 1.0
+        small_value, big_value = 0.0, 0.0  # unused: sign term below
+    elif buckets in (3, 4):
+        n_levels, shift = _stretched_elastic_params(buckets)
+        lo, hi = -_STRETCHED_ELASTIC_CLIP_VAL, _STRETCHED_ELASTIC_CLIP_VAL
+        big_value = (n_levels - shift) / n_levels
+        small_value = -big_value
+    else:
+        lo, hi = float(qmin), float(qmax)
+        small_value, big_value = float(qmin), float(qmax)
+    too_small = x < lo
+    too_big = hi < x
+    within = too_small.logical_not().logical_and(too_big.logical_not())
+    grad_input = g * within.type_as(g)
+    if buckets == 2:
+        term = 2 * (x >= 0).type_as(x) - 1
+        norm = sqrt(x.numel())
+    else:
+        term = (
+            too_small.type_as(g) * small_value
+            + too_big.type_as(g) * big_value
+            + within.type_as(g) * (_fq_quantized(x, buckets, qmin, qmax) - x)
+        )
+        norm = sqrt(x.numel()) if buckets in (3, 4) else sqrt(x.numel() * qmax)
+    grad_scale = (g * term).sum(0).sum(-1) / norm
+    return grad_input.to(grad_out.dtype), grad_scale.to(grad_out.dtype)
+
+
+class FusedQuantizeFunction(Function):
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        blocks: Tensor,
+        flat_scale: Tensor,
+        quant: Quantization,
+        return_ints: bool,
+    ) -> Tensor:
+        assert quant.block_size is not None and blocks.ndim == 3
+        assert blocks.size(1) == flat_scale.numel()
+        _raise_recompile_limits()
+        scale = _prepared_scale(flat_scale, quant)
+        ctx.save_for_backward(blocks, scale)
+        ctx.quant = quant  # type: ignore[attr-defined]
+        return _fq_forward(
+            blocks, scale, quant.buckets, quant.qmin, quant.qmax, return_ints
+        )
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, grad_out: Tensor):  # type: ignore[override]
+        blocks, scale = ctx.saved_tensors  # type: ignore[attr-defined]
+        quant: Quantization = ctx.quant  # type: ignore[attr-defined]
+        _raise_recompile_limits()
+        grad_input, grad_scale = _fq_backward(
+            grad_out.contiguous(), blocks, scale, quant.buckets, quant.qmin,
+            quant.qmax,
+        )
+        return grad_input, grad_scale, None, None
 
 
 class QuantizeFunction(Function):

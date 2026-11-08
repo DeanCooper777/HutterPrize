@@ -1,0 +1,42 @@
+﻿== enwik5 (transformer+dict): compressing
+
+== enwik5 (transformer+dict): decompressing
+
+
+Date                : 20261106-055040
+File                : enwik5
+Mode                : transformer+dict
+InputBytes          : 100000
+CompressedBytes     : 14748
+TotalWithCompressor : 
+BitsPerChar         : 1.1798
+CompSec             : 28.7
+DecompSec           : 31
+CompPeakMB          : 5395
+DecompPeakMB        : 5355
+Verified            : True
+
+
+
+
+== enwik6 (transformer+dict): compressing
+
+== enwik6 (transformer+dict): decompressing
+
+
+Date                : 20261106-055040
+File                : enwik6
+Mode                : transformer+dict
+InputBytes          : 1000000
+CompressedBytes     : 131850
+TotalWithCompressor : 
+BitsPerChar         : 1.0548
+CompSec             : 177.8
+DecompSec           : 192.6
+CompPeakMB          : 5664
+DecompPeakMB        : 5667
+Verified            : True
+
+
+
+

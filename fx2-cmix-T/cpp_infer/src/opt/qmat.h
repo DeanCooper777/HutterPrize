@@ -107,6 +107,12 @@ struct QDense {
   int ngroups = 0;      // rows_padded / group_rows
   int rows_padded = 0;  // round_up(d_out, group_rows)
   size_t bytes = 0;     // total stream bytes (multiple of the group size)
+  // VNNI-packed variant of the same geometry (qmat_dense.cpp, used when the
+  // CPU has AVX-VNNI): each 32-byte weight vector holds row 2j (low nibbles)
+  // and row 2j+1 (high nibbles) of a chunk as unsigned w+7 in [0,14], so a
+  // group block is [corr | scale | nchunk * group_rows * 16 B]. The kernels
+  // subtract the extra 7*sum(act) exactly: int32 dots are unchanged.
+  bool packed = false;
 };
 
 // arena size in bytes (excluding QMAT_TAIL_SLACK)

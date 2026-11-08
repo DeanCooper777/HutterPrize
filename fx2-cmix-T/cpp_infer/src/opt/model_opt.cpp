@@ -212,6 +212,14 @@ void prof_print(double tsc_to_core, long tokens) {
                   double(g_pcalls[s]) / double(tokens > 0 ? tokens : 1));
     }
   }
+#ifdef ATTN_PROFILE
+  {
+    const double t = double(tokens > 0 ? tokens : 1);
+    std::printf("  attention phases (lfence rdtsc ticks/token): qk %.0f  exp %.0f  pv %.0f\n",
+                double(g_attn_prof[0]) / t, double(g_attn_prof[1]) / t,
+                double(g_attn_prof[2]) / t);
+  }
+#endif
 #endif
 }
 
@@ -265,6 +273,11 @@ struct TransformerOptImpl {
   alignas(64) uint16_t idxp[224 + 16] = {};
   alignas(64) float logits[208] = {};
   alignas(64) float probs208[208] = {};
+  // MLP activation capture (TransformerOpt::set_capture_layers)
+  uint32_t cap_mask = 0;
+  int cap_nnz[12] = {};
+  uint16_t cap_idx[12][DMLP + 16] = {};
+  alignas(64) uint8_t cap_q[12][DMLP] = {};
   alignas(32) float sfall[32] = {}, cfall[32] = {};  // rope fallback row
 
   explicit TransformerOptImpl(const char* path, AttnKind k) : kind(k) {
@@ -479,6 +492,11 @@ struct TransformerOptImpl {
       PSCOPE(PS_MM_MLP_UP);
       nnz = qgemv_relu2q(mm.up.m, q5, mm.down_s_act, q768, idx768);
     }
+    if ((cap_mask >> l) & 1) {
+      cap_nnz[l] = nnz;
+      std::memcpy(cap_idx[l], idx768, sizeof(uint16_t) * nnz);
+      std::memcpy(cap_q[l], q768, DMLP);
+    }
     {
       PSCOPE(PS_MM_MLP_DOWN);
       if (nnz > DOWN_DENSE_NNZ)
@@ -569,6 +587,19 @@ void TransformerOpt::step(uint8_t token, const float* prior205,
 }
 
 const float* TransformerOpt::last_logits() const { return impl->logits; }
+
+const float* TransformerOpt::last_hidden() const { return impl->xn; }
+
+void TransformerOpt::set_capture_layers(uint32_t mask) {
+  impl->cap_mask = mask;
+}
+
+int TransformerOpt::mlp_acts(int layer, const uint16_t** idx,
+                             const uint8_t** q) const {
+  *idx = impl->cap_idx[layer];
+  *q = impl->cap_q[layer];
+  return impl->cap_nnz[layer];
+}
 
 AttnKind TransformerOpt::attn_kind() const { return impl->kind; }
 

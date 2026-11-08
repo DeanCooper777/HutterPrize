@@ -43,6 +43,15 @@ struct TransformerOpt {
 
   // the 205 post-softcap logits of the last step (valid until the next step)
   const float* last_logits() const;
+  // the final rms-normed hidden state (192 floats) the head was applied to
+  const float* last_hidden() const;
+
+  // capture the sparse relu^2 MLP activations (u8, 0..127) of the layers in
+  // mask (bit l = layer l) at every step; mlp_acts returns the last step's
+  // active count for layer l and points idx/q at its indices and the dense
+  // 768-entry activation row
+  void set_capture_layers(uint32_t mask);
+  int mlp_acts(int layer, const uint16_t** idx, const uint8_t** q) const;
 
   AttnKind attn_kind() const;
 
