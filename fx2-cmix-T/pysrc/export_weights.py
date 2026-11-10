@@ -11,6 +11,7 @@ bit-exactly against the model's own Quantize modules (both the ints and the
 dequantized fake-quantized weights) before anything is written
 """
 
+from dataclasses import replace as _dc_replace
 import struct
 
 import numpy as np
@@ -91,6 +92,12 @@ def make_reference_config() -> TransformerConfig:
     matmul_quantization = MatmulQuantization(
         weight=weight_quantization, activation=activation_quantization
     )
+    # A_MLP_BITS=3: 7-level (-3..3) MLP weights, variant 2c (2026-11-08)
+    mlp_bits = int(_os.environ.get("A_MLP_BITS", "4"))
+    mlp_quantization = matmul_quantization if mlp_bits == 4 else MatmulQuantization(
+        weight=_dc_replace(weight_quantization, buckets=2**mlp_bits - 1),
+        activation=activation_quantization,
+    )
 
     return TransformerConfig(
         vocabulary_size=205,
@@ -118,7 +125,7 @@ def make_reference_config() -> TransformerConfig:
         value_embedding_pattern=None,
         prior_value_embedding=False,
         attention_scale=None,
-        d_mlp=768,
+        d_mlp=int(_os.environ.get("A_DMLP", "768")),
         activation_function="relu_squared",
         embedding_norm=True,
         prior_embedding_norm=True,
@@ -141,7 +148,7 @@ def make_reference_config() -> TransformerConfig:
         attention_dtype=torch.float32,
         logit_dtype=torch.float32,
         weight_dtype=torch.float32,
-        mlp_quantization=matmul_quantization,
+        mlp_quantization=mlp_quantization,
         attention_full_rank_quantization=matmul_quantization,
         attention_low_rank_quantization=matmul_quantization,
         qkv_quantization=activation_quantization,
@@ -168,7 +175,7 @@ def load_reference_model(device: torch.device) -> Transformer:
 
 
 def quantize_weight_rows(
-    weight: Tensor, scale_fp32: Tensor
+    weight: Tensor, scale_fp32: Tensor, qmax: int = 7
 ) -> tuple[Tensor, Tensor]:
     """replicate QuantizeFunction.forward for the 15-bucket weight quantizer
     (per-output-row scales, fp32 arithmetic, no epsilon) on the weight's own
@@ -181,7 +188,7 @@ def quantize_weight_rows(
 
     scale = scale_fp32.to(torch.bfloat16).to(torch.float32)
     scaled = weight.float() / scale.unsqueeze(-1)  # IEEE fp32 division per row
-    quantized = scaled.round().clamp(-7, 7)  # round half to even, then clamp
+    quantized = scaled.round().clamp(-qmax, qmax)  # round half to even, then clamp
     return quantized.to(torch.int8), scale
 
 
@@ -255,10 +262,11 @@ def export_weights(model: Transformer, output_filename: str) -> None:
         if key in quantized_weight_keys:
             prefix = key[: -len(".weight")]
             scale_fp32 = state_dict[prefix + ".quantize_weight.scale"].detach()
-            ints, scale_used = quantize_weight_rows(value, scale_fp32)
-
             # verify bit-exactly against the model's own quantizer on CUDA
             quantize_module = modules[prefix].quantize_weight
+            ints, scale_used = quantize_weight_rows(
+                value, scale_fp32, quantize_module.quant.qmax
+            )
             ints_reference = quantize_module(
                 value, initialize_scales_steps=None, return_ints=True
             )
@@ -344,7 +352,7 @@ def export_weights(model: Transformer, output_filename: str) -> None:
         ],
         dtype=np.int32,
     )
-    assert config_ints.tolist() == [205, 192, 12, 64, 3, 768, 1024, 64, 3, 4, 10000]
+    assert config_ints.tolist() == [205, 192, 12, 64, 3, cfg.d_mlp, 1024, 64, 3, 4, 10000]
     entries.append(("config.ints", DTYPE_INT32, config_ints))
     entries.append(
         (

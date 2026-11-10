@@ -62,6 +62,10 @@ struct VanArenas {
   float coef[3] = {};  // 0.125f * sq[h] * sk[h] (same fp order as naive)
 };
 
+#ifndef FX2_DMLP
+#define FX2_DMLP 768  // MLP width; phase 2 builds use -DFX2_DMLP=384/512
+#endif
+
 struct MlpArenas {
   QSite up;                  // 768x192, biased; relu2q epilogue s_next below
   QSparse4 down;             // int4 columns, raw-u8 input (relu^2 output)
@@ -70,7 +74,7 @@ struct MlpArenas {
 
 struct OptModel {
   static constexpr int V = 205, D = 192, NL = 12, DH = 64, NH = 3,
-                       DMLP = 768, ROPE_LEN = 131072;
+                       DMLP = FX2_DMLP, ROPE_LEN = 131072;
   static constexpr bool KIMI_L[NL] = {true, true, true,  false, true, true,
                                       true, false, true, true,  true, false};
 

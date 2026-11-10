@@ -9,11 +9,14 @@
 #include "kernels.h"
 #include "weights_io.h"
 
+#ifndef FX2_DMLP
+#define FX2_DMLP 768  // MLP width; phase 2 builds use -DFX2_DMLP=384/512
+#endif
 namespace fx2 {
 
 namespace {
 
-constexpr int V = 205, D = 192, NL = 12, DH = 64, NH = 3, DMLP = 768;
+constexpr int V = 205, D = 192, NL = 12, DH = 64, NH = 3, DMLP = FX2_DMLP;
 constexpr int WIN = 1024;
 constexpr int ROPE_LEN = 131072;
 constexpr int PRIOR_STRIDE = 208;  // 205 padded to a multiple of 16

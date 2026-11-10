@@ -33,15 +33,18 @@
 #include "../kernels.h"
 #endif
 
+#ifndef FX2_DMLP
+#define FX2_DMLP 768  // MLP width; phase 2 builds use -DFX2_DMLP=384/512
+#endif
 namespace fx2 {
 namespace opt {
 
 namespace {
-constexpr int V = 205, D = 192, NL = 12, DH = 64, NH = 3, DMLP = 768;
+constexpr int V = 205, D = 192, NL = 12, DH = 64, NH = 3, DMLP = FX2_DMLP;
 constexpr int WIN = 1024, ROPE_LEN = 131072;
 // density thresholds for the sparse column kernels (qmat.h)
 constexpr int DOWN_DENSE_NNZ =
-    static_cast<int>(QMAT_SPARSE_DENSITY_THRESHOLD * DMLP);  // 729
+    static_cast<int>(QMAT_SPARSE_DENSITY_THRESHOLD * DMLP);  // 729 at width 768
 constexpr int PRIOR_DENSE_NNZ =
     static_cast<int>(QMAT_SPARSE_DENSITY_THRESHOLD * V);  // 194
 

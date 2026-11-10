@@ -7,6 +7,7 @@
 # schedule starts at 10x and decays to 1x like quantize.py), A_CE_WEIGHT
 # (plain cross-entropy share, default 0.1), A_INIT (start checkpoint).
 from torch.nn.parallel import DistributedDataParallel as DDP
+from dataclasses import replace as _dc_replace
 import torch.distributed as dist
 import torch
 from os import makedirs
@@ -62,6 +63,12 @@ def main() -> None:
     matmul_quantization = MatmulQuantization(
         weight=weight_quantization, activation=activation_quantization
     )
+    # A_MLP_BITS=3: 7-level (-3..3) MLP weights, variant 2c (2026-11-08)
+    mlp_bits = int(os.environ.get("A_MLP_BITS", "4"))
+    mlp_quantization = matmul_quantization if mlp_bits == 4 else MatmulQuantization(
+        weight=_dc_replace(weight_quantization, buckets=2**mlp_bits - 1),
+        activation=activation_quantization,
+    )
 
     raw_model: Transformer = Transformer(
         TransformerConfig(
@@ -92,7 +99,7 @@ def main() -> None:
             value_embedding_pattern=None,
             prior_value_embedding=False,
             attention_scale=None,
-            d_mlp=768,
+            d_mlp=int(os.environ.get("A_DMLP", "768")),
             activation_function="relu_squared",
             embedding_norm=True,
             prior_embedding_norm=True,
@@ -117,7 +124,7 @@ def main() -> None:
             attention_dtype=torch.bfloat16,
             logit_dtype=torch.float32,
             weight_dtype=torch.float32,
-            mlp_quantization=matmul_quantization,
+            mlp_quantization=mlp_quantization,
             attention_full_rank_quantization=matmul_quantization,
             attention_low_rank_quantization=matmul_quantization,
             qkv_quantization=activation_quantization,
@@ -135,7 +142,13 @@ def main() -> None:
     )
 
     raw_model = raw_model.to(device)
-    raw_model.load_state_dict(torch.load(os.environ.get("A_INIT", "models/6m-q4.tch")))
+    # A_INIT_SCALES=N: the start checkpoint has no quantization scales (run B,
+    # stage 1 output, 2026-11-09): load non-strictly and fit the scales over
+    # N steps first, like upstream quantize.py (256)
+    init_scales = int(os.environ.get("A_INIT_SCALES", "0")) or None
+    raw_model.load_state_dict(
+        torch.load(os.environ.get("A_INIT", "models/6m-q4.tch")), strict=init_scales is None
+    )
     model: DDP = DDP(raw_model)
     # important: do not torch compile the model as it removes the .to(torch.bfloat16).to(torch.float32) conversion applied to the quantization scales
 
@@ -181,7 +194,7 @@ def main() -> None:
         return t + (1 - t) * final_learning_rate_multiplier
 
     training_config = TrainingConfig(
-        initialize_scales_steps=None,
+        initialize_scales_steps=init_scales,
         initialize_weight_scales_first=True,
         optimizer_config=OptimizerConfig(
             learning_rate_multiplier_schedule=learning_rate_multiplier_schedule,

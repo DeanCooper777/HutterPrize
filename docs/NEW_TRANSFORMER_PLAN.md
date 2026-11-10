@@ -240,3 +240,35 @@ the gain from longer training keeps going.
 
 **Phase 3 is on hold** (training from scratch, B/C at ~$60–215 each) until phase 2 shows whether
 fine-tuning plateaus.
+
+### Results, phase 1 and phase 2 (2026-11-08)
+
+Split enwik9 estimate for Afull: 553,370 bytes smaller than the current weights, so the entry
+would be about 97,262,799 bytes (−3.15% vs the record, unverified).
+
+| weights (all from run A's weights) | weight file | enwik6 | enwik7 |
+|---|---|---|---|
+| Aopt (3+1 epochs, CE weight 0.1) | 2.94 MB | 130,644 | 1,294,411 |
+| 1a: richer mixer contexts (3+1) | 2.94 MB | 130,374 | 1,292,302 |
+| 1b: CE weight 0.3 (3+1) | 2.94 MB | 130,500 | 1,293,570 |
+| 1b: CE weight 0 (3+1) | 2.94 MB | 130,638 | 1,293,922 |
+| Afull (24+4) | 2,941,833 | 130,353 | 1,291,842 |
+| 2a: width 384, pruned, no fine-tune | 2,088,507 | 176,861 | |
+| 2a: width 384, pruned + 3+1 epochs | 2,082,282 | 154,541 (+18.6%) | 1,500,669 (+16.2%) |
+| 2b: width 512, pruned + 3+1 epochs | 2,367,087 | 143,716 (+10.3%) | 1,410,848 (+9.2%) |
+
+- **Phase 1:** the richer mixer helps (about −0.2%); the CE weight barely matters (0.3 is used
+  from now on).
+- **Phase 2 by pruning fails.** Width 384 saves 1.72 MB (−1.7%) and width 512 saves 1.15 MB
+  (−1.1%), but the archive grows 9–16%. The short fine-tune repairs only about half the damage.
+- **The damage is real, not a bug.** Dropping only 32 of 768 units per layer (by
+  |up|²·|down|) costs 11% on enwik6 (144,502 bytes; loss 1.31 → 1.59 nats/token). The width-736
+  build and zeroing the same units in the 768 build give identical output, so the C++ (`-DFX2_DMLP`,
+  `pysrc/prune_mlp.py`, `A_DMLP`) is correct.
+- A smaller model would have to be trained from scratch (phase 3), not cut down from run A.
+
+**Variant 2c (3-bit MLP weights, 7 levels, 3+1 epoch QAT fine-tune from Afull's start, 2026-11-08):** weights 2,464,278 B (−477,555 vs Afull, ≈ −0.95% of the entry since they count twice), but enwik6 132,953 (+2.0%) and enwik7 1,315,863 (+1.86% vs Afull 1,291,842). Scaled to enwik9 (×0.75) the archive grows ≈ +1.3 MB, more than the weight saving, so the entry gets ≈ 0.3% worse. Rejected.
+
+**Extension run (Afull + 24 epochs incl. 4-epoch cooldown, 2026-11-08/09):** weights 2,947,485 B (+5,652 vs Afull). enwik6 130,364 (+11), enwik7 1,291,904 (+62): flat on the small sets. Split enwik9 (K=16, WARM 4 MB) total 96,750,703 vs Afull 96,780,392 (−29,689). Net entry change ≈ −29,689 + 2×5,652 = −18,385 → estimated entry ≈ 97,244,414 (−3.17% vs 100,424,672). Small but real gain; the extra epochs help only later in enwik9. Training longer from this start has nearly run out.
+
+**Run B result (2026-11-09).** Phase 3 model trained from scratch (d_mlp 384, mixture loss, 128 + 24 QAT + 4 cooldown epochs on 4x RTX PRO 6000, ~11.6 h, ~$116). Weights 2,023,160 bytes (-907,492 vs current), but enwik6 137,117 (+5.2% vs ext 130,364) and enwik7 1,352,358 (+4.7% vs ext 1,291,904), far beyond the ~1.7% the weight saving can pay for. Rejected; checkpoints kept in fx2-cmix-T/models/runB/. Best remains the extension weights (-3.17% est.).

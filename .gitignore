@@ -40,3 +40,6 @@ fx2-cmix-T/models/*.mixer.tch
 # Runtime temporaries
 *.cmix.temp
 ppm*.temp
+
+# Run B progress-bar logs (huge)
+fx2-cmix-T/models/runB/*.log

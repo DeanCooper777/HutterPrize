@@ -3,6 +3,7 @@
 # A_CE_WEIGHT (default 0.1). Output: models/6m-q4-fp32-A.tch, which
 # export_weights / weights_compress turn into the .tfwc2 the compressor loads.
 from torch.nn.parallel import DistributedDataParallel as DDP
+from dataclasses import replace as _dc_replace
 import torch.distributed as dist
 import torch
 from os import makedirs
@@ -57,6 +58,12 @@ def main() -> None:
     matmul_quantization = MatmulQuantization(
         weight=weight_quantization, activation=activation_quantization
     )
+    # A_MLP_BITS=3: 7-level (-3..3) MLP weights, variant 2c (2026-11-08)
+    mlp_bits = int(os.environ.get("A_MLP_BITS", "4"))
+    mlp_quantization = matmul_quantization if mlp_bits == 4 else MatmulQuantization(
+        weight=_dc_replace(weight_quantization, buckets=2**mlp_bits - 1),
+        activation=activation_quantization,
+    )
 
     raw_model: Transformer = Transformer(
         TransformerConfig(
@@ -85,7 +92,7 @@ def main() -> None:
             value_embedding_pattern=None,
             prior_value_embedding=False,
             attention_scale=None,
-            d_mlp=768,
+            d_mlp=int(os.environ.get("A_DMLP", "768")),
             activation_function="relu_squared",
             embedding_norm=True,
             prior_embedding_norm=True,
@@ -110,7 +117,7 @@ def main() -> None:
             attention_dtype=torch.float32,
             logit_dtype=torch.float32,
             weight_dtype=torch.float32,
-            mlp_quantization=matmul_quantization,
+            mlp_quantization=mlp_quantization,
             attention_full_rank_quantization=matmul_quantization,
             attention_low_rank_quantization=matmul_quantization,
             qkv_quantization=activation_quantization,

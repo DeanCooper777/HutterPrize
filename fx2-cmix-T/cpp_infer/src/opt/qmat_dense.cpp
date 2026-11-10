@@ -214,7 +214,14 @@ bool detect_vnni() {
   return (a >> 4) & 1;
 #endif
 }
+// FX2_NO_VNNI (set by the Linux submission makefile) compiles the VNNI
+// kernels out, so the binary holds nothing past AVX2 (checked by
+// build_and_construct_comp.sh); the results are identical either way.
+#ifdef FX2_NO_VNNI
+const bool g_vnni = false;
+#else
 const bool g_vnni = detect_vnni();
+#endif
 
 // AVX512-VNNI (Ice Lake / Tiger Lake, e.g. the contest's i7-1165G7): the same
 // vpdpbusd on ymm registers in its EVEX encoding (needs AVX512VL), for CPUs
@@ -244,8 +251,13 @@ bool detect_vnni512() {
   const unsigned long long xcr0 = _xgetbv(0);
   return (xcr0 & 0xE6) == 0xE6;
 }
+#ifdef FX2_NO_VNNI
+const bool g_vnni512 = false;
+#else
 const bool g_vnni512 = !g_vnni && detect_vnni512();
+#endif
 
+#ifndef FX2_NO_VNNI
 template <int NC, int PFN, class Epi>
 __attribute__((target("avxvnni"), noinline)) void run_g8_vnni(
     const QDense& m, const uint8_t* act, Epi& epi) {
@@ -333,6 +345,7 @@ __attribute__((target("avxvnni"), noinline)) void run_g4_768_vnni(
   }
 }
 
+#endif  // FX2_NO_VNNI
 // ---------------------------------------------------------------------------
 // VNNI + packed nibbles (QDense::packed). Halves the weight bytes streamed per
 // token (the matmuls are L3-bandwidth-bound on recent Intel cores, where the
@@ -378,6 +391,7 @@ inline void qm_pf(const char* p) {
   else _mm_prefetch(p, _MM_HINT_T0);
 }
 
+#ifndef FX2_NO_VNNI
 #define QM_PACKED_KERNELS(SUF, TGT, DP) \
 template <int NC, int PFN, class Epi>                                             \
 __attribute__((target(TGT), noinline)) void run_g8_vnni4##SUF(                    \
@@ -468,25 +482,34 @@ QM_PACKED_KERNELS(, "avxvnni", _mm256_dpbusd_avx_epi32)
 // EVEX encoding on ymm: AVX512-VNNI + AVX512VL (no zmm registers are used)
 QM_PACKED_KERNELS(_512, "avx512vnni,avx512vl,avx512f", _mm256_dpbusd_epi32)
 #undef QM_PACKED_KERNELS
+#endif  // FX2_NO_VNNI
 
 template <int NC, int PFN, class Epi>
 inline void run_g8_any(const QDense& m, const uint8_t* act, Epi& epi) {
+#ifdef FX2_NO_VNNI
+  run_g8<NC, PFN>(m, act, epi);
+#else
   if (m.packed) {
     if (g_vnni) run_g8_vnni4<NC, PFN>(m, act, epi);
     else run_g8_vnni4_512<NC, PFN>(m, act, epi);
   }
   else if (g_vnni) run_g8_vnni<NC, PFN>(m, act, epi);
   else run_g8<NC, PFN>(m, act, epi);
+#endif
 }
 
 template <int PFN, class Epi>
 inline void run_g4_768_any(const QDense& m, const uint8_t* act, Epi& epi) {
+#ifdef FX2_NO_VNNI
+  run_g4_768<PFN>(m, act, epi);
+#else
   if (m.packed) {
     if (g_vnni) run_g4_768_vnni4<PFN>(m, act, epi);
     else run_g4_768_vnni4_512<PFN>(m, act, epi);
   }
   else if (g_vnni) run_g4_768_vnni<PFN>(m, act, epi);
   else run_g4_768<PFN>(m, act, epi);
+#endif
 }
 
 template <int PFN, class Epi>
