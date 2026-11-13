@@ -125,6 +125,7 @@ enum : uint8_t {
   ENC_PLANE4 = 3,
   ENC_ROPE_SIN = 4,
   ENC_ROPE_COS = 5,
+  ENC_INTC = 6,  // DT_I8, n-bit tree with per-tensor count-based probabilities
 };
 
 // --- bit-exact host port of CUDA libdevice __nv_sinf/__nv_cosf --------------
@@ -249,6 +250,35 @@ struct BinDecoder {
     }
     return bit;
   }
+  // counts: (2 << nbits) entries, [2*node] zeros and [2*node+1] ones seen;
+  // P(0) = (2*n0 + 1) / (2*(n0 + n1) + 2) in 12 bits, clamped to [1, 4095]
+  uint32_t decode_tree_counts(uint32_t* counts, int nbits) {
+    uint32_t node = 1;
+    for (int k = 0; k < nbits; k++) {
+      uint32_t* c = &counts[2 * node];
+      uint32_t pr = uint32_t(((2 * uint64_t(c[0]) + 1) << 12) /
+                             (2 * (uint64_t(c[0]) + c[1]) + 2));
+      if (pr < 1) pr = 1;
+      if (pr > 4095) pr = 4095;
+      uint32_t bound = (range >> 12) * pr;
+      uint32_t bit;
+      if (code < bound) {
+        range = bound;
+        bit = 0;
+      } else {
+        code -= bound;
+        range -= bound;
+        bit = 1;
+      }
+      c[bit]++;
+      while (range < (1u << 24)) {
+        code = (code << 8) | byte();
+        range <<= 8;
+      }
+      node = (node << 1) | bit;
+    }
+    return node - (1u << nbits);
+  }
   // probs: (1 << nbits) entries, indices 1.. used
   uint32_t decode_tree(uint16_t* probs, int nbits) {
     uint32_t node = 1;
@@ -321,6 +351,19 @@ WeightsFile load_v2(Reader& r, const char* path) {
     uint8_t encoding = get_meta();
 
     switch (encoding) {
+      case ENC_INTC: {
+        if (t.dtype != DT_I8) die("%s: %s: ENC_INTC on dtype %u", path,
+                                  name.c_str(), unsigned(t.dtype));
+        int nbits = get_meta();
+        if (nbits < 2 || nbits > 8) die("%s: %s: bad ENC_INTC width", path,
+                                        name.c_str());
+        uint32_t counts[512] = {0};
+        const int offset = (1 << (nbits - 1)) - 1;
+        int8_t* out = reinterpret_cast<int8_t*>(t.data.data());
+        for (size_t k = 0; k < numel; k++)
+          out[k] = int8_t(int(dec.decode_tree_counts(counts, nbits)) - offset);
+        break;
+      }
       case ENC_INT4: {
         if (t.dtype != DT_I8) die("%s: %s: ENC_INT4 on dtype %u", path,
                                   name.c_str(), unsigned(t.dtype));

@@ -94,7 +94,7 @@ check_no_recip_estimate() {
 }
 check_no_recip_estimate ./cmix
 
- upx-ucl -9 cmix
+ upx-ucl --lzma cmix
 
 # this is a directory where the compressor binary will be placed 
 DIR=run

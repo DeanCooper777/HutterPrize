@@ -95,6 +95,17 @@ struct OptModel {
   std::vector<float> rope_sin, rope_cos;  // 131072 x 32 each
   float inv_freq[32] = {};
 
+  // experimental 16-bit activation path (act16.h); CMIX_ACT16 bitmask:
+  // 1 = mlp.down input, 2 = attention output-projection input
+  int act16 = 3;
+  HugeBuf pool16;
+  const int8_t* down16[NL] = {};  // [DMLP][192] int8 columns
+  const float* down_fold16[NL] = {};
+  float down_s16[NL] = {};
+  const int8_t* op16[NL] = {};    // [192][192] int8 rows
+  const float* op_fold16[NL] = {};
+  float op_s16[NL] = {};
+
   void load(const char* weights_path);
 };
 

@@ -56,6 +56,29 @@ static unsigned long long trim_every = 20000;  // bytes between checks (0: never
 static unsigned long long ws_budget = 0;       // trim only above this working set
 #else
 static constexpr char mmap_path[] = "ppm.temp";
+// The remap that drops the heap's pages from the resident set is done when
+// the process's resident set exceeds rss_budget, checked every rss_check
+// bytes (tune keys ppmd_rss_mb, default 8600 MB, and ppmd_trim). Upstream
+// remapped every 20000 bytes regardless: late in an enwik9 run the heap pages
+// touched within 20000 bytes reach ~4.4 GB on top of ~5.8 GB of other memory
+// (measured peak 10.2 GB), and early in the run the remaps are wasted page
+// faults. ppmd_rss_mb=0 restores the fixed period. The heap contents, and
+// therefore the output, do not depend on when the remap happens.
+static unsigned long long rss_check = 2000;
+static unsigned long long rss_budget = 0;
+
+// resident set of this process in bytes; 0 if it cannot be read
+static unsigned long long ResidentBytes() {
+  static int fd = open("/proc/self/statm", O_RDONLY);
+  if (fd < 0) return 0;
+  char buf[128];
+  ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
+  if (n <= 0) return 0;
+  buf[n] = 0;
+  unsigned long long size = 0, resident = 0;
+  if (sscanf(buf, "%llu %llu", &size, &resident) != 2) return 0;
+  return resident * (unsigned long long)sysconf(_SC_PAGESIZE);
+}
 #endif
 
 const int ORealMAX=256;
@@ -1436,6 +1459,10 @@ PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
 #ifdef _WIN32
   trim_every = (unsigned long long)tune::Get("ppmd_trim", 20000);
   ws_budget = (unsigned long long)tune::Get("ppmd_ws_mb", 8500) << 20;
+#else
+  rss_budget = (unsigned long long)tune::Get("ppmd_rss_mb", 8600) << 20;
+  rss_check = (unsigned long long)tune::Get("ppmd_trim", rss_budget ? 2000 : 20000);
+  if (!rss_check) rss_check = 20000;
 #endif
   ppmd_model_.reset(new ppmd_Model());
   ppmd_model_->Init(order,memory,1,0);
@@ -1460,7 +1487,13 @@ void PPMD::ByteUpdate() {
   ByteModel::ByteUpdate();
   probs_ /= probs_.sum();
 #ifndef _WIN32
-  if (mmap_to_disk && counter_ % 20000 == 0) {
+  bool remap = false;
+  if (mmap_to_disk && counter_ % rss_check == 0) {
+    unsigned long long rss = rss_budget ? ResidentBytes() : 0;
+    // no budget, or /proc unreadable: the fixed period
+    remap = rss ? rss > rss_budget : counter_ % 20000 == 0;
+  }
+  if (remap) {
     // The suballocator keeps absolute pointers into the heap (pText,
     // UnitsStart, LoUnit, HiUnit, AuxUnit, MinContext, MaxContext,
     // FoundState), and none of them are rebased here -- so the remap has to

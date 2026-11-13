@@ -220,6 +220,49 @@ void OptModel::load(const char* weights_path) {
   unembed = qsite("unembedding", V, D, true);
   stream_bytes = round64(off);
 
+  if (const char* e = std::getenv("CMIX_ACT16")) act16 = std::atoi(e);
+  if (act16) {
+    pool16.alloc(size_t(NL) * (size_t(DMLP + D) * D + 2 * sizeof(float) * D +
+                               256) + QMAT_TAIL_SLACK);
+    size_t o16 = 0;
+    auto take16 = [&](size_t n) -> uint8_t* {
+      o16 = round64(o16);
+      uint8_t* q = pool16.p + o16;
+      o16 += n;
+      if (o16 + QMAT_TAIL_SLACK > pool16.bytes) die("act16 pool overflow");
+      return q;
+    };
+    // int8 weights (columns, or rows if by_rows) + fold with the activation
+    // scale / 256 (exact)
+    auto cols16 = [&](const std::string& prefix, int d_in, bool by_rows,
+                      const int8_t** cols, const float** foldp, float* s16) {
+      const WTensor& wq =
+          wf.get(prefix + ".weight.q", DT_I8,
+                 {static_cast<uint32_t>(D), static_cast<uint32_t>(d_in)});
+      const WTensor& ws = wf.get(prefix + ".weight.scale", DT_BF16,
+                                 {static_cast<uint32_t>(D)});
+      const WTensor& sa =
+          wf.get(prefix + ".quantize_activation.scale", DT_BF16, {1});
+      *s16 = bf16_to_f32(sa.bf16_bits()[0]) * (1.0f / 256.0f);
+      float* f = reinterpret_cast<float*>(take16(sizeof(float) * D));
+      for (int o = 0; o < D; o++)
+        f[o] = *s16 * bf16_to_f32(ws.bf16_bits()[o]);
+      int8_t* c = reinterpret_cast<int8_t*>(take16(size_t(d_in) * D));
+      for (int o = 0; o < D; o++)
+        for (int i = 0; i < d_in; i++)
+          c[by_rows ? size_t(o) * d_in + i : size_t(i) * D + o] =
+              wq.i8()[size_t(o) * d_in + i];
+      *cols = c;
+      *foldp = f;
+    };
+    for (int l = 0; l < NL; l++) {
+      std::string b = "blocks." + std::to_string(l) + ".";
+      cols16(b + "attention.output_projection", D, true, &op16[l], &op_fold16[l],
+             &op_s16[l]);
+      cols16(b + "mlp.down", DMLP, false, &down16[l], &down_fold16[l], &down_s16[l]);
+    }
+  }
+
   // ---- non-stream data: tail slack gap, then the normed embedding table ----
   off += QMAT_TAIL_SLACK;
   {

@@ -198,6 +198,8 @@ ENC_BF16 = 2  # DT_BF16, hi/lo byte models
 ENC_PLANE4 = 3  # DT_F32/DT_I32, per-byte-plane models
 ENC_ROPE_SIN = 4  # empty payload: recompute from rope.inv_freq
 ENC_ROPE_COS = 5  # empty payload: recompute from rope.inv_freq
+ENC_INTC = 6  # DT_I8 values in [-(2^(n-1)-1), 2^(n-1)-1]: one meta byte n, then
+# an n-bit tree with count-based probabilities, reset for every tensor
 
 
 # --- bit-exact host emulation of CUDA libdevice __nv_sinf/__nv_cosf ---------
@@ -384,6 +386,28 @@ class BinEncoder:
             self.encode_bit(probs, node, bit)
             node = (node << 1) | bit
 
+    def encode_tree_counts(self, counts: list, nbits: int, symbol: int) -> None:
+        """counts: 2 << nbits ints, [2*node] zeros and [2*node + 1] ones seen;
+        P(0) = (2*n0 + 1) / (2*(n0 + n1) + 2) in 12 bits, clamped to [1, 4095]"""
+        node = 1
+        for k in range(nbits - 1, -1, -1):
+            bit = (symbol >> k) & 1
+            n0 = counts[2 * node]
+            n1 = counts[2 * node + 1]
+            p = ((2 * n0 + 1) << 12) // (2 * (n0 + n1) + 2)
+            p = min(max(p, 1), 4095)
+            bound = (self.range >> 12) * p
+            if bit == 0:
+                self.range = bound
+            else:
+                self.low += bound
+                self.range -= bound
+            counts[2 * node + bit] += 1
+            while self.range < _TOP:
+                self.range = self.range << 8
+                self._shift_low()
+            node = (node << 1) | bit
+
     def finish(self) -> bytes:
         for _ in range(5):
             self._shift_low()
@@ -427,6 +451,28 @@ class BinDecoder:
             node = (node << 1) | self.decode_bit(probs, node)
         return node - (1 << nbits)
 
+    def decode_tree_counts(self, counts: list, nbits: int) -> int:
+        node = 1
+        for _ in range(nbits):
+            n0 = counts[2 * node]
+            n1 = counts[2 * node + 1]
+            p = ((2 * n0 + 1) << 12) // (2 * (n0 + n1) + 2)
+            p = min(max(p, 1), 4095)
+            bound = (self.range >> 12) * p
+            if self.code < bound:
+                self.range = bound
+                bit = 0
+            else:
+                self.code -= bound
+                self.range -= bound
+                bit = 1
+            counts[2 * node + bit] += 1
+            while self.range < _TOP:
+                self.code = ((self.code << 8) | self._byte()) & _MASK32
+                self.range = self.range << 8
+            node = (node << 1) | bit
+        return node - (1 << nbits)
+
 
 class _Models:
     """the adaptive model set of the v2 stream (same on both sides)"""
@@ -462,13 +508,26 @@ class _Models:
         return t
 
 
+def _intc_bits(array: np.ndarray) -> int:
+    """smallest n in 2..8 with all values in [-(2^(n-1)-1), 2^(n-1)-1]; 0 if none"""
+    flat = array.astype(np.int32).ravel()
+    m = int(np.abs(flat).max()) if len(flat) else 0
+    for n in range(2, 9):
+        if m <= (1 << (n - 1)) - 1:
+            return n
+    return 0
+
+
 def _pick_encoding(
     name: str,
     dtype_code: int,
     array: np.ndarray,
     seen: dict[str, np.ndarray],
+    count_coder: bool = False,
 ) -> int:
     if dtype_code == DTYPE_INT8:
+        if count_coder and _intc_bits(array):
+            return ENC_INTC
         flat = array.astype(np.int32).ravel()
         if len(flat) == 0 or (flat.min() >= -7 and flat.max() <= 7):
             return ENC_INT4
@@ -496,9 +555,13 @@ def _pick_encoding(
 
 
 def write_tensor_file_v2(
-    filename: str, entries: list[tuple[str, int, np.ndarray]]
+    filename: str,
+    entries: list[tuple[str, int, np.ndarray]],
+    count_coder: bool = False,
 ) -> None:
-    """compressed alternative to export_weights.write_tensor_file (format v2)"""
+    """compressed alternative to export_weights.write_tensor_file (format v2);
+    count_coder=True codes the quantized weights with ENC_INTC (needs a decoder
+    that knows it)"""
     enc = BinEncoder()
     models = _Models()
 
@@ -525,10 +588,17 @@ def write_tensor_file_v2(
             for k in range(4):
                 put_meta((d >> (8 * k)) & 0xFF)
 
-        encoding = _pick_encoding(name, dtype_code, data, seen)
+        encoding = _pick_encoding(name, dtype_code, data, seen, count_coder)
         put_meta(encoding)
 
-        if encoding == ENC_INT4:
+        if encoding == ENC_INTC:
+            nbits = _intc_bits(data)
+            put_meta(nbits)
+            counts = [0] * (2 << nbits)
+            offset = (1 << (nbits - 1)) - 1
+            for v in (data.astype(np.int32).ravel() + offset).tolist():
+                enc.encode_tree_counts(counts, nbits, v)
+        elif encoding == ENC_INT4:
             probs = models.int4
             for v in (data.astype(np.int32).ravel() + 7).tolist():
                 enc.encode_tree(probs, 4, v)
@@ -594,7 +664,16 @@ def read_tensor_file_v2(filename: str) -> dict[str, tuple[int, np.ndarray]]:
         encoding = get_meta()
 
         dtype = np.dtype(_DTYPE_TO_NUMPY[dtype_code])
-        if encoding == ENC_INT4:
+        if encoding == ENC_INTC:
+            assert dtype_code == DTYPE_INT8
+            nbits = get_meta()
+            counts = [0] * (2 << nbits)
+            offset = (1 << (nbits - 1)) - 1
+            array = np.array(
+                [dec.decode_tree_counts(counts, nbits) - offset for _ in range(count)],
+                dtype=np.int8,
+            ).reshape(shape)
+        elif encoding == ENC_INT4:
             assert dtype_code == DTYPE_INT8
             probs = models.int4
             array = np.array(
@@ -672,12 +751,12 @@ def main() -> None:
 
     usage = (
         "usage: python -m pysrc.weights_compress"
-        " {compress|compress1|decompress|verify} <input> <output|compressed>"
+        " {compress|compress1|compress3|decompress|verify} <input> <output|compressed>"
     )
     if len(sys.argv) != 4:
         sys.exit(usage)
     command, a, b = sys.argv[1:]
-    if command not in ("compress", "compress1", "decompress", "verify"):
+    if command not in ("compress", "compress1", "compress3", "decompress", "verify"):
         sys.exit(usage)
 
     # Check the input files up front so a typo is reported as such instead of
@@ -692,9 +771,12 @@ def main() -> None:
                 else f"error: input file {path!r} is not a regular file"
             )
 
-    if command in ("compress", "compress1"):
+    if command in ("compress", "compress1", "compress3"):
         entries = _entries_from_reference(a)
-        writer = write_tensor_file_v2 if command == "compress" else write_tensor_file_v1
+        if command == "compress3":  # count-based weight coder (ENC_INTC)
+            writer = lambda f, e: write_tensor_file_v2(f, e, count_coder=True)
+        else:
+            writer = write_tensor_file_v2 if command == "compress" else write_tensor_file_v1
         writer(b, entries)
         _verify_equal(dict(read_tensor_file(a)), _read_compressed(b))
         print(

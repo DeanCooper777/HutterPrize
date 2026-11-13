@@ -78,6 +78,7 @@ $tfSrc = @(
   @{ src='cpp_infer/src/opt/kda.cpp';               obj='tf_kda';                   os=$false },
   @{ src='cpp_infer/src/opt/glue.cpp';              obj='tf_glue';                  os=$false },
   @{ src='cpp_infer/src/opt/arena_build.cpp';       obj='tf_arena_build';           os=$false },
+  @{ src='cpp_infer/src/opt/act16.cpp';             obj='tf_act16';                 os=$false },
   @{ src='cpp_infer/src/opt/model_opt.cpp';         obj='tf_model_opt';             os=$false })
 
 # ---------------------------------------------------------------- helpers

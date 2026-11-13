@@ -17,6 +17,7 @@
 #include <cstring>
 #include <vector>
 
+#include "act16.h"
 #include "arena_build.h"
 #include "attn.h"
 #include "glue.h"
@@ -270,6 +271,12 @@ struct TransformerOptImpl {
   alignas(64) float qf[D] = {}, kf[D] = {}, vf[D] = {}, pre[D] = {};
   alignas(64) int8_t qq[D] = {}, kk[D] = {}, vv[D] = {};
   alignas(64) uint8_t q768[DMLP] = {};
+  // 16-bit activation path (act16.h)
+  int cur_l = 0;
+  alignas(64) float h768[DMLP] = {};
+  alignas(64) int16_t a768[DMLP] = {};
+  alignas(64) int16_t a192[D] = {};
+  alignas(64) uint16_t ident192[D + 16] = {};
   alignas(64) uint16_t idx768[DMLP + 16] = {};
   alignas(64) float prior_f32[208] = {};
   alignas(64) uint8_t q8p[224] = {};      // 224 = 205 rounded to 32
@@ -295,6 +302,8 @@ struct TransformerOptImpl {
     else
       kvi = reinterpret_cast<AttnKV*>(spool.p + kda_sz);
     for (int i = 0; i < 9; i++) kda_layer_reset(kst[i]);
+    for (int i = 0; i < D + 16; i++)
+      ident192[i] = static_cast<uint16_t>(i < D ? i : D - 1);
   }
 
   void begin(int64_t rope_position_offset) {
@@ -371,11 +380,15 @@ struct TransformerOptImpl {
     }
     {
       PSCOPE(PS_EL_OQ);
-      quant192_u8(gn, L.op.s_act, q5);
+      if (M.act16 & 2) quant192_i16(gn, M.op_s16[cur_l], a192);
+      else quant192_u8(gn, L.op.s_act, q5);
     }
     {
       PSCOPE(PS_MM_KOP);
-      qgemv_add(L.op.m, q5, x);
+      if (M.act16 & 2)
+        gemv16_add(M.op16[cur_l], M.op_fold16[cur_l], a192, x);
+      else
+        qgemv_add(L.op.m, q5, x);
     }
   }
 
@@ -476,11 +489,15 @@ struct TransformerOptImpl {
 #endif
     {
       PSCOPE(PS_EL_OQ);
-      quant192_u8(pre, L.op.s_act, q5);
+      if (M.act16 & 2) quant192_i16(pre, M.op_s16[cur_l], a192);
+      else quant192_u8(pre, L.op.s_act, q5);
     }
     {
       PSCOPE(PS_MM_VOP);
-      qgemv_add(L.op.m, q5, x);
+      if (M.act16 & 2)
+        gemv16_add(M.op16[cur_l], M.op_fold16[cur_l], a192, x);
+      else
+        qgemv_add(L.op.m, q5, x);
     }
   }
 
@@ -491,6 +508,18 @@ struct TransformerOptImpl {
       rms_norm_quant192(x, xn, mm.up.s_act, q5);
     }
     int nnz;
+    if (M.act16 & 1) {
+      {
+        PSCOPE(PS_MM_MLP_UP);
+        qgemv_f32(mm.up.m, q5, h768);
+        nnz = relu2_quant16(h768, M.down_s16[l], DMLP, a768, idx768);
+      }
+      {
+        PSCOPE(PS_MM_MLP_DOWN);
+        spmv16_add(M.down16[l], M.down_fold16[l], a768, idx768, nnz, x);
+      }
+      return;
+    }
     {
       PSCOPE(PS_MM_MLP_UP);
       nnz = qgemv_relu2q(mm.up.m, q5, mm.down_s_act, q768, idx768);
@@ -539,6 +568,7 @@ struct TransformerOptImpl {
         if (l >= 6) add_scaled192(x, M.skip_w[l - 6], skip_store[11 - l]);
         axpby_tok192(M.rsc[l], x, M.tec[l], tok);
       }
+      cur_l = l;
       if (OptModel::KIMI_L[l])
         kimi_layer(M.layer2kimi[l]);
       else

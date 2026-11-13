@@ -24,7 +24,7 @@ const DecaySchedule& Decay() {
       (unsigned long long)tune::Get("decay_t2", 5000000),
       (unsigned long long)tune::Get("decay_t3", 25000000),
       (float)tune::Get("decay_d0", 1.0), (float)tune::Get("decay_d1", 0.7),
-      (float)tune::Get("decay_d2", 0.3), (float)tune::Get("decay_d3", 0.05)};
+      (float)tune::Get("decay_d2", 0.3), (float)tune::Get("decay_d3", 0.08)};
   return d;
 }
 

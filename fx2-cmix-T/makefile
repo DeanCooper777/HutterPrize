@@ -46,6 +46,8 @@ endif
 # which are exactly specified and therefore identical on every x86-64 CPU.
 # Do not remove this; build_and_construct_comp.sh re-checks the built binary.
 ARCHFLAGS += -mrecip=none
+# Size: nothing in cmix catches exceptions, so the unwind tables are dead weight.
+ARCHFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables
 
 CPPFLAGS_PART-THAT-SHOULD-BE-FAST += $(ARCHFLAGS)
 
@@ -53,7 +55,7 @@ CPPFLAGS_PART-THAT-CAN-BE-SLOW    := $(CPPFLAGS_PART-THAT-SHOULD-BE-FAST)
 CPPFLAGS_PART-THAT-CAN-BE-SLOW    += -Os -fdata-sections -ffunction-sections
 CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -O3 -fdata-sections -ffunction-sections
 
-LFLAGS := -m64 -Wl,--gc-sections -std=c++17
+LFLAGS := -m64 -Wl,--gc-sections -std=c++17 -Wl,--build-id=none -Wl,-z,norelro -Wl,--hash-style=gnu -Wl,-z,noseparate-code
 
 # Transformer inference objects (cpp_infer). Compiled with the exact flag set
 # of cpp_infer/Makefile: NO -ffp-model=fast (bit-exact IEEE arithmetic keeps
@@ -63,9 +65,9 @@ LFLAGS := -m64 -Wl,--gc-sections -std=c++17
 # identical to the hand-optimized, benchmarked cpp_infer objects).
 # The kernels require AVX2/FMA/F16C, which every ARCHFLAGS variant provides.
 CPPFLAGS_TRANSFORMER := -m64 -O3 -std=c++17 -Wall -Wextra -fno-math-errno -fdata-sections -ffunction-sections -DFX2_NO_VNNI
-CPPFLAGS_TRANSFORMER += $(ARCHFLAGS)
+CPPFLAGS_TRANSFORMER += $(ARCHFLAGS) -fno-exceptions -fno-rtti
 
-TRANSFORMER_OBJS := tf_weights_io.o tf_weights_io_compressed.o tf_qmat_dense.o tf_qmat_sparse.o tf_attn.o tf_kda.o tf_glue.o tf_arena_build.o tf_model_opt.o
+TRANSFORMER_OBJS := tf_weights_io.o tf_weights_io_compressed.o tf_qmat_dense.o tf_qmat_sparse.o tf_attn.o tf_kda.o tf_glue.o tf_arena_build.o tf_act16.o tf_model_opt.o
 
 tf_weights_io.o: cpp_infer/src/weights_io.cpp cpp_infer/src/weights_io.h
 	$(CC) $(CPPFLAGS_TRANSFORMER) -c cpp_infer/src/weights_io.cpp -o $@
