@@ -35,6 +35,12 @@ namespace {
   const int kMinVocabFileSize = 10000;
 }
 
+// CMIX_OFFICIAL: the build for an official Hutter Prize run. Only what comp9 and archive9 use is
+// compiled in: -e, argument-less decompression, the plain -c/-d used for the embedded dictionary
+// and article order, and -h. No long options, no dump files, no help text, no CMIX_TUNE file.
+#ifdef CMIX_OFFICIAL
+int Help() { return -1; }
+#else
 int Help() {
   printf("fx2-cmix\n");
   printf("Compress:\n");
@@ -104,6 +110,7 @@ int Help() {
   printf("                                      decompression must both use it or neither\n");
   return -1;
 }
+#endif
 
 struct ExtractionOptions {
   bool ppmd_only = false;
@@ -149,6 +156,9 @@ struct ExtractionOptions {
   }
 };
 
+#ifdef CMIX_OFFICIAL
+#define UsageError(...) exit(1)
+#else
 [[noreturn]] void UsageError(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -159,6 +169,7 @@ struct ExtractionOptions {
   Help();
   exit(1);
 }
+#endif
 
 // Every path named on the command line is checked here, up front, so that a
 // typo or a missing file is reported immediately with the offending path
@@ -181,6 +192,7 @@ void RequireReadableFile(const char* what, const std::string& path) {
 // positional arguments can be handled afterwards.
 ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
   ExtractionOptions options;
+#ifndef CMIX_OFFICIAL
   int out = 1;
   for (int i = 1; i < *argc; ++i) {
     std::string arg = argv[i];
@@ -240,6 +252,7 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
     *value = argv[++i];
   }
   *argc = out;
+#endif
   return options;
 }
 
@@ -249,6 +262,7 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
 // since the decompressor's models must match the compressor's); the ones that
 // dump or replace the compressor's input have no counterpart there.
 void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
+#ifndef CMIX_OFFICIAL
   bool enwik9_decompression = mode == 0;
   // The options that name an existing file (the --save-* ones name files to be
   // created, so they are not checked here).
@@ -382,6 +396,7 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
           "--save-article-boundaries would produce no output at all");
     }
   }
+#endif
 }
 
 size_t getFileSize(const std::string& path) {
@@ -867,6 +882,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
 #ifdef _WIN32
   preprocessor::g_vocab_safe_lengths = !transformer_weights.empty();
 #endif
+#ifndef CMIX_OFFICIAL
   if (extraction.raw_stream) {
     if (enable_preprocess) {
       Fail("--raw-stream can only be used with -n");
@@ -876,7 +892,9 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     while ((got = fread(buffer.data(), 1, buffer.size(), data_in)) > 0) {
       fwrite(buffer.data(), 1, got, temp_out);
     }
-  } else if (enable_preprocess) {
+  } else
+#endif
+  if (enable_preprocess) {
     fprintf(stderr, "\rpreprocessing...");
     fflush(stderr);
     preprocessor::Encode(data_in, temp_out, *input_bytes, temp_path,
@@ -904,6 +922,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     temp_in.seekg(0, std::ios::beg);
   }
 
+#ifndef CMIX_OFFICIAL
   if (!extraction.save_vocab.empty()) {
     FILE* f = fopen(extraction.save_vocab.c_str(), "wb");
     if (f == NULL) Fail("cannot open %s", extraction.save_vocab.c_str());
@@ -916,6 +935,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     printf("\rsaved vocabulary of %d bytes to %s\n", n,
         extraction.save_vocab.c_str());
   }
+#endif
 #ifdef _WIN32
   // Windows port: the transformer's token ids are indices into the exact
   // 205-byte vocabulary of the official build (read from the header of the
@@ -948,6 +968,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     }
   }
 
+#ifndef CMIX_OFFICIAL
   if (!extraction.save_ppmd_bytes.empty()) {
     SavePpmdBytes(temp_path, temp_bytes, vocab, extraction.save_ppmd_bytes);
   }
@@ -961,6 +982,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     *output_bytes = 0;
     return true;
   }
+#endif
 
   std::ofstream data_out(output_path, std::ios::out | std::ios::binary);
   if (!data_out.is_open()) {
@@ -978,6 +1000,18 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   predictor_options.save_transformer_probs = extraction.save_transformer_probs;
   predictor_options.neutral_transformer = extraction.no_transformer;
   predictor_options.save_cmix_bits = extraction.save_cmix_bits;
+#ifdef CMIX_PIPE
+  // CMIX_TF_THREADS=N: run the transformer on N worker threads ahead of the
+  // coder (same output; see TfPipe in predictor.cpp). CMIX_TF_AHEAD: the
+  // look-ahead in tokens.
+  if (const char* e = getenv("CMIX_TF_THREADS")) {
+    predictor_options.tf_threads = atoi(e);
+    predictor_options.lookahead_path = temp_path;
+    if (const char* a = getenv("CMIX_TF_AHEAD")) {
+      predictor_options.tf_ahead = strtoull(a, nullptr, 10);
+    }
+  }
+#endif
   Predictor p(vocab, predictor_options);
   if (enable_preprocess && !extraction.ppmd_only && !extraction.transformer_only) {
     // Pretraining only affects the models --ppmd-only and --transformer-only
@@ -1082,7 +1116,11 @@ int main(int argc, char** argv) {
   char mode = 0;
   if (argc > 1) {
     if (strlen(argv[1]) != 2 || argv[1][0] != '-' ||
+#ifdef CMIX_OFFICIAL
+        strchr("cdeh", argv[1][1]) == NULL) {
+#else
         strchr("cdehnsx", argv[1][1]) == NULL) {
+#endif
       UsageError("unknown mode '%s' (expected -c, -d, -e, -h, -n, -s or -x)",
           argv[1]);
     }
@@ -1169,13 +1207,16 @@ int main(int argc, char** argv) {
     goto print_end_message;
   }
 
+#ifndef CMIX_OFFICIAL
   if (mode == 's') {
     if (!Store(input_path, temp_path, output_path, dictionary, &input_bytes,
         &output_bytes)) {
       Fail("preprocessing failed: cannot open %s or %s", input_path.c_str(),
           output_path.c_str());
     }
-  } else if (mode == 'c' || mode == 'n') {
+  } else
+#endif
+  if (mode == 'c' || mode == 'n') {
       remove(".dict");
     if (!RunCompression(enable_preprocess, input_path, temp_path, output_path,
         dictionary, &input_bytes, &output_bytes, extraction,
@@ -1249,7 +1290,9 @@ int main(int argc, char** argv) {
     header.tf_weights_size = atoi(argv[5]);
     write("header.dat", header);
     goto exit;
-  }  else if (mode == 'x') {
+  }
+#ifndef CMIX_OFFICIAL
+  else if (mode == 'x') {
     // run compression
     input_path = argv[2];
     output_path = argv[3];
@@ -1260,6 +1303,7 @@ int main(int argc, char** argv) {
     }
     goto print_end_message;
   }
+#endif
   else {
     if (!RunDecompression(input_path, temp_path, output_path, dictionary,
         &input_bytes, &output_bytes, extraction, extraction.transformer)) {

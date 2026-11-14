@@ -87,6 +87,14 @@ struct PredictorOptions {
   // Training data: append cmix's final prediction for every coded bit, as a
   // float16 logit ln(p/(1-p)) of p = P(bit = 1).
   std::string save_cmix_bits;
+  // Compression only, builds with -DCMIX_PIPE: if tf_threads > 0, the
+  // transformer runs on that many worker threads, one article piece each,
+  // ahead of the coder (see TfPipe in predictor.cpp). lookahead_path is the
+  // file holding exactly the bytes that will be coded, in order. The coded
+  // output is byte-identical to the single-thread compressor's.
+  int tf_threads = 0;
+  unsigned long long tf_ahead = 0;  // look-ahead in tokens (0 = default)
+  std::string lookahead_path;
 };
 
 // Buffered writer converting floats to float16 (IEEE half precision).
@@ -126,6 +134,9 @@ class Predictor {
  public:
   Predictor(const std::vector<bool>& vocab,
       const PredictorOptions& options = PredictorOptions());
+#ifdef CMIX_PIPE
+  ~Predictor();
+#endif
   float Predict();
   void Perceive(int bit);
   void Pretrain(int bit);
@@ -234,6 +245,17 @@ class Predictor {
   std::vector<float> dyn_scratch_;
   void DynLearn(int token);
   void DynApply();
+  // the logits / hidden state DynApply reads (the transformer's last step)
+  const float* dyn_z_src_ = nullptr;
+  const float* dyn_h_src_ = nullptr;
+#ifdef CMIX_PIPE
+  struct TfPipe;
+  std::unique_ptr<TfPipe> pipe_;
+  unsigned int ppmd_byte_ = 0;  // the byte the run-ahead ppmd consumes
+  void PipeStart(const PredictorOptions& options);
+  void PipeAdvance();
+  void PipeFetch();
+#endif
 };
 
 #endif

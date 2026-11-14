@@ -28,6 +28,11 @@ struct TransformerOpt {
   explicit TransformerOpt(const char* weights_path,
                           AttnKind attn = AttnKind::KVF32);
   ~TransformerOpt();
+  // A second instance with its own streaming state (KV rings, KDA states,
+  // scratch) that reads the weights of `shared`, which must outlive it.
+  // Instances can step concurrently on different threads.
+  struct ShareWeights {};
+  TransformerOpt(const TransformerOpt& shared, ShareWeights);
   TransformerOpt(const TransformerOpt&) = delete;
   TransformerOpt& operator=(const TransformerOpt&) = delete;
 

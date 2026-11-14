@@ -26,7 +26,8 @@ rm -rf pgo_data
 mkdir -p pgo_data 
 
 # building with PGO
-CFLAGS_DEFINES="-DSEED=$SEED -DUPDATE_LIMIT=$UPDATE_LIMIT"
+# OFFICIAL=1 builds the minimal binary for an official run (see CMIX_OFFICIAL in src/runner.cpp).
+CFLAGS_DEFINES="-DSEED=$SEED -DUPDATE_LIMIT=$UPDATE_LIMIT${OFFICIAL:+ -DCMIX_OFFICIAL}"
 make CFLAGS_DEFINES="$CFLAGS_DEFINES" prof_gen -j 
 
 ./cmix -c ./prof_input/input ./prof_comp > ./prof_output
@@ -94,7 +95,14 @@ check_no_recip_estimate() {
 }
 check_no_recip_estimate ./cmix
 
- upx-ucl --lzma cmix
+# Pack the binary. PACKER=pk (default): our context-mixing packer (packer/pack.sh), about 118 KB
+# against upx --lzma's 170 KB; the binary is stored in both comp9 and archive9. PACKER=upx: the old way.
+if [ "${PACKER:-pk}" = upx ]; then
+  upx-ucl --lzma cmix
+else
+  bash packer/pack.sh ./cmix ./cmix.packed
+  mv ./cmix.packed ./cmix
+fi
 
 # this is a directory where the compressor binary will be placed 
 DIR=run

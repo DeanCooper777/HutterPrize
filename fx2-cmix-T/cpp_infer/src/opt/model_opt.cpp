@@ -231,7 +231,9 @@ void prof_print(double tsc_to_core, long tokens) {
 // the model
 // ---------------------------------------------------------------------------
 struct TransformerOptImpl {
-  OptModel M;
+  OptModel* Mp;  // the weights; shared (not owned) if !owns
+  bool owns;
+  OptModel& M;
   AttnKind kind;
 
   // streaming state (hugepage pool: KDA states, then KV caches)
@@ -278,6 +280,7 @@ struct TransformerOptImpl {
   alignas(64) int16_t a192[D] = {};
   alignas(64) uint16_t ident192[D + 16] = {};
   alignas(64) uint16_t idx768[DMLP + 16] = {};
+  alignas(64) uint16_t idxh768[DMLP + 16] = {};
   alignas(64) float prior_f32[208] = {};
   alignas(64) uint8_t q8p[224] = {};      // 224 = 205 rounded to 32
   alignas(64) uint16_t idxp[224 + 16] = {};
@@ -290,8 +293,15 @@ struct TransformerOptImpl {
   alignas(64) uint8_t cap_q[12][DMLP] = {};
   alignas(32) float sfall[32] = {}, cfall[32] = {};  // rope fallback row
 
-  explicit TransformerOptImpl(const char* path, AttnKind k) : kind(k) {
-    M.load(path);
+  ~TransformerOptImpl() {
+    if (owns) delete Mp;
+  }
+
+  // path != nullptr: loads its own weights; else reads those of *shared
+  TransformerOptImpl(const char* path, OptModel* shared, AttnKind k)
+      : Mp(path ? new OptModel() : shared), owns(path != nullptr), M(*Mp),
+        kind(k) {
+    if (path) M.load(path);
     const size_t kda_sz = sizeof(KdaState) * 9;
     const size_t kv_sz =
         (kind == AttnKind::KVF32 ? sizeof(AttnKVF32) : sizeof(AttnKV)) * 3;
@@ -386,7 +396,7 @@ struct TransformerOptImpl {
     {
       PSCOPE(PS_MM_KOP);
       if (M.act16 & 2)
-        gemv16_add(M.op16[cur_l], M.op_fold16[cur_l], a192, x);
+        gemv16p_add(M.op16[cur_l], M.op_fold16[cur_l], M.op_k16[cur_l], a192, x);
       else
         qgemv_add(L.op.m, q5, x);
     }
@@ -495,7 +505,7 @@ struct TransformerOptImpl {
     {
       PSCOPE(PS_MM_VOP);
       if (M.act16 & 2)
-        gemv16_add(M.op16[cur_l], M.op_fold16[cur_l], a192, x);
+        gemv16p_add(M.op16[cur_l], M.op_fold16[cur_l], M.op_k16[cur_l], a192, x);
       else
         qgemv_add(L.op.m, q5, x);
     }
@@ -509,14 +519,18 @@ struct TransformerOptImpl {
     }
     int nnz;
     if (M.act16 & 1) {
+      int nh16 = 0;
+      int32_t suma16 = 0;
       {
         PSCOPE(PS_MM_MLP_UP);
         qgemv_f32(mm.up.m, q5, h768);
-        nnz = relu2_quant16(h768, M.down_s16[l], DMLP, a768, idx768);
+        nnz = relu2_quant16p(h768, M.down_s16[l], DMLP, a768, idx768, idxh768,
+                             &nh16, &suma16);
       }
       {
         PSCOPE(PS_MM_MLP_DOWN);
-        spmv16_add(M.down16[l], M.down_fold16[l], a768, idx768, nnz, x);
+        spmv16p_add(M.down16[l], M.down_fold16[l], a768, idx768, nnz, idxh768,
+                    nh16, suma16, x);
       }
       return;
     }
@@ -598,7 +612,11 @@ struct TransformerOptImpl {
 };
 
 TransformerOpt::TransformerOpt(const char* weights_path, AttnKind attn)
-    : impl(new TransformerOptImpl(weights_path, attn)) {}
+    : impl(new TransformerOptImpl(weights_path, nullptr, attn)) {}
+
+TransformerOpt::TransformerOpt(const TransformerOpt& shared, ShareWeights)
+    : impl(new TransformerOptImpl(nullptr, shared.impl->Mp,
+                                  shared.impl->kind)) {}
 
 TransformerOpt::~TransformerOpt() = default;
 

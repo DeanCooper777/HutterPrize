@@ -14,6 +14,15 @@
 #include <map>
 #include <string>
 
+#ifdef CMIX_OFFICIAL
+// Official build: every parameter is its built-in default, a compile-time constant.
+namespace tune {
+inline double Get(const char*, double def) { return def; }
+inline double Get(const std::string&, double def) { return def; }
+inline void CheckAllUsed() {}
+}  // namespace tune
+#else
+
 namespace tune {
 
 inline std::map<std::string, double>& Overrides() {
@@ -65,5 +74,6 @@ inline void CheckAllUsed() {
 }
 
 }  // namespace tune
+#endif  // CMIX_OFFICIAL
 
 #endif

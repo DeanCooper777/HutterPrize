@@ -33,6 +33,9 @@ void ByteMixer::SetProbs(const float* vocab_probs) {
 }
 
 void ByteMixer::ByteUpdate() {
+#ifdef CMIX_OFFICIAL
+  ByteModel::ByteUpdate();  // never reached: the official build has no lstm (see predictor.cpp)
+#else
   inputs_ *= 2 / num_models_;
   lstm_->SetInput(inputs_);
   inputs_ = 0;
@@ -48,4 +51,5 @@ void ByteMixer::ByteUpdate() {
   }
   offset_ = 0;
   ByteModel::ByteUpdate();
+#endif
 }

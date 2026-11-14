@@ -9,6 +9,14 @@ struct TfProfRegistrar { TfProfRegistrar() { atexit(TfProfReport); } } g_tf_prof
 }
 #endif
 #include <vector>
+#ifdef CMIX_PIPE
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <cmath>
@@ -199,6 +207,244 @@ void HalfFileReader::Read(float* values, size_t n) {
   available_ -= n;
 }
 
+#ifdef CMIX_PIPE
+// ---------------------------------------------------------------------------
+// Multi-thread compression (PredictorOptions::tf_threads).
+//
+// While compressing, every byte is known in advance, and the transformer's
+// output for a token depends only on the tokens and ppmd distributions of
+// its own article piece. So the transformer need not run in step with the
+// coder:
+//   - the ppmd runs ahead of the coder (in the coder's thread, in bursts, up
+//     to W tokens ahead) and its distribution after each token is kept in a
+//     ring; the coder reads its ppmd inputs back from the ring;
+//   - each completed article piece goes to a worker thread, which runs its
+//     own transformer instance (shared weights) over it and stores, per
+//     token, what TransformerByteUpdate needs: the output row, the logits and
+//     the hidden state (for the online adaptation, which stays in the coder's
+//     thread because it carries state across pieces);
+//   - the coder takes each token's record when it gets there, waiting if the
+//     worker has not reached it yet.
+// Every value the coder sees is computed by the same code from the same
+// inputs as in the single-thread path, so the output is byte-identical.
+// The decompressor cannot do this (it learns each token only by decoding).
+// ---------------------------------------------------------------------------
+struct Predictor::TfPipe {
+  static constexpr int kV = 205, kRec = 608;  // probs @0, logits @208, hidden @416
+  struct Piece {
+    unsigned long long start = 0;
+    std::vector<uint8_t> tok;
+    std::atomic<uint32_t> done{0};  // tokens whose records are complete
+  };
+  FILE* file = nullptr;
+  unsigned long long n = 0;      // tokens in the stream
+  unsigned long long pos = 0;    // the coder's token
+  unsigned long long ahead = 0;  // tokens the ppmd has consumed
+  unsigned long long W = 0, cap = 0;
+  std::vector<float> prior;      // [cap][kV] ppmd distributions
+  std::vector<float> rec;        // [cap][kRec] transformer records
+  std::vector<uint8_t> bytes;    // [cap] the stream's bytes (sanity check)
+  std::deque<std::unique_ptr<Piece>> pieces;  // dispatched, in order
+  std::unique_ptr<Piece> open;                // being collected
+  unsigned char window[15];
+  unsigned long long article_tokens = 0;
+  std::vector<unsigned char> rbuf;
+  size_t rpos = 0, ravail = 0;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<Piece*> queue;
+  bool stop = false;
+  std::vector<std::unique_ptr<fx2::opt::TransformerOpt>> tfs;
+  std::vector<std::thread> threads;
+  double wait_seconds = 0;
+  unsigned long long waits = 0;
+
+  void Enqueue() {
+    Piece* p = open.get();
+    pieces.push_back(std::move(open));
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      queue.push_back(p);
+    }
+    cv.notify_one();
+  }
+
+  void Work(fx2::opt::TransformerOpt* tf) {
+    uint16_t half[208];
+    for (;;) {
+      Piece* p;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [this] { return stop || !queue.empty(); });
+        if (queue.empty()) return;
+        p = queue.front();
+        queue.pop_front();
+      }
+      // the piece may be freed as soon as its last record is published
+      const unsigned long long start = p->start;
+      const uint32_t len = (uint32_t)p->tok.size();
+      const uint8_t* tok = p->tok.data();
+      tf->begin_article();
+      for (uint32_t j = 0; j < len; ++j) {
+        const size_t slot = (size_t)((start + j) % cap);
+        FloatsToHalves(&prior[slot * kV], half, kV);
+        float* r = &rec[slot * kRec];
+        const uint8_t t = tok[j];
+        tf->step(t, half, r);
+        memcpy(r + 208, tf->last_logits(), sizeof(float) * kV);
+        memcpy(r + 416, tf->last_hidden(), sizeof(float) * 192);
+        p->done.store(j + 1, std::memory_order_release);
+      }
+    }
+  }
+
+  ~TfPipe() {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      stop = true;
+      queue.clear();
+    }
+    cv.notify_all();
+    for (auto& t : threads) t.join();
+    if (file) fclose(file);
+  }
+};
+
+Predictor::~Predictor() {
+  if (pipe_) {
+    fprintf(stderr, "\ntf pipeline: %zu threads, coder waited %.1f s in %llu "
+        "waits\n", pipe_->threads.size(), pipe_->wait_seconds, pipe_->waits);
+  }
+}
+
+void Predictor::PipeStart(const PredictorOptions& options) {
+  if (vocab_size_ != TfPipe::kV) Fail("tf pipeline: vocabulary is not 205");
+  pipe_.reset(new TfPipe());
+  TfPipe& P = *pipe_;
+  P.file = fopen(options.lookahead_path.c_str(), "rb");
+  if (!P.file) Fail("tf pipeline: cannot open %s", options.lookahead_path.c_str());
+  P.n = options.num_input_bytes;
+  // A piece is dispatched once the ppmd has passed its end, and the coder
+  // refills the look-ahead when less than W/2 is left, so W/2 must exceed
+  // the longest piece.
+  const unsigned long long min_w = 2 * (kMaxArticleTokens + 64);
+  P.W = options.tf_ahead ? options.tf_ahead : 400000;
+  if (P.W < min_w) P.W = min_w;
+  P.cap = P.W + 16;
+  P.prior.assign((size_t)P.cap * TfPipe::kV, 0.0f);
+  P.rec.assign((size_t)P.cap * TfPipe::kRec, 0.0f);
+  P.bytes.assign((size_t)P.cap, 0);
+  P.rbuf.resize(1 << 20);
+  memset(P.window, 0xFF, sizeof(P.window));
+  // One step on the (otherwise unused) main instance, so that anything the
+  // kernels initialize on first use is set up before the threads start.
+  {
+    std::vector<float> u(208, 1.0f / TfPipe::kV);
+    std::vector<uint16_t> h(208, 0);
+    FloatsToHalves(u.data(), h.data(), TfPipe::kV);
+    std::vector<float> out(208, 0.0f);
+    transformer_->begin_article();
+    transformer_->step(0, h.data(), out.data());
+  }
+  for (int i = 0; i < options.tf_threads; ++i) {
+    P.tfs.emplace_back(new fx2::opt::TransformerOpt(
+        *transformer_, fx2::opt::TransformerOpt::ShareWeights()));
+  }
+  for (int i = 0; i < options.tf_threads; ++i) {
+    P.threads.emplace_back(&TfPipe::Work, &P, P.tfs[i].get());
+  }
+  fprintf(stderr, "tf pipeline: %d threads, look-ahead %llu tokens\n",
+      options.tf_threads, P.W);
+}
+
+// Called at each byte boundary in place of the ppmd's ByteUpdate: lets the
+// ppmd run ahead if the look-ahead is low, then puts the distribution that
+// follows the byte just coded back into the byte model.
+void Predictor::PipeAdvance() {
+  TfPipe& P = *pipe_;
+  const unsigned long long i = P.pos;
+  if (i >= P.n) Fail("tf pipeline: more bytes coded than the stream holds");
+  if (P.ahead < P.n && P.ahead < i + 1 + P.W / 2) {
+    unsigned long long target = i + 1 + P.W;
+    if (target > P.n) target = P.n;
+    while (P.ahead < target) {
+      if (P.rpos == P.ravail) {
+        P.ravail = fread(P.rbuf.data(), 1, P.rbuf.size(), P.file);
+        P.rpos = 0;
+        if (P.ravail == 0) Fail("tf pipeline: look-ahead stream ended early");
+      }
+      const unsigned int c = P.rbuf[P.rpos++];
+      const int t = byte_to_index_[c];
+      if (t < 0) Fail("transformer: byte 0x%02x is not in the vocabulary", c);
+      const size_t slot = (size_t)(P.ahead % P.cap);
+      ppmd_byte_ = c;
+      byte_model_->ByteUpdate();
+      const std::valarray<float>& p = byte_model_->BytePredict();
+      float* d = &P.prior[slot * TfPipe::kV];
+      for (unsigned int v = 0; v < vocab_size_; ++v) d[v] = p[vocab_bytes_[v]];
+      P.bytes[slot] = (uint8_t)c;
+      // the same piece boundaries as TransformerByteUpdate
+      memmove(P.window, P.window + 1, sizeof(P.window) - 1);
+      P.window[sizeof(P.window) - 1] = (unsigned char)t;
+      ++P.article_tokens;
+      const bool last =
+          memcmp(P.window, kArticleSeparator, sizeof(kArticleSeparator)) == 0 ||
+          P.article_tokens >= kMaxArticleTokens;
+      if (last) {
+        if (P.open) P.Enqueue();
+        P.article_tokens = 0;
+      } else {
+        if (P.article_tokens == 1) {
+          P.open.reset(new TfPipe::Piece());
+          P.open->start = P.ahead;
+        }
+        P.open->tok.push_back((uint8_t)t);
+      }
+      ++P.ahead;
+    }
+    if (P.ahead == P.n && P.open) P.Enqueue();
+  }
+  const size_t slot = (size_t)(i % P.cap);
+  if (P.bytes[slot] != manager_.bit_context_) {
+    Fail("tf pipeline: byte %llu of the look-ahead stream is 0x%02x, but "
+        "0x%02x was coded", i, P.bytes[slot], manager_.bit_context_);
+  }
+  byte_model_->LoadVocabProbs(&P.prior[slot * TfPipe::kV], vocab_bytes_);
+}
+
+// The transformer step of the coder's current token: waits for its record
+// and points transformer_probs_ / the dyn sources at it.
+void Predictor::PipeFetch() {
+  TfPipe& P = *pipe_;
+  const unsigned long long i = P.pos;
+  while (!P.pieces.empty() &&
+         i >= P.pieces.front()->start + P.pieces.front()->tok.size()) {
+    P.pieces.pop_front();
+  }
+  if (P.pieces.empty() || i < P.pieces.front()->start) {
+    Fail("tf pipeline: token %llu is not in a dispatched piece", i);
+  }
+  TfPipe::Piece* p = P.pieces.front().get();
+  const uint32_t need = (uint32_t)(i - p->start) + 1;
+  if (p->done.load(std::memory_order_acquire) < need) {
+    const auto t0 = std::chrono::steady_clock::now();
+    unsigned spins = 0;
+    while (p->done.load(std::memory_order_acquire) < need) {
+      if (++spins < 4000) _mm_pause();
+      else std::this_thread::yield();
+    }
+    P.wait_seconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    ++P.waits;
+  }
+  const float* r = &P.rec[(size_t)(i % P.cap) * TfPipe::kRec];
+  memcpy(transformer_probs_.data(), r, sizeof(float) * vocab_size_);
+  dyn_z_src_ = r + 208;
+  dyn_h_src_ = r + 416;
+}
+#endif  // CMIX_PIPE
+
 Predictor::Predictor(const std::vector<bool>& vocab,
     const PredictorOptions& options) : manager_(),
     sigmoid_(100001), vocab_(vocab), ppmd_only_(options.ppmd_only),
@@ -233,6 +479,12 @@ Predictor::Predictor(const std::vector<bool>& vocab,
     print_transformer_loss_ = true;
   }
   neutral_transformer_ = options.neutral_transformer;
+#ifdef CMIX_OFFICIAL
+  // Official build: no lstm. Without transformer weights (the embedded dictionary and article
+  // order, coded with plain -c/-d) the byte mixer carries a uniform distribution instead. That
+  // costs about 4.8 KB on those two tables and saves the lstm's code in both binaries.
+  if (options.transformer_weights.empty()) neutral_transformer_ = true;
+#endif
   if (neutral_transformer_) uniform_probs_.assign(vocab_size_, 1.0f);
   if (!options.save_cmix_bits.empty()) {
     cmix_bits_writer_.reset(new HalfFileWriter(options.save_cmix_bits));
@@ -282,6 +534,13 @@ Predictor::Predictor(const std::vector<bool>& vocab,
   for (unsigned int i = 0; i < vocab_size_; ++i) {
     byte_to_index_[vocab_bytes_[i]] = i;
   }
+#ifdef CMIX_PIPE
+  if (options.tf_threads > 0 && transformer_ && !ppmd_only_ &&
+      !transformer_only_) {
+    if (dyn2_lr_ != 0) Fail("tf pipeline: not available with dyn2_lr");
+    PipeStart(options);
+  }
+#endif
   // 0xFF is not a vocabulary index, so the window cannot match the
   // separator before 15 real tokens have been seen.
   memset(separator_window_, 0xFF, sizeof(separator_window_));
@@ -344,6 +603,12 @@ void Predictor::AddBracket() {
 }
 
 void Predictor::AddPPMD() {
+#ifdef CMIX_PIPE
+  if (pipe_) {
+    byte_model_.emplace(25, (int)tune::Get("ppmd_mb", 14000), ppmd_byte_, vocab_);
+    return;
+  }
+#endif
   byte_model_.emplace(25, (int)tune::Get("ppmd_mb", 14000), manager_.bit_context_, vocab_);
 }
 
@@ -424,8 +689,12 @@ void Predictor::AddMixers() {
   // allocated. Nothing after this point draws from rand(), so skipping the
   // lstm's initialization does not shift any other model's random state.
   byte_mixer_.emplace(1, manager_.bit_context_, vocab_,
+#ifdef CMIX_OFFICIAL
+      vocab_size, nullptr);
+#else
       vocab_size, (transformer_ || neutral_transformer_) ? nullptr :
       new Lstm(vocab_size, vocab_size, 200, 1, 128, 0.03, 10));
+#endif
   if (!dyn_W_.empty() && dyn_mode_ == 1) {
     dyn_mixer_.emplace(1, manager_.bit_context_, vocab_, vocab_size, nullptr);
     dyn_scratch_.assign(vocab_size, 1.0f);
@@ -643,9 +912,18 @@ void Predictor::TransformerByteUpdate() {
     article_tokens_ = 0;
     dyn_valid_ = false;
   } else {
-    if (article_tokens_ == 1) transformer_->begin_article();
-    transformer_->step((uint8_t)token, half_scratch_.data(),
-        transformer_probs_.data());
+#ifdef CMIX_PIPE
+    if (pipe_) {
+      PipeFetch();
+    } else
+#endif
+    {
+      if (article_tokens_ == 1) transformer_->begin_article();
+      transformer_->step((uint8_t)token, half_scratch_.data(),
+          transformer_probs_.data());
+      dyn_z_src_ = transformer_->last_logits();
+      dyn_h_src_ = transformer_->last_hidden();
+    }
 #ifdef CMIX_PROFILE
     ++g_tf_steps;
 #endif
@@ -675,8 +953,8 @@ void Predictor::TransformerByteUpdate() {
 // Adds the learned correction to the transformer's last logits and replaces
 // transformer_probs_ with the softmax of the result.
 void Predictor::DynApply() {
-  const float* __restrict z = transformer_->last_logits();
-  const float* __restrict hs = transformer_->last_hidden();
+  const float* __restrict z = dyn_z_src_;
+  const float* __restrict hs = dyn_h_src_;
   float* __restrict h = dyn_h_.data();
   float* __restrict zz = dyn_z_.data();
   float* __restrict q = dyn_q_.data();
@@ -910,12 +1188,19 @@ void Predictor::Perceive(int bit) {
 
     PROF_MARK(models_byteupd);
     if (byte_model_) {
+#ifdef CMIX_PIPE
+      if (pipe_) PipeAdvance();
+      else
+#endif
       byte_model_->ByteUpdate();
       if (ppmd_probs_writer_) WritePpmdProbs();
       PROF_MARK(ppmd_byteupd);
 
       if (transformer_) {
         TransformerByteUpdate();
+#ifdef CMIX_PIPE
+        if (pipe_) ++pipe_->pos;
+#endif
       } else if (neutral_transformer_) {
         byte_mixer_->SetProbs(uniform_probs_.data());
       } else {

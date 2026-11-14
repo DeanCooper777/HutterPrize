@@ -1,0 +1,2 @@
+cd /tmp && P=/mnt/c/Dean/Projects/HutterPrize && bash $P/fx2-cmix-T/packer/pack.sh /root/b_off/cmix.elf /tmp/off.packed && bash $P/fx2-cmix-T/packer/pack.sh /root/b_test/cmix.elf /tmp/test.packed
+mkdir -p /tmp/pt && cd /tmp/pt && cp /tmp/off.packed cmix && head -c 20000 $P/data/enwik6 > in.txt && ./cmix -c $P/fx2-cmix-T/dictionary/english.dic in.txt o > /dev/null 2>&1 && ./cmix -d $P/fx2-cmix-T/dictionary/english.dic o back > /dev/null 2>&1 && cmp back in.txt && echo "packed official binary round trip ok $(stat -c %s o)"

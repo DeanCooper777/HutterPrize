@@ -98,11 +98,11 @@ struct OptModel {
   // experimental 16-bit activation path (act16.h); CMIX_ACT16 bitmask:
   // 1 = mlp.down input, 2 = attention output-projection input
   int act16 = 3;
-  HugeBuf pool16;
-  const int8_t* down16[NL] = {};  // [DMLP][192] int8 columns
+  const uint8_t* down16[NL] = {};  // [DMLP] packed columns, 96 B each
   const float* down_fold16[NL] = {};
   float down_s16[NL] = {};
-  const int8_t* op16[NL] = {};    // [192][192] int8 rows
+  const uint8_t* op16[NL] = {};    // [192] packed rows, 96 B each
+  const int32_t* op_k16[NL] = {};  // [192] 128 * (row sum of the weights)
   const float* op_fold16[NL] = {};
   float op_s16[NL] = {};
 

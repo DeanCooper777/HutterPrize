@@ -19,6 +19,7 @@
 
 #include "fxcmv1.h"
 
+#include <stdint.h>  // uintptr_t: newer libstdc++ no longer pulls it in indirectly
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

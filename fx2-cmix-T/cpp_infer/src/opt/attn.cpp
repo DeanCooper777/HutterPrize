@@ -43,9 +43,15 @@ inline uint64_t prof_rd() {
 #define PROF_ADD(i, a, b) (void)0
 #endif
 
-// scratch (single-threaded; see attn.h)
-alignas(64) float g_sc[ATTN_WIN + 32];  // scores, padded with -inf
-alignas(64) float g_eb[ATTN_WIN + 32];  // exp values (+0.0 = excluded lane)
+// scratch (single-threaded; see attn.h). Builds with -DCMIX_PIPE step
+// several model instances on different threads, so there it is per thread.
+#ifdef CMIX_PIPE
+#define ATTN_SCRATCH thread_local
+#else
+#define ATTN_SCRATCH
+#endif
+alignas(64) ATTN_SCRATCH float g_sc[ATTN_WIN + 32];  // scores, padded with -inf
+alignas(64) ATTN_SCRATCH float g_eb[ATTN_WIN + 32];  // exp values (+0.0 = excluded lane)
 
 inline float hsum8(__m256 v) {
   __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));

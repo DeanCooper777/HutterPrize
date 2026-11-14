@@ -77,6 +77,10 @@ tf_weights_io.o: cpp_infer/src/weights_io.cpp cpp_infer/src/weights_io.h
 tf_weights_io_compressed.o: cpp_infer/src/weights_io_compressed.cpp cpp_infer/src/weights_io.h
 	$(CC) $(filter-out -O3,$(CPPFLAGS_TRANSFORMER)) -Os -c cpp_infer/src/weights_io_compressed.cpp -o $@
 
+# load-time only (builds the arena from the weights file once): -Os, about 29 KB of code at -O3
+tf_arena_build.o: cpp_infer/src/opt/arena_build.cpp $(wildcard cpp_infer/src/opt/*.h) cpp_infer/src/weights_io.h
+	$(CC) $(filter-out -O3,$(CPPFLAGS_TRANSFORMER)) -Os -c $< -o $@
+
 tf_%.o: cpp_infer/src/opt/%.cpp $(wildcard cpp_infer/src/opt/*.h) cpp_infer/src/weights_io.h
 	$(CC) $(CPPFLAGS_TRANSFORMER) -c $< -o $@
 

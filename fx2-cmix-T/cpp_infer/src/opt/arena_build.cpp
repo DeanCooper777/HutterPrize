@@ -1,5 +1,7 @@
 #include "arena_build.h"
 
+#include "act16.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -135,6 +137,52 @@ void OptModel::load(const char* weights_path) {
     return p;
   };
 
+  if (const char* e = std::getenv("CMIX_ACT16")) act16 = std::atoi(e);
+  // 16-bit activation path (act16.h), in the stream at the place of the
+  // 8-bit arena it replaces: nibble-packed weights (96 B per column, or per
+  // row if by_rows) + fold with the activation scale / 256 (exact); for rows also
+  // krow = 128 * the row's weight sum
+  auto cols16 = [&](const std::string& prefix, int d_in, bool by_rows,
+                    const uint8_t** cols, const float** foldp, float* s16,
+                    const int32_t** krowp) {
+    const WTensor& wq =
+        wf.get(prefix + ".weight.q", DT_I8,
+               {static_cast<uint32_t>(D), static_cast<uint32_t>(d_in)});
+    const WTensor& ws = wf.get(prefix + ".weight.scale", DT_BF16,
+                               {static_cast<uint32_t>(D)});
+    const WTensor& sa =
+        wf.get(prefix + ".quantize_activation.scale", DT_BF16, {1});
+    *s16 = bf16_to_f32(sa.bf16_bits()[0]) * (1.0f / 256.0f);
+    float* f = reinterpret_cast<float*>(take(sizeof(float) * D));
+    for (int o = 0; o < D; o++)
+      f[o] = *s16 * bf16_to_f32(ws.bf16_bits()[o]);
+    const int8_t* q = wq.i8();
+    for (size_t i = 0; i < size_t(D) * d_in; i++)
+      if (q[i] < -7 || q[i] > 7) die("act16: weight outside [-7, 7]");
+    if (by_rows) {
+      if (d_in != D) die("act16: row layout needs d_in == 192");
+      int32_t* k = reinterpret_cast<int32_t*>(take(sizeof(int32_t) * D));
+      uint8_t* c = take(size_t(D) * (D / 2));
+      for (int o = 0; o < D; o++) {
+        int32_t sum = 0;
+        for (int i = 0; i < D; i++) sum += q[size_t(o) * D + i];
+        k[o] = 128 * sum;
+        pack16_nibbles(q + size_t(o) * D, D, c + size_t(o) * (D / 2));
+      }
+      *cols = c;
+      *krowp = k;
+    } else {
+      uint8_t* c = take(size_t(d_in) * (D / 2));
+      int8_t col[D];
+      for (int i = 0; i < d_in; i++) {
+        for (int o = 0; o < D; o++) col[o] = q[size_t(o) * d_in + i];
+        pack16_nibbles(col, D, c + size_t(i) * (D / 2));
+      }
+      *cols = c;
+    }
+    *foldp = f;
+  };
+
   // ---- stream, in per-token consumption order ----
   prior = qsp4("prior_embedding", V, &prior_s_act);
 
@@ -191,7 +239,11 @@ void OptModel::load(const char* weights_path) {
         const WTensor& al = wf.get(a + "log_baseline_decay_rate", DT_F32, {NH});
         for (int h = 0; h < NH; h++) L.kw.a_neg[h] = -std::exp(al.f32()[h]);
       }
-      L.op = qsite(a + "output_projection", D, D, true);
+      if (act16 & 2)
+        cols16(a + "output_projection", D, true, &op16[l], &op_fold16[l],
+               &op_s16[l], &op_k16[l]);
+      else
+        L.op = qsite(a + "output_projection", D, D, true);
       ki++;
     } else {
       VanArenas& L = van[vi];
@@ -199,7 +251,11 @@ void OptModel::load(const char* weights_path) {
       L.qp = qsite(a + "query_projection", D, D, true);
       L.kp = qsite(a + "key_projection", D, D, true);
       L.vp = qsite(a + "value_projection", D, D, true);
-      L.op = qsite(a + "output_projection", D, D, true);
+      if (act16 & 2)
+        cols16(a + "output_projection", D, true, &op16[l], &op_fold16[l],
+               &op_s16[l], &op_k16[l]);
+      else
+        L.op = qsite(a + "output_projection", D, D, true);
       const WTensor& qs = wf.get(a + "quantize_queries.scale", DT_BF16, {NH});
       const WTensor& ks = wf.get(a + "quantize_keys.scale", DT_BF16, {NH});
       const WTensor& vs = wf.get(a + "quantize_values.scale", DT_BF16, {NH});
@@ -213,55 +269,16 @@ void OptModel::load(const char* weights_path) {
     }
 
     mlp[l].up = qsite(b + "mlp.up", DMLP, D, true);
-    mlp[l].down = qsp4(b + "mlp.down", DMLP, &mlp[l].down_s_act);
+    if (act16 & 1)
+      cols16(b + "mlp.down", DMLP, false, &down16[l], &down_fold16[l],
+             &down_s16[l], nullptr);
+    else
+      mlp[l].down = qsp4(b + "mlp.down", DMLP, &mlp[l].down_s_act);
   }
   if (ki != 9 || vi != 3) die("layer pattern mismatch");
 
   unembed = qsite("unembedding", V, D, true);
   stream_bytes = round64(off);
-
-  if (const char* e = std::getenv("CMIX_ACT16")) act16 = std::atoi(e);
-  if (act16) {
-    pool16.alloc(size_t(NL) * (size_t(DMLP + D) * D + 2 * sizeof(float) * D +
-                               256) + QMAT_TAIL_SLACK);
-    size_t o16 = 0;
-    auto take16 = [&](size_t n) -> uint8_t* {
-      o16 = round64(o16);
-      uint8_t* q = pool16.p + o16;
-      o16 += n;
-      if (o16 + QMAT_TAIL_SLACK > pool16.bytes) die("act16 pool overflow");
-      return q;
-    };
-    // int8 weights (columns, or rows if by_rows) + fold with the activation
-    // scale / 256 (exact)
-    auto cols16 = [&](const std::string& prefix, int d_in, bool by_rows,
-                      const int8_t** cols, const float** foldp, float* s16) {
-      const WTensor& wq =
-          wf.get(prefix + ".weight.q", DT_I8,
-                 {static_cast<uint32_t>(D), static_cast<uint32_t>(d_in)});
-      const WTensor& ws = wf.get(prefix + ".weight.scale", DT_BF16,
-                                 {static_cast<uint32_t>(D)});
-      const WTensor& sa =
-          wf.get(prefix + ".quantize_activation.scale", DT_BF16, {1});
-      *s16 = bf16_to_f32(sa.bf16_bits()[0]) * (1.0f / 256.0f);
-      float* f = reinterpret_cast<float*>(take16(sizeof(float) * D));
-      for (int o = 0; o < D; o++)
-        f[o] = *s16 * bf16_to_f32(ws.bf16_bits()[o]);
-      int8_t* c = reinterpret_cast<int8_t*>(take16(size_t(d_in) * D));
-      for (int o = 0; o < D; o++)
-        for (int i = 0; i < d_in; i++)
-          c[by_rows ? size_t(o) * d_in + i : size_t(i) * D + o] =
-              wq.i8()[size_t(o) * d_in + i];
-      *cols = c;
-      *foldp = f;
-    };
-    for (int l = 0; l < NL; l++) {
-      std::string b = "blocks." + std::to_string(l) + ".";
-      cols16(b + "attention.output_projection", D, true, &op16[l], &op_fold16[l],
-             &op_s16[l]);
-      cols16(b + "mlp.down", DMLP, false, &down16[l], &down_fold16[l], &down_s16[l]);
-    }
-  }
 
   // ---- non-stream data: tail slack gap, then the normed embedding table ----
   off += QMAT_TAIL_SLACK;
