@@ -1,8 +1,19 @@
+// context-manager.cpp: maintains the contexts declared in context-manager.h. The inputs
+// are the bytes of the PREPROCESSED stream (after the WRT dictionary transform and its
+// byte remapping), which is why punctuation is tested through the remapped codes below.
+//
+// Place in the pipeline: see context-manager.h.
+//
+// Unchanged from the previous winning entry.
+
 #include "context-manager.h"
 extern unsigned long long wrtcxt;
 
 extern const unsigned char wrt_2b[256];
 extern const unsigned char wrt_3b[256];
+// Character-class tables: each maps a byte of the preprocessed stream to a small class
+// number. Streams of these classes (b2stream, b3stream, b4stream, mx18cxt) summarize the
+// recent text structure in a few bits per byte. wrt_2b / wrt_3b are defined elsewhere.
 const unsigned char wrt_4b[256]={
  6, 0,12,15,12,15,14,14, 5, 3,14, 0,15,13, 8,13,
  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -41,6 +52,8 @@ const unsigned char wrt_4b[256]={
  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
   };
+// Punctuation as it appears AFTER the preprocessor's byte remapping (encode_text in
+// preprocess/preprocessor.cpp): for example ':' is stored as 'J' and '{' as 'P'.
 #define COLON         'J' // :
 #define SEMICOLON     'K' // ;
 #define LESSTHAN      'L' // <
@@ -55,6 +68,8 @@ const unsigned char wrt_4b[256]={
 #define VERTICALBAR   'Q' // |
 #define CURLYCLOSE    'R' // }
 
+// Sizes: 60 MB byte history for the match models, the table shared by the indirect
+// models, and the lookup tables of the two-step (ind*) contexts.
 ContextManager::ContextManager() : history_(60000000, 0),
     shared_map_(256*400000, 0), words_(8, 0), recent_bytes_(8, 0) {
     hashes_ind1.resize(0x1000000, 0);
@@ -64,12 +79,16 @@ ContextManager::ContextManager() : history_(60000000, 0),
     hashes_ind5.resize(0x100, 0);
 }
 
+// Appends the completed byte to the circular history buffer.
 void ContextManager::UpdateHistory() {
   history_[history_pos_] = bit_context_;
   ++history_pos_;
   if (history_pos_ == history_.size()) history_pos_ = 0;
 }
 
+// Per-byte update of the class streams, the word hashes (words_[0], words_[1] = current
+// word, words_[2..6] = previous words, words_[7] = letters only) and the two-step
+// contexts ind1..ind5 (what followed the current hashed context last time).
 void ContextManager::UpdateWords() {
   unsigned char c = bit_context_;
   if (c==CURLYCLOSE || c==CURLYOPENING ||c==SQUARECLOSE)    b3stream= (b3stream&0xfffffff8)+3;
@@ -148,6 +167,7 @@ void ContextManager::UpdateWords() {
   ind5 = hashes_ind5[context1_ind5];
 }
 
+// recent_bytes_[0] = last byte, [1] = the one before, ...
 void ContextManager::UpdateRecentBytes() {
   for (int i = 7; i >= 1; --i) {
     recent_bytes_[i] = recent_bytes_[i-1];
@@ -155,6 +175,7 @@ void ContextManager::UpdateRecentBytes() {
   recent_bytes_[0] = bit_context_;
 }
 
+// Tracks multi-byte dictionary codes (bytes >= 0x80) of the WRT transform.
 void ContextManager::UpdateWRTContext() {
   if (bit_context_ < 0x80) {
     wrt_state_ = 0;
@@ -167,6 +188,8 @@ void ContextManager::UpdateWRTContext() {
   }
 }
 
+// Per-bit update. At a byte boundary: byte-level updates first; then the mixer contexts
+// are recombined with the new partial byte (long_bit_context_).
 void ContextManager::UpdateContexts(int bit) {
   bit_context_ += bit_context_ + bit;
   long_bit_context_ = bit_context_;

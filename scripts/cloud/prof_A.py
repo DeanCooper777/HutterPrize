@@ -1,3 +1,11 @@
+# prof_A.py: profile one training step of the cmix-aware fine-tune (time per micro batch with
+# the plain loss and with the mixture loss, then a profiler table). Also prints a numerical
+# fingerprint (losses, gradient norm) used to confirm that speed changes such as FUSED_QUANT
+# did not change the computation. Output on stdout.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Profile run A's training step: time per 2**17-token micro batch (forward +
 # backward) with plain CE and with the mixture loss, then a torch.profiler
 # table. Builds the model exactly like the recipe by replacing its train().

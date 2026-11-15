@@ -2,6 +2,28 @@
 // WeightsFile::load_compressed(compressed) tensor by tensor, bit for bit.
 //
 // usage: test_weights_compressed <reference.bin> <compressed>
+//
+// What it verifies: the weight-file decoder used at start-up
+// (WeightsFile::load_compressed in weights_io_compressed.cpp) is lossless.
+// Reference = the same weights in the plain uncompressed container read by
+// WeightsFile::load (weights_io.cpp), i.e. the export that the Python coder
+// (pysrc/weights_compress.py) compressed. Every tensor must have the same
+// name, dtype, shape and bytes.
+//
+// Where it sits: the compressed weights file is appended to the compressor
+// and to the self-extracting archive, and is decoded once before the
+// transformer byte model starts predicting. One wrong weight would change the
+// predictions, so this protects weights_io_compressed.cpp.
+//
+// Testing: build with `make test_weights_compressed` in cpp_infer/
+// (-> bin/test_weights_compressed). Pass: the line "OK: N tensors, M payload
+// bytes bit-identical" and exit code 0; any difference prints "FAIL: ..." and
+// exits 1.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged. [this entry] added a tensor encoding (ENC_INTC) to
+// the FX2TFWC2 decoder it tests; load_compressed picks the format from the
+// file's magic, so the same test covers the shipped .tfwc2 files.
 
 #include <cstdio>
 #include <cstring>

@@ -3,6 +3,22 @@
 // FMA? where do vcvtdq2ps / vpmovsxbd / vsubps issue? All loops are pure
 // register ALU (no memory), independent chains, asm bodies; results are
 // instructions/cycle at steady state.
+//
+// What it measures: for single instructions and for fixed mixes of them, how
+// many instructions per cycle the CPU sustains. If a mix runs at the sum of
+// its parts' rates, the instructions use different execution ports ("pipes");
+// if it runs slower, they compete for one. The answers decided how the
+// attention kernel (attn.cpp) interleaves integer multiply-adds, int->float
+// conversions and FMAs. (Unrelated to the CMIX_PIPE multi-core mode.)
+//
+// Testing: not a correctness test and not part of cmix. Build (from
+// cpp_infer/src/opt): `make -f Makefile.attn ../../bin/opt-attn/pipe_probe`.
+// x86-64 Linux with GNU inline asm. Run without arguments; it pins itself to
+// the CPU in the environment variable BENCH_CPU (default 104, a core of the
+// previous authors' machine) and prints one "RESULT <mix> <instr/cyc>" line
+// per probe. There is no pass/fail; the numbers are specific to the CPU.
+//
+// Unchanged from the previous winning entry.
 #include "../../bench/bench_common.h"
 
 // Each test: asm loop, BODY repeated per iteration; returns ticks for ITERS

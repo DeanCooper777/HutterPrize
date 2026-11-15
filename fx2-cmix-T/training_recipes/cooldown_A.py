@@ -1,3 +1,15 @@
+# cooldown_A.py: [this entry] final stage of the cmix-aware training. New in this entry
+# (derived from the previous winner's cooldown.py).
+#
+# Why a cooldown: the fine-tune runs in bfloat16 for speed, but the model that is exported and
+# that the C++ inference is checked against is a float32 one (see cooldown.py). A few epochs
+# at a tiny learning rate with all activations in float32 move the model there. Unlike the
+# previous winner's cooldown it keeps training on the mixture loss.
+#
+# Where it fits: models/6m-q4-A.tch -> [this recipe] -> models/6m-q4-fp32-A.tch ->
+# pysrc/export_weights.py -> pysrc/weights_compress.py -> .tfwc2 inside the compressor.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.cooldown_A
 # Run A, step 2: fp32 cooldown of models/6m-q4-A.tch with the cmix mixture
 # loss (derived from cooldown.py). Environment: COOLDOWN_EPOCHS (default 4),
 # A_CE_WEIGHT (default 0.1). Output: models/6m-q4-fp32-A.tch, which
@@ -22,6 +34,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -39,6 +52,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,
@@ -65,6 +79,8 @@ def main() -> None:
         activation=activation_quantization,
     )
 
+    # The model. The architecture must stay identical across the three stages and equal to
+    # make_reference_config in pysrc/export_weights.py (which the C++ inference hard-codes).
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -166,6 +182,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         # the last batch has fraction_done == 1.0 exactly: with warmup over the
@@ -180,6 +199,8 @@ def main() -> None:
         t = (cos(s * pi) + 1) / 2
         return t + (1 - t) * final_learning_rate_multiplier
 
+    # No scale calibration (the scales come from the checkpoint); mixture loss as in the fine-tune.
+    # The stand-in mixer starts again from its initial weights here.
     training_config = TrainingConfig(
         initialize_scales_steps=None,
         initialize_weight_scales_first=True,

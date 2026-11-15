@@ -8,6 +8,20 @@
 // epilogues, chained mlp.up relu2q -> mlp.down), dense all-(a) unpacked vs
 // packed-int4 (format comparison), sparse (mlp.down + prior via column
 // kernels at real densities, real ppmd prior rows), density sweeps.
+//
+// Where it sits: speed tool for qmat_dense.cpp / qmat_sparse.cpp, the
+// quantized matmul kernels that dominate the transformer byte model's time.
+// Not a correctness test (test_qmat.cpp is) and not part of cmix.
+//
+// Testing: build (from cpp_infer/src/opt) with `make` (-> ../../bin/opt/
+// bench_qmat), run as `bench_qmat [TOKENS] [all|sparse]` (default 1500, all).
+// Pin with BENCH_CPU. Linux only. No pass/fail: it prints cycles per token
+// for each configuration, a per-class breakdown and the density sweeps.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged. [this entry] added run-time-selected VNNI variants
+// to qmat_dense.cpp, so on a CPU that has them the "dense" numbers measure
+// those kernels (CMIX_NO_VNNI=1 gives the AVX2 kernels the submission uses).
 #include "../../bench/bench_common.h"
 
 #include <algorithm>

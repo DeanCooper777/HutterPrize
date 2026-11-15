@@ -1,3 +1,51 @@
+// runner.cpp: the program's main(). It parses the command line, runs the enwik9-specific
+// front end (split -> article reorder -> phda9 text transform), the generic cmix preprocessor
+// (WRT dictionary transform), then drives the Predictor bit by bit through the arithmetic
+// Encoder/Decoder, and finally assembles (or unpacks) the self-extracting archive.
+//
+// Place in the pipeline: this file is the top of everything:
+//   preprocess -> dictionary -> context models / PPMD / transformer byte model -> mixers -> SSE
+//   -> arithmetic coder -> self-extracting archive.
+// The same executable is the compressor ("cmix -e enwik9 out", writes archive9) and, when it
+// is started without arguments under the name archive9, the decompressor. It also calls
+// itself as a subprocess with plain -d to unpack the embedded dictionary and article order
+// (see readalike_prepr/self_extract.h for the file layouts).
+//
+// Modes (first argument); "official" = also present in the -DCMIX_OFFICIAL submission build:
+//   -e IN OUT        official. Compress enwik9 with the embedded dictionary, article order and
+//                    transformer weights; writes OUT and the self-extracting archive9.
+//   (no arguments)   official. Self-extracting decompression: writes enwik9_uncompressed.
+//   -c [DICT] IN OUT official. Generic compression with the cmix preprocessor. The build
+//                    script uses it to compress the dictionary and the article order.
+//   -d [DICT] IN OUT official. Inverse of -c/-n/-s; used by the self-extractors (subprocess).
+//   -h A B C D       official. Writes header.dat (the HeaderInfo trailer) for the build script.
+//   -n IN OUT        testing. Compress without preprocessing (with --raw-stream: code IN
+//                    verbatim as the already-preprocessed stream).
+//   -s [DICT] IN OUT testing. Preprocess only, no modelling ("store").
+//   -x IN OUT        testing. Like -d, with the dictionary taken from ./.dict.
+//
+// Testing: all long options (--transformer, --raw-stream, --save-*, ...) are development and
+// training-data tools; Help() lists them. The split evaluation used to score a weights file
+// or a setting on a chunk of the stream is
+//   cmix -n chunk.bin out --raw-stream --official-vocab --transformer weights.tfwc2
+// where chunk.bin is a piece of the preprocessed stream that -e codes (rebuilt from an
+// earlier run's --save-ppmd-bytes dump). The environment variable CMIX_TUNE (tune.h)
+// overrides tunable constants; CMIX_TF_THREADS (builds with -DCMIX_PIPE) runs the
+// transformer on worker threads. None of these exist in the official build.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - CMIX_OFFICIAL: compile-time switch that leaves only -e, argument-less decompression,
+//     plain -c/-d and -h in the binary (no long options, no help text, no dump code). The
+//     executable is stored in both comp9 and archive9, so every byte removed counts twice.
+//   - Training-data options for the cmix-aware fine-tuning: --no-transformer,
+//     --save-cmix-bits, --raw-stream, --official-vocab (and the diagnostic --save-vocab).
+//     They dump what cmix predicts WITHOUT the transformer, which is what the transformer
+//     is then trained to complement.
+//   - CMIX_PIPE: optional multi-core compress-only mode for fast experiments.
+//   - Windows development build: .exe names, official vocabulary forced whenever the
+//     transformer runs, vocabulary-safe segment lengths in the preprocessor.
+//   - --save-article-boundaries accepts a first separator near (not exactly at) offset 28.
+
 #include <fstream>
 #include <ctime>
 #include <chrono>
@@ -31,10 +79,14 @@
 #include <string.h>
 #include <algorithm>
 
+// Streams shorter than this get no vocabulary bitmap in their header: every byte value is
+// treated as possible (see WriteHeader / ReadHeader).
 namespace {
   const int kMinVocabFileSize = 10000;
 }
 
+// [this entry] Size: the usage text and everything that prints it are compiled out of the
+// submission binary. Help() is still the error return value of main().
 // CMIX_OFFICIAL: the build for an official Hutter Prize run. Only what comp9 and archive9 use is
 // compiled in: -e, argument-less decompression, the plain -c/-d used for the embedded dictionary
 // and article order, and -h. No long options, no dump files, no help text, no CMIX_TUNE file.
@@ -112,6 +164,9 @@ int Help() {
 }
 #endif
 
+// The long ("--") options. All of them are testing / training-data tools; the official
+// build parses none of them, so this struct then stays at its defaults. The name is
+// historical: the first options extracted data (ppmd bytes / probabilities) for training.
 struct ExtractionOptions {
   bool ppmd_only = false;
   // Like ppmd_only, but the transformer the ppmd feeds is run as well.
@@ -128,6 +183,7 @@ struct ExtractionOptions {
   // Testing option: dump of the distributions passed downstream in place of
   // the lstm's output (see PredictorOptions::save_transformer_probs).
   std::string save_transformer_probs;
+  // [this entry] The five options below are new.
   // Diagnostic option (Windows port): write the byte vocabulary the
   // compressor derived from its input (256 bytes, 0/1 each).
   std::string save_vocab;
@@ -156,6 +212,8 @@ struct ExtractionOptions {
   }
 };
 
+// Reports a command-line error with the usage text and exits.
+// [this entry] The official build has no messages: a usage error is just exit(1).
 #ifdef CMIX_OFFICIAL
 #define UsageError(...) exit(1)
 #else
@@ -192,6 +250,7 @@ void RequireReadableFile(const char* what, const std::string& path) {
 // positional arguments can be handled afterwards.
 ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
   ExtractionOptions options;
+// [this entry] Official build: no long options exist, argv is left untouched.
 #ifndef CMIX_OFFICIAL
   int out = 1;
   for (int i = 1; i < *argc; ++i) {
@@ -210,6 +269,7 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
       options.transformer_only = true;
       continue;
     }
+    // [this entry] The three training-data flags (see ExtractionOptions for their meaning).
     if (arg == "--raw-stream") {
       if (options.raw_stream) UsageError("duplicate --raw-stream");
       options.raw_stream = true;
@@ -239,6 +299,7 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
       value = &options.load_transformer_probs;
     }
     else if (arg == "--transformer") value = &options.transformer;
+    // [this entry] --save-vocab and --save-cmix-bits.
     else if (arg == "--save-vocab") value = &options.save_vocab;
     else if (arg == "--save-cmix-bits") value = &options.save_cmix_bits;
     else if (arg == "--save-transformer-probs") {
@@ -261,6 +322,8 @@ ExtractionOptions ParseExtractionOptions(int* argc, char** argv) {
 // predictor does therefore apply to it exactly as they do to -e (and have to,
 // since the decompressor's models must match the compressor's); the ones that
 // dump or replace the compressor's input have no counterpart there.
+// Rejects option combinations that make no sense, each with a message that says why.
+// [this entry] Compiled out of the official build (there are no options to validate).
 void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
 #ifndef CMIX_OFFICIAL
   bool enwik9_decompression = mode == 0;
@@ -269,6 +332,7 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
   if (!options.transformer.empty()) {
     RequireReadableFile("--transformer weights file", options.transformer);
   }
+  // [this entry]
   if (!options.save_vocab.empty() && mode != 'c' && mode != 'n' &&
       mode != 'e') {
     UsageError("--save-vocab can only be used when compressing (-c, -n, -e)");
@@ -330,6 +394,8 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
         "transformer: -e, argument-less enwik9 decompression, or -c/-n with "
         "--transformer");
   }
+  // [this entry] --no-transformer and --save-cmix-bits describe the full cmix model minus
+  // the transformer, during compression only.
   if (options.no_transformer && (options.ppmd_only ||
       options.transformer_only || options.bytes_only ||
       !options.load_transformer_probs.empty() ||
@@ -399,6 +465,7 @@ void ValidateExtractionOptions(const ExtractionOptions& options, char mode) {
 #endif
 }
 
+// Size of a file in bytes (0 if it cannot be opened). Used for the archive trailer.
 size_t getFileSize(const std::string& path) {
   // // get the size of the output file
   FILE *f = fopen(path.c_str(), "rb");
@@ -412,6 +479,13 @@ size_t getFileSize(const std::string& path) {
   return output_size;
 }
 
+// Header of a cmix-coded stream:
+//   5 bytes  length of the preprocessed stream, big endian (so below 2^39); the top bit of
+//            the first byte is set if a dictionary was used;
+//   32 bytes bitmap of the byte values that occur in the stream (bit j of byte i = value
+//            8*i+j), only if length >= kMinVocabFileSize.
+// The vocabulary lets the byte-level models (PPMD, byte mixer, transformer) work over the
+// bytes that actually occur (205 for the enwik9 stream) instead of all 256.
 void WriteHeader(unsigned long long length, const std::vector<bool>& vocab,
     bool dictionary_used, std::ofstream* os) {
   for (int i = 4; i >= 0; --i) {
@@ -432,6 +506,7 @@ void WriteHeader(unsigned long long length, const std::vector<bool>& vocab,
   }
 }
 
+// Header of a -s ("store") file: length field 0, which RunDecompression recognizes.
 void WriteStorageHeader(FILE* out, bool dictionary_used) {
   for (int i = 4; i >= 0; --i) {
     char c = 0;
@@ -440,6 +515,7 @@ void WriteStorageHeader(FILE* out, bool dictionary_used) {
   }
 }
 
+// Inverse of WriteHeader. A length of 0 means a stored (-s) file.
 void ReadHeader(std::ifstream* is, unsigned long long* length,
     bool* dictionary_used, std::vector<bool>* vocab) {
   *length = 0;
@@ -466,6 +542,8 @@ void ReadHeader(std::ifstream* is, unsigned long long* length,
   }
 }
 
+// Marks every byte value that occurs in the preprocessed stream. (byte_map below is
+// computed and never used; kept from upstream.)
 void ExtractVocab(unsigned long long num_bytes, std::ifstream* is,
     std::vector<bool>* vocab) {
   for (size_t pos = 0; pos < num_bytes; ++pos) {
@@ -481,6 +559,8 @@ void ExtractVocab(unsigned long long num_bytes, std::ifstream* is,
   }
 }
 
+// Progress display on stderr: clear the line / format a duration / print percentage,
+// elapsed time and the estimated remaining time.
 void ClearOutput() {
   fprintf(stderr, "\r%*s\r", 70, "");
   fflush(stderr);
@@ -727,6 +807,7 @@ void SaveArticleBoundaries(const std::string& temp_path,
   if (first_marker < 0) {
     Fail("--save-article-boundaries: no line-start page marker found");
   }
+  // [this entry] Was a hard requirement of exactly 28; relaxed for the Windows build:
   // The first separator follows the block header and phda9's text header
   // line. Upstream's Linux stream has it at 28; the header line holds a
   // data-dependent number whose dictionary encoding can be longer (our
@@ -782,6 +863,11 @@ void SaveArticleBoundaries(const std::string& temp_path,
       boundaries.size(), boundaries.size() - 1, out_path.c_str());
 }
 
+// The coding loop of the compressor: every byte of the preprocessed stream is coded as 8
+// binary decisions, most significant bit first. For each bit the Encoder asks the
+// Predictor for P(bit = 1), narrows its interval and then tells the Predictor the bit.
+// progress.log gets "percent compressed-bytes-so-far" lines, which development scripts
+// use to estimate the final size of a long run.
 void Compress(unsigned long long input_bytes, std::ifstream* is,
     std::ofstream* os, unsigned long long* output_bytes, Predictor* p) {
   Encoder e(os, p);
@@ -818,6 +904,8 @@ void Compress(unsigned long long input_bytes, std::ifstream* is,
   delete [] buffer;
 }
 
+// The coding loop of the decompressor: mirror image of Compress. `byte` starts at 1 and
+// collects 8 decoded bits; when it reaches 256..511 its low 8 bits are the byte.
 void Decompress(unsigned long long output_length, std::ifstream* is,
                 std::ofstream* os, Predictor* p) {
   Decoder d(is, p);
@@ -838,6 +926,7 @@ void Decompress(unsigned long long output_length, std::ifstream* is,
   }
 }
 
+// -s: preprocess only. Writes the storage header and the preprocessed stream uncompressed.
 bool Store(const std::string& input_path, const std::string& temp_path,
     const std::string& output_path, FILE* dictionary,
     unsigned long long* input_bytes, unsigned long long* output_bytes) {
@@ -859,6 +948,12 @@ bool Store(const std::string& input_path, const std::string& temp_path,
   return true;
 }
 
+// Compression proper (-c, -n and the last stage of -e):
+//   1. write the preprocessed stream to temp_path (cmix preprocessor, none, or verbatim);
+//   2. derive the byte vocabulary from it;
+//   3. optional dumps for training (--save-*);
+//   4. write the header, build the Predictor, pretrain it on the dictionary, and code.
+// temp_path is deleted at the end.
 // If transformer_weights is nonempty, the lstm is replaced by the pretrained
 // transformer loaded from that file (enwik9-specialized compression); with
 // --load-transformer-probs the transformer is not run and its output
@@ -879,10 +974,15 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   *input_bytes = ftell(data_in);
   fseek(data_in, 0L, SEEK_SET);
 
+// [this entry] Windows build only: see preprocessor.h. Never set in the Linux submission.
 #ifdef _WIN32
   preprocessor::g_vocab_safe_lengths = !transformer_weights.empty();
 #endif
 #ifndef CMIX_OFFICIAL
+  // [this entry] --raw-stream: the input already IS the preprocessed stream (or a chunk of
+  // it). Copy it to the temp file unchanged, so that the models see exactly the bytes an -e
+  // run codes at that point. This is how chunks of the enwik9 stream are scored in parallel
+  // (split evaluation) and how the --save-cmix-bits training dump is produced in chunks.
   if (extraction.raw_stream) {
     if (enable_preprocess) {
       Fail("--raw-stream can only be used with -n");
@@ -914,6 +1014,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   unsigned long long temp_bytes = temp_in.tellg();
   temp_in.seekg(0, std::ios::beg);
 
+  // The vocabulary: the byte values present in the stream (all 256 for tiny inputs).
   std::vector<bool> vocab(256, false);
   if (temp_bytes < kMinVocabFileSize) {
     std::fill(vocab.begin(), vocab.end(), true);
@@ -923,6 +1024,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   }
 
 #ifndef CMIX_OFFICIAL
+  // [this entry] --save-vocab (diagnostic): dump the derived vocabulary, one 0/1 byte per value.
   if (!extraction.save_vocab.empty()) {
     FILE* f = fopen(extraction.save_vocab.c_str(), "wb");
     if (f == NULL) Fail("cannot open %s", extraction.save_vocab.c_str());
@@ -936,6 +1038,9 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
         extraction.save_vocab.c_str());
   }
 #endif
+// [this entry] Forcing the official vocabulary. The transformer's token id of a byte is the
+// byte's rank in the vocabulary of the official enwik9 stream, so a stream (or chunk) whose
+// own vocabulary is a subset must still be numbered with the official one.
 #ifdef _WIN32
   // Windows port: the transformer's token ids are indices into the exact
   // 205-byte vocabulary of the official build (read from the header of the
@@ -953,6 +1058,8 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   // derived from it would shift the columns of --save-ppmd-probs.
   const bool force_official_vocab = extraction.official_vocab;
 #endif
+  // The bitmap below is that vocabulary in header format (205 bits set). A byte outside it
+  // cannot be given a token id, so it is an error.
   if (force_official_vocab && temp_bytes >= kMinVocabFileSize) {
     static const unsigned char kOfficialVocab[32] = {
         0xe8, 0x16, 0x04, 0x00, 0xff, 0xff, 0xff, 0x03, 0x01, 0xfc, 0x0f,
@@ -969,6 +1076,8 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   }
 
 #ifndef CMIX_OFFICIAL
+  // Training-data dumps of the token stream and the article boundaries; --bytes-only stops
+  // here without running any model.
   if (!extraction.save_ppmd_bytes.empty()) {
     SavePpmdBytes(temp_path, temp_bytes, vocab, extraction.save_ppmd_bytes);
   }
@@ -989,6 +1098,7 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     Fail("cannot open output file %s for writing", output_path.c_str());
   }
 
+  // From here on: the coded output. Header first, then the arithmetic-coded bits.
   WriteHeader(temp_bytes, vocab, dictionary != NULL, &data_out);
   PredictorOptions predictor_options;
   predictor_options.ppmd_only = extraction.ppmd_only;
@@ -998,8 +1108,11 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   predictor_options.num_input_bytes = temp_bytes;
   predictor_options.transformer_weights = transformer_weights;
   predictor_options.save_transformer_probs = extraction.save_transformer_probs;
+  // [this entry] --no-transformer / --save-cmix-bits (training data for the mixture loss).
   predictor_options.neutral_transformer = extraction.no_transformer;
   predictor_options.save_cmix_bits = extraction.save_cmix_bits;
+// [this entry] Multi-core compression for experiments; never in the submitted binary.
+// The pipeline re-reads the preprocessed stream from temp_path to run ahead of the coder.
 #ifdef CMIX_PIPE
   // CMIX_TF_THREADS=N: run the transformer on N worker threads ahead of the
   // coder (same output; see TfPipe in predictor.cpp). CMIX_TF_AHEAD: the
@@ -1012,6 +1125,8 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
     }
   }
 #endif
+  // Pretrain() feeds the dictionary text through the context models (not PPMD, not the
+  // transformer) before the first real byte, so common words are known from the start.
   Predictor p(vocab, predictor_options);
   if (enable_preprocess && !extraction.ppmd_only && !extraction.transformer_only) {
     // Pretraining only affects the models --ppmd-only and --transformer-only
@@ -1026,6 +1141,9 @@ bool RunCompression(bool enable_preprocess, const std::string& input_path,
   return true;
 }
 
+// Decompression proper (-d, -x and the main stage of argument-less decompression): read
+// the header, rebuild the same Predictor, decode the preprocessed stream into temp_path,
+// then undo the cmix preprocessor into output_path.
 // If transformer_weights is nonempty, the lstm is replaced by the pretrained
 // transformer loaded from that file (enwik9-specialized decompression). The
 // compression and decompression sides must agree on this, or the decoded
@@ -1035,6 +1153,7 @@ bool RunDecompression(const std::string& input_path,
     FILE* dictionary, unsigned long long* input_bytes,
     unsigned long long* output_bytes, const ExtractionOptions& extraction,
     const std::string& transformer_weights = "") {
+// [this entry] Windows build only; must match what the compressor did.
 #ifdef _WIN32
   preprocessor::g_vocab_safe_lengths = !transformer_weights.empty();
 #endif
@@ -1082,6 +1201,7 @@ bool RunDecompression(const std::string& input_path,
   predictor_options.save_ppmd_probs = extraction.save_ppmd_probs;
   predictor_options.load_transformer_probs = extraction.load_transformer_probs;
   predictor_options.save_transformer_probs = extraction.save_transformer_probs;
+  // The predictor must be configured exactly like the compressor's, including pretraining.
   Predictor p(vocab, predictor_options);
   if (dictionary_used && !extraction.ppmd_only && !extraction.transformer_only) {
     // Mirrors RunCompression: pretraining only affects the models --ppmd-only
@@ -1096,6 +1216,7 @@ bool RunDecompression(const std::string& input_path,
   data_in.close();
   temp_out.close();
 
+  // Undo the cmix preprocessor (WRT dictionary transform): temp file -> output file.
   FILE* temp_in = fopen(temp_path.c_str(), "rb");
   if (!temp_in) return false;
   FILE* data_out = fopen(output_path.c_str(), "wb");
@@ -1110,9 +1231,12 @@ bool RunDecompression(const std::string& input_path,
   return true;
 }
 
+// main: see the mode table at the top of this file.
 int main(int argc, char** argv) {
   ExtractionOptions extraction = ParseExtractionOptions(&argc, argv);
 
+  // mode stays 0 when there are no arguments: self-extracting enwik9 decompression.
+  // [this entry] The official build accepts only the mode letters c, d, e and h.
   char mode = 0;
   if (argc > 1) {
     if (strlen(argv[1]) != 2 || argv[1][0] != '-' ||
@@ -1144,6 +1268,7 @@ int main(int argc, char** argv) {
   }
   ValidateExtractionOptions(extraction, mode);
 
+  // SEED is a compile-time constant (build flag -DSEED), so both sides draw the same numbers.
   srand(SEED);
 
   clock_t start = clock();
@@ -1154,6 +1279,7 @@ int main(int argc, char** argv) {
   FILE* dictionary = NULL;
 
 
+  // Positional arguments: [dictionary] input output.
   if (mode != 0 && mode != 'h')  {
     if (mode == 'n') enable_preprocess = false;
     input_path = argv[2];
@@ -1175,12 +1301,18 @@ int main(int argc, char** argv) {
 
   unsigned long long input_bytes = 0, output_bytes = 0;
 
+  // ---- no arguments: this executable is archive9; restore enwik9 ----
+  // Inverse of the -e branch below, step by step in reverse order.
   if (argc == 1) {
     //Decompress enwik9
+    // (As coded in selfextract_decomp: it writes the trailer to test.dat, the dictionary to
+    // .dict, the transformer weights to .tfweights and the coded enwik9 stream to
+    // .ready4cmix_decomp. archive9 holds no article order; see sort() below.)
     // unpack a) header b) cmix dictionary, c) new order of articles, d) actual cmix binary
     selfextract_decomp();
 
-    // run compression
+    // run decompression: .ready4cmix_decomp -> .input_decomp (the reordered, phda9-transformed
+    // enwik9 with the intro and coda appended)
     std::cout << "Running cmix decompression..." << std::endl;
     input_path = ".ready4cmix_decomp";
     output_path = ".input_decomp" ;
@@ -1192,12 +1324,15 @@ int main(int argc, char** argv) {
     }
     std::cout << "Cmix decompression finished" << std::endl;
 
+    // cut .input_decomp back into main part, intro and coda (readalike_prepr/misc.h)
     split4Decomp();
 
     // apply phda9 preprocessor
     phda9_resto();
 
     // change the order of articles in the input
+    // (restores the original order by sorting the articles by their <id>, so the decompressor
+    // needs no article-order table)
     sort();
 
     // merge all input parts after preprocessing
@@ -1208,6 +1343,7 @@ int main(int argc, char** argv) {
   }
 
 #ifndef CMIX_OFFICIAL
+  // ---- -s: preprocess only (testing) ----
   if (mode == 's') {
     if (!Store(input_path, temp_path, output_path, dictionary, &input_bytes,
         &output_bytes)) {
@@ -1216,6 +1352,8 @@ int main(int argc, char** argv) {
     }
   } else
 #endif
+  // ---- -c / -n: generic compression. With --transformer PATH (testing) the transformer
+  // runs with the weights in PATH, as -e does with the embedded ones. ----
   if (mode == 'c' || mode == 'n') {
       remove(".dict");
     if (!RunCompression(enable_preprocess, input_path, temp_path, output_path,
@@ -1223,11 +1361,20 @@ int main(int argc, char** argv) {
         extraction.transformer)) {
       return Help();
     }
+  // ---- -e: the official enwik9 compression. Intermediate files, all in the working
+  // directory:
+  //   enwik9 -> .intro / .main / .coda                 (split4Comp, by line number)
+  //   .main  -> .main_reordered                        (reorder: similar articles adjacent)
+  //          -> .main_phda9prepr                       (phda9_prepr: XML/markup transform)
+  //   .main_phda9prepr + .intro + .coda -> .ready4cmix (the input of cmix proper)
+  //   .ready4cmix -> OUT                               (WRT transform + models + coder)
+  //   archive9 = decompressor + dictionary + weights + OUT + trailer
   } else if (mode == 'e') {
     // Compress enwik9
     input_path = argv[2];
     output_path = argv[3]; //name of a compressor output
 
+    // (and d) the transformer weights, written to .tfweights and passed to RunCompression)
     // unpack a) cmix dictionary, b) new order of articles, c) actual cmix binary
     selfextract_comp();
 
@@ -1260,7 +1407,7 @@ int main(int argc, char** argv) {
     }
 
     // construct a selfextracting decompressor binary
-    // archive9 = decomp_binary(upxed) + comp_dict + tf_weights + cmix_output
+    // archive9 = decomp_binary(packed) + comp_dict + tf_weights + cmix_output
     //     + header.dat
     cat(".decomp_bin", ".dict.comp", "dec1");
     cat("dec1", ".tfweights", "dec1w");
@@ -1268,12 +1415,16 @@ int main(int argc, char** argv) {
     // get the size of the output file
     size_t output_size = getFileSize(output_path);
 
+    // The archive trailer is the compressor's own trailer (saved to test.dat by
+    // selfextract_comp) with decomp_input_size filled in; the article-order size stays in it
+    // but archive9 contains no article order and the decompressor does not read that field.
     HeaderInfo header;
     read("test.dat", header);
     header.decomp_input_size = output_size;
     write("header4archive.dat", header);
 
     cat("dec1w", output_path.c_str(), "dec2");
+    // [this entry] ARCHIVE_EXE is "archive9" (Linux) or "archive9.exe" (Windows build).
     cat("dec2", "header4archive.dat", ARCHIVE_EXE);
 
     // make the decompressor binary executable
@@ -1282,6 +1433,8 @@ int main(int argc, char** argv) {
     int i = strtol(mode, 0, 8);
     chmod(buf, i);
 
+  // ---- -h: write the 16-byte trailer (header.dat) that the build script appends to the
+  // compressor package. decomp_input_size is 0 there; -e fills it in for archive9. ----
   } else if (mode == 'h') {
     HeaderInfo header;
     header.dict_size = atoi(argv[2]);
@@ -1292,8 +1445,9 @@ int main(int argc, char** argv) {
     goto exit;
   }
 #ifndef CMIX_OFFICIAL
+  // ---- -x (testing): decompress a -e style stream outside a self-extracting archive ----
   else if (mode == 'x') {
-    // run compression
+    // run decompression, with the dictionary left in ./.dict by an earlier run
     input_path = argv[2];
     output_path = argv[3];
     dictionary = fopen(".dict", "rb");
@@ -1304,6 +1458,7 @@ int main(int argc, char** argv) {
     goto print_end_message;
   }
 #endif
+  // ---- -d: generic decompression (with --transformer PATH if -c/-n used it) ----
   else {
     if (!RunDecompression(input_path, temp_path, output_path, dictionary,
         &input_bytes, &output_bytes, extraction, extraction.transformer)) {

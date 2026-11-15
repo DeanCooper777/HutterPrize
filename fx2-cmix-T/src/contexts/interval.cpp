@@ -1,3 +1,7 @@
+// interval.cpp: Interval, see interval.h. Not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "interval.h"
 
 Interval::Interval(const unsigned int& bit_context,
@@ -14,6 +18,7 @@ Interval::Interval(const unsigned int& bit_context,
   mask_ = size_ - 1;
 }
 
+// shift_ = bits needed for the largest class number; the oldest classes fall off the top.
 void Interval::Update() {
   context_ = mask_ & ((context_ << shift_) + map_[byte_]);
 }

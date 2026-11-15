@@ -1,10 +1,22 @@
 // Runtime-tunable parameters for experiments.
 //
-// Every parameter has its built-in (upstream) default. If the environment
+// Every parameter has a built-in default, which is the value this entry ships (not
+// always upstream's value). If the environment
 // variable CMIX_TUNE names a file, each line "name value" in it overrides the
 // parameter of that name ('#' starts a comment). CheckAllUsed() aborts if a
 // name in the file was never requested (typo protection). Compression and
 // decompression must see the same file.
+//
+// Place in the pipeline: a side channel. Model code (predictor.cpp, mixer, sse, ppmd,
+// fxcm) asks tune::Get("name", default) for its constants while it is being constructed.
+//
+// Testing: this is the experiment mechanism. An experiment points CMIX_TUNE at a file of
+// overrides and runs the compressor on a test file; a winning value is then made the
+// default in the source. The submitted run uses no file.
+//
+// New in this entry. In the official build (-DCMIX_OFFICIAL) Get() returns the default
+// and nothing else is compiled, so the file reader, the map and the getenv call add no
+// bytes to the submission binary and the environment cannot change the model.
 #ifndef CMIX_TUNE_H
 #define CMIX_TUNE_H
 
@@ -25,6 +37,7 @@ inline void CheckAllUsed() {}
 
 namespace tune {
 
+// The overrides read from the CMIX_TUNE file, loaded on first use.
 inline std::map<std::string, double>& Overrides() {
   static std::map<std::string, double>* m = [] {
     auto* m = new std::map<std::string, double>();
@@ -47,12 +60,13 @@ inline std::map<std::string, double>& Overrides() {
   return *m;
 }
 
-// Returns the override for `name`, or `def`. Marks the name as used.
+// The names requested so far (for CheckAllUsed).
 inline std::map<std::string, int>& Used() {
   static std::map<std::string, int> u;
   return u;
 }
 
+// Returns the override for `name`, or `def`. Marks the name as used and logs overrides.
 inline double Get(const char* name, double def) {
   auto& m = Overrides();
   Used()[name] = 1;
@@ -64,6 +78,7 @@ inline double Get(const char* name, double def) {
 
 inline double Get(const std::string& name, double def) { return Get(name.c_str(), def); }
 
+// Called once the model is built: a name in the file that nobody asked for is an error.
 inline void CheckAllUsed() {
   for (auto& kv : Overrides()) {
     if (!Used().count(kv.first)) {

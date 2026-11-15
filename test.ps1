@@ -22,6 +22,40 @@
   .\test.ps1 -Sizes 6 -NoTransformer   # use the LSTM mixer input instead
   .\test.ps1 -Enwik9              # full contest run with build\run\cmix.exe
 #>
+
+# test.ps1 -- compress / decompress round-trip test on Windows. New in this
+# entry.
+#
+# What it verifies: that the decompressor restores exactly the bytes that the
+# compressor was given, for the whole chain (preprocessing, dictionary,
+# context models, PPMD, transformer byte model, mixers, SSE, arithmetic
+# coder). The reference is the input file itself: same length and same
+# SHA-256. It also records compressed size, time and peak memory, which is
+# how settings were compared during development.
+#
+# Two modes:
+#   default   generic mode (-c / -d with the dictionary and --transformer) on
+#             data\enwikN, the first 10^N bytes of enwik9. Uses
+#             build\cmix_orig.exe. Fast, but it is not the contest pipeline
+#             (no article reordering, no self-extracting archive).
+#   -Enwik9   the contest pipeline with build\run\cmix.exe: "-e" on the full
+#             enwik9, then the resulting archive9.exe run in an empty
+#             directory. Reports TotalWithCompressor = size of cmix.exe +
+#             size of archive9.exe, the Windows equivalent of the score
+#             (the real score comes from the Linux build).
+#
+# How to run: .\build.ps1 first (needs enwik9 in the repository root and, for
+# the partial files, python scripts\split_enwik9.py). Then see .EXAMPLE above.
+#
+# Pass: the row appended to results.csv has Verified = True. In the default
+# mode a mismatch also stops the script with "decompressed output does NOT
+# match the input". With -SkipDecompress nothing is verified (Verified is
+# empty); only size and time are recorded.
+#
+# Protects: everything under fx2-cmix-T\src and cpp_infer that takes part in
+# coding. Any change that makes compressor and decompressor disagree shows up
+# here as a failed round trip.
+
 param(
   [int[]]$Sizes = @(5, 6),
   [switch]$NoTransformer,
@@ -37,6 +71,8 @@ $Dict    = Join-Path $Src 'dictionary\english.dic'
 $Weights = Join-Path $Src 'models\6m-q4-fp32.tfwc2'
 $Csv     = Join-Path $Root 'results.csv'
 
+# Runs a program in $cwd and waits for it, polling once a second for its peak
+# working set. Returns wall time, peak memory in MB and the exit code.
 function Invoke-Measured([string]$exe, [string[]]$argv, [string]$cwd) {
   $psi = [Diagnostics.ProcessStartInfo]::new($exe, (($argv | ForEach-Object { '"' + $_ + '"' }) -join ' '))
   $psi.UseShellExecute = $false
@@ -51,17 +87,20 @@ function Invoke-Measured([string]$exe, [string[]]$argv, [string]$cwd) {
   [pscustomobject]@{ Seconds = $sw.Elapsed.TotalSeconds; PeakMB = [int]($peak / 1MB); ExitCode = $p.ExitCode }
 }
 
+# True if $b exists and has the same length and SHA-256 as $a.
 function Test-SameFile([string]$a, [string]$b) {
   if (-not (Test-Path $b)) { return $false }
   if ((Get-Item $a).Length -ne (Get-Item $b).Length) { return $false }
   (Get-FileHash $a -Algorithm SHA256).Hash -eq (Get-FileHash $b -Algorithm SHA256).Hash
 }
 
+# Appends one row to results.csv and prints it.
 function Add-Result($row) {
   $row | Export-Csv -Path $Csv -Append -NoTypeInformation
   $row | Format-List | Out-String | Write-Host
 }
 
+# Every run gets its own directory under runs\, named with this time stamp.
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 if ($Enwik9) {
@@ -77,6 +116,8 @@ if ($Enwik9) {
   $c = Invoke-Measured "$work\comp\cmix.exe" @('-e', 'enwik9', 'enwik9.comp') "$work\comp"
   if ($c.ExitCode -ne 0) { throw "compression failed ($($c.ExitCode))" }
   $arch = Get-Item "$work\comp\archive9.exe"
+  # $s1 = size of the compressor package. The archive is moved to a directory
+  # that holds nothing else, so the decompression cannot read the original.
   $s1 = (Get-Item $cmix).Length
   Copy-Item $arch.FullName "$work\decomp\archive9.exe"
   $d = $null; $ok = ''
@@ -98,6 +139,9 @@ if ($Enwik9) {
 if (-not (Test-Path $Exe)) { throw "$Exe not found - run .\build.ps1 first" }
 $dictArg = if ($NoDictionary) { @() } else { @($Dict) }
 
+# One compress + decompress per requested size. The same options ($opts, the
+# dictionary) must be given to -c and -d: the decompressor rebuilds the same
+# models and has to make the same predictions.
 foreach ($n in $Sizes) {
   $in = Join-Path $Root "data\enwik$n"
   if (-not (Test-Path $in)) { throw "$in not found - run: python scripts\split_enwik9.py" }

@@ -1,4 +1,14 @@
 #!/bin/bash
+# run_A_opt.sh: the complete cmix-aware retraining of the transformer on one GPU: fine-tune
+# with the mixture loss (training_recipes/train_A_finetune.py), float32 cooldown
+# (cooldown_A.py), export (pysrc/export_weights.py) and packing into a .tfwc2 weights file
+# (pysrc/weights_compress.py). SUBMISSION.md, "Retrain the weights", refers to this script.
+# Inputs: the staged training data, the code under /workspace/opt, the starting checkpoint.
+# Output: RUN_DIR/models/6m-q4-fp32-A.tfwc2 (the file the compressor embeds) and checkpoints.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Run A with the optimized code (fused fake quant, sync fixes, no gradient
 # checkpointing in the bf16 fine-tune) in its own directory, then export.
 #   RUN_DIR=/workspace/full A_EPOCHS=24 COOLDOWN_EPOCHS=4 bash run_A_opt.sh

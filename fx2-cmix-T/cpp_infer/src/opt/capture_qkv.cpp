@@ -12,6 +12,21 @@
 //   i8       k[n_layers][n_pos][192]
 //   i8       v[n_layers][n_pos][192]
 // layer index order = {3, 7, 11}.
+//
+// Where it sits: a data generator for the attention-kernel tests, not part of
+// cmix. The reference Transformer (../model.cpp) reports its intermediates
+// through set_capture(); this tool keeps the quantized queries, keys and
+// values, so that test_attn.cpp and bench_attn.cpp can exercise attn.cpp (the
+// production attention kernel inside the transformer byte model) on real
+// activations instead of random ones.
+//
+// Testing: build (from cpp_infer/src/opt) with `make -f Makefile.attn`
+// (-> ../../bin/opt-attn/capture_qkv), run as
+//   capture_qkv [--data DIR] [--article N] [--max-pos N]
+// It writes <data>/attn_qkv_article<N>.bin, prints the per-head scales and
+// "wrote <file> (<n> positions)". It checks nothing itself.
+//
+// Unchanged from the previous winning entry.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

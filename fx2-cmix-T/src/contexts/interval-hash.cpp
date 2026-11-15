@@ -1,3 +1,7 @@
+// interval-hash.cpp: IntervalHash, see interval-hash.h. Not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "interval-hash.h"
 
 IntervalHash::IntervalHash(const unsigned int& bit_context,
@@ -15,6 +19,8 @@ IntervalHash::IntervalHash(const unsigned int& bit_context,
   size_ = (unsigned long long)1 << (hash_size * order);
 }
 
+// interval_ = the classes of the last few bytes (num_bits bits); context_ = rolling hash of
+// the successive interval_ values.
 void IntervalHash::Update() {
   interval_ = mask_ & ((interval_ << shift_) + map_[byte_]);
   context_ = (context_ * (1 << hash_size_) + interval_) % size_;

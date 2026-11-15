@@ -19,6 +19,13 @@
 // added operator<< for std::ostream
 // added C10_API to export SmallVectorBase
 
+// SmallVector.h (third party, LLVM via ATen): vector with inline storage for a few elements.
+// Used by src/context-manager.h, src/predictor.h and src/mixer/lstm.h to hold models, contexts
+// and mixers without a heap indirection.
+//
+// Third-party container, used as it is. Not part of the compression method.
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #pragma once
 
 #include "AlignOf.h"

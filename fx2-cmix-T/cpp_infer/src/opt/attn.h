@@ -70,6 +70,18 @@
 // the same d = score - max values). The toggle is a runtime float; when off
 // the only residual cost is the (always-vectorized) compare+movemask that
 // also drives the group-skip fast path.
+//
+// How it fits: used by model_opt.cpp for layers 3, 7 and 11 of the
+// transformer byte model (transformer -> mixers -> SSE -> arithmetic coder).
+// model_opt.cpp always passes skip_threshold 0 (exact softmax).
+//
+// Testing: test_attn.cpp, bench_attn.cpp (real q/k/v captured by
+// capture_qkv.cpp, loaded through qkv_capture.h).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry. ([this entry] attn.cpp makes the
+// scratch buffers thread_local in -DCMIX_PIPE experiment builds, which lifts
+// the "NOT reentrant" restriction above for those builds only.)
 #pragma once
 
 #include <cstdint>

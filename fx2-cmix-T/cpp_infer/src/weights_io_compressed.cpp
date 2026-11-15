@@ -12,6 +12,30 @@
 // __nv_sinf/__nv_cosf; DT_I8 uses an adaptive 15-symbol tree, DT_BF16 hi/lo
 // byte models, DT_F32/DT_I32 per-byte-plane models, names an order-2
 // character model and metadata an order-1 byte model.
+//
+// How it fits: the weights of the transformer byte model are part of the
+// compressor package, so every byte of that file counts in the score. This
+// decoder runs once at start-up (from OptModel::load in opt/arena_build.cpp)
+// and hands the tensors to the loader. It is compiled -Os: it is load-time
+// code and its own size counts too.
+//
+// Testing: test_weights_compressed (bit-for-bit comparison with the plain
+// FX2TFW01 container); the Python encoder also decodes and compares its own
+// output.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] ENC_INTC, the payload coding the shipped ".tfwc2" file uses
+//   for the quantized weights (BinDecoder::decode_tree_counts and the
+//   ENC_INTC case in load_v2). The previous coding (ENC_INT4) predicts each
+//   bit of a weight with an adaptive probability shared by all tensors that
+//   forgets old data (shift-5 update). ENC_INTC keeps, per tensor and per
+//   node of the bit tree, the exact counts of zeros and ones seen so far and
+//   uses the Krichevsky-Trofimov estimate (2*n0 + 1) / (2*(n0 + n1) + 2).
+//   With no forgetting it converges on the tensor's actual value frequencies,
+//   which codes the weights in fewer bytes -> smaller compressor package.
+//   The estimate is integer arithmetic, so encoder and decoder agree exactly.
+// - Everything else (v1, the v2 container, the RoPE table reconstruction) is
+//   unchanged.
 
 #include "weights_io.h"
 
@@ -50,6 +74,7 @@ size_t dtype_size(uint8_t dtype) {
   }
 }
 
+// bounds-checked cursor over the file bytes
 struct Reader {
   const uint8_t* p;
   size_t left;
@@ -106,6 +131,7 @@ struct RangeDecoder {
   }
 };
 
+// format v1 payload: each weight is one of 15 equally likely values
 void decode_i8_uniform15(const uint8_t* stream, size_t stream_len, int8_t* out,
                          size_t count) {
   RangeDecoder rd(stream, stream_len);
@@ -190,6 +216,13 @@ float trig_slowpath(float a, int* quadrant) {
   return r;
 }
 
+// Why this exists: the RoPE sin/cos tables are most of the uncompressed file
+// but are a pure function of the 32 stored frequencies, so the file omits
+// them and they are recomputed here. The training ran on a GPU, so the
+// recomputation has to reproduce the GPU library's sinf/cosf bit for bit.
+// Every step is a single correctly rounded IEEE operation (fp32 arithmetic,
+// fmaf, integer arithmetic, one double multiply), so any CPU gets the same
+// tables.
 // __nv_sinf(a) for cos_bias 0, __nv_cosf(a) for cos_bias 1
 float sincosf_cuda(float a, int cos_bias) {
   int i = (int)lrintf(a * fbits(0x3F22F983u));  // __float2int_rn(a * 2/pi)
@@ -231,6 +264,8 @@ struct BinDecoder {
     for (int i = 0; i < 4; i++) code = (code << 8) | byte();
   }
   uint8_t byte() { return p < end ? *p++ : 0; }
+  // one binary decision with an adaptive 11-bit probability of a 0 bit;
+  // after the bit the probability moves 1/32 of the way toward it
   int decode_bit(uint16_t* prob) {
     uint32_t bound = (range >> 11) * *prob;
     int bit;
@@ -250,6 +285,11 @@ struct BinDecoder {
     }
     return bit;
   }
+  // [this entry] ENC_INTC symbol decoder. Walks an nbits-deep binary tree,
+  // most significant bit first; each node predicts its bit from the counts
+  // of the bits already decoded at that node (integer division, so the
+  // Python encoder computes exactly the same 12-bit probability), then
+  // increments the count of the bit it saw.
   // counts: (2 << nbits) entries, [2*node] zeros and [2*node+1] ones seen;
   // P(0) = (2*n0 + 1) / (2*(n0 + n1) + 2) in 12 bits, clamped to [1, 4095]
   uint32_t decode_tree_counts(uint32_t* counts, int nbits) {
@@ -279,6 +319,7 @@ struct BinDecoder {
     }
     return node - (1u << nbits);
   }
+  // symbol decoder for the adaptive-probability models: the same tree walk
   // probs: (1 << nbits) entries, indices 1.. used
   uint32_t decode_tree(uint16_t* probs, int nbits) {
     uint32_t node = 1;
@@ -308,6 +349,8 @@ struct ModelsV2 {
         plane(4 * 256, 1024) {}
 };
 
+// Decodes a whole FX2TFWC2 file: for each tensor its name, dtype, shape and
+// encoding byte (all through the metadata / name models), then the payload.
 WeightsFile load_v2(Reader& r, const char* path) {
   uint32_t n_tensors = r.u32();
   BinDecoder dec(r.p, r.left);
@@ -351,6 +394,9 @@ WeightsFile load_v2(Reader& r, const char* path) {
     uint8_t encoding = get_meta();
 
     switch (encoding) {
+      // [this entry] quantized weights, count-based coder. nbits = width of
+      // the tree (4 for the 4-bit weights in [-7, 7]); the counts start at
+      // zero for every tensor; the decoded symbol is value + (2^(nbits-1) - 1).
       case ENC_INTC: {
         if (t.dtype != DT_I8) die("%s: %s: ENC_INTC on dtype %u", path,
                                   name.c_str(), unsigned(t.dtype));
@@ -364,6 +410,7 @@ WeightsFile load_v2(Reader& r, const char* path) {
           out[k] = int8_t(int(dec.decode_tree_counts(counts, nbits)) - offset);
         break;
       }
+      // quantized weights, the previous winner's coding (still decoded)
       case ENC_INT4: {
         if (t.dtype != DT_I8) die("%s: %s: ENC_INT4 on dtype %u", path,
                                   name.c_str(), unsigned(t.dtype));
@@ -372,6 +419,7 @@ WeightsFile load_v2(Reader& r, const char* path) {
           out[k] = int8_t(int(dec.decode_tree(m.int4.data(), 4)) - 7);
         break;
       }
+      // bf16 scales: high byte, then low byte in the context of the high
       case ENC_BF16: {
         if (t.dtype != DT_BF16) die("%s: %s: ENC_BF16 on dtype %u", path,
                                     name.c_str(), unsigned(t.dtype));
@@ -383,6 +431,7 @@ WeightsFile load_v2(Reader& r, const char* path) {
         }
         break;
       }
+      // fp32 / int32: one model per byte position within the 4-byte value
       case ENC_PLANE4: {
         if (dtype_size(t.dtype) != 4)
           die("%s: %s: ENC_PLANE4 on dtype %u", path, name.c_str(),
@@ -391,6 +440,8 @@ WeightsFile load_v2(Reader& r, const char* path) {
           t.data[k] = uint8_t(dec.decode_tree(&m.plane[(k & 3) * 256], 8));
         break;
       }
+      // RoPE tables: nothing stored; recomputed from rope.inv_freq, which
+      // must already have been decoded
       case ENC_ROPE_SIN:
       case ENC_ROPE_COS: {
         if (t.dtype != DT_F32 || ndim != 2)
@@ -427,6 +478,8 @@ WeightsFile load_v2(Reader& r, const char* path) {
 
 }  // namespace
 
+// Entry point: reads the file, dispatches on the magic. FX2TFWC2 -> load_v2;
+// FX2TFWC1 is decoded inline below (raw container, range-coded int8 payloads).
 WeightsFile WeightsFile::load_compressed(const char* path) {
   FILE* f = std::fopen(path, "rb");
   if (!f) die("cannot open %s", path);

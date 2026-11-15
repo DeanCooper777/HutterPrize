@@ -82,6 +82,19 @@
 // =========================================================================
 // All builders take the same inputs the model loader has: row-major int8
 // weights in [-7,7] and the folded per-row fp32 scales.
+//
+// How it fits: these are the in-memory formats of the matmuls with 8-bit
+// inputs. arena_build.cpp fills them at load, qmat_dense.cpp / qmat_sparse.cpp
+// read them for every symbol (transformer byte model -> mixers -> SSE ->
+// arithmetic coder). In this entry the matmuls with 16-bit inputs use the
+// separate layouts of act16.h instead.
+//
+// Testing: test_qmat.cpp, bench_qmat.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] QDense::packed: a nibble-packed variant of the dense arena
+//   for the VNNI kernels (speed only; not used by the submitted Linux binary,
+//   which is built with -DFX2_NO_VNNI).
 #pragma once
 
 #include <cstddef>
@@ -107,6 +120,7 @@ struct QDense {
   int ngroups = 0;      // rows_padded / group_rows
   int rows_padded = 0;  // round_up(d_out, group_rows)
   size_t bytes = 0;     // total stream bytes (multiple of the group size)
+  // [this entry]
   // VNNI-packed variant of the same geometry (qmat_dense.cpp, used when the
   // CPU has AVX-VNNI): each 32-byte weight vector holds row 2j (low nibbles)
   // and row 2j+1 (high nibbles) of a chunk as unsigned w+7 in [0,14], so a

@@ -1,5 +1,26 @@
-// act16.cpp — see act16.h. AVX2 only; every operation is an explicit
+// act16.cpp - the 16-bit activation kernels; see act16.h for what they
+// compute, which matmul uses which kernel and why the archive gets smaller.
+// AVX2 only; every operation is an explicit
 // intrinsic (no fast-math), so results are the same on every x86-64 CPU.
+//
+// How it fits: called from model_opt.cpp for every layer of every byte
+// (transformer byte model -> mixers -> SSE -> arithmetic coder). The weight
+// layouts read here are written once at load by arena_build.cpp
+// (pack16_nibbles).
+//
+// Testing: test_act16.cpp (bitwise equality of the packed kernels with the
+// plain int8 ones, and of gemv16p_set with a scalar reference; also a rough
+// timing).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// New in this entry.
+//
+// Why integer arithmetic is used throughout: an int32 sum has one value no
+// matter how it is split over SIMD lanes or in which order it is added, as
+// long as no intermediate overflows or saturates. Each kernel below states
+// the bound that guarantees this. Floating point enters only in the quantizer
+// (one IEEE division) and in the epilogue (convert, multiply, add), each a
+// single correctly rounded operation.
 #include "act16.h"
 
 #include <immintrin.h>
@@ -8,6 +29,8 @@ namespace fx2 {
 namespace opt {
 
 namespace {
+// Lookup table for the branch-free nonzero index lists of the relu^2
+// quantizers.
 // t[m] = the bit positions set in m, one per byte, lowest first
 struct PosTable {
   uint64_t t[256];
@@ -24,6 +47,11 @@ struct PosTable {
 constexpr PosTable kPos;
 }  // namespace
 
+// relu^2 and 16-bit quantization of the mlp.down input, 8 values per step:
+// max(h, 0), square, IEEE divide by the scale, clamp to 32767 in float (so the
+// conversion cannot overflow), convert with round-half-to-even (the MXCSR
+// default), saturating pack to int16. Also builds the list of nonzero
+// positions. (Reference form; the model calls relu2_quant16p.)
 int relu2_quant16(const float* h, float s, int n, int16_t* a, uint16_t* idx) {
   const __m256 vs = _mm256_set1_ps(s);
   const __m256 vhi = _mm256_set1_ps(32767.0f);
@@ -53,6 +81,9 @@ int relu2_quant16(const float* h, float s, int n, int16_t* a, uint16_t* idx) {
   return nnz;
 }
 
+// Signed 16-bit quantizer for a 192-vector: IEEE divide, clamp in float to
+// [-32768, 32767], round-half-to-even convert, pack. The same recipe as the
+// 8-bit quantizers of glue.cpp with a scale 256 times smaller.
 void quant192_i16(const float* x, float s, int16_t* a) {
   const __m256 vs = _mm256_set1_ps(s);
   const __m256 vlo = _mm256_set1_ps(-32768.0f);
@@ -69,6 +100,11 @@ void quant192_i16(const float* x, float s, int16_t* a) {
 
 namespace {
 
+// Reference sparse kernel (int8 columns), one half of the 192 output rows.
+// Two active columns are processed together: their int8 weights are widened to
+// int16 and interleaved, and vpmaddwd against the pair (a[c0], a[c1]) gives
+// w0*a0 + w1*a1 per row directly in int32: |w| <= 7 and 0 <= a <= 32767, so no
+// product or sum can overflow.
 // rows [row0, row0 + 96): 6 blocks of 16 rows, 12 int32 accumulators
 inline void spmv16_half(const int8_t* cols, const float* fold,
                         const int16_t* a, const uint16_t* idx, int nnz,
@@ -98,6 +134,7 @@ inline void spmv16_half(const int8_t* cols, const float* fold,
           hi[b], _mm256_madd_epi16(_mm256_unpackhi_epi16(w0, w1), pair));
     }
   }
+  // odd count: the last column alone, paired with zero weights
   if (k < nnz) {
     const unsigned c0 = idx[k];
     const __m256i pair = _mm256_set1_epi32(
@@ -113,6 +150,7 @@ inline void spmv16_half(const int8_t* cols, const float* fold,
           hi[b], _mm256_madd_epi16(_mm256_unpackhi_epi16(w0, z), pair));
     }
   }
+  // epilogue: out += fold * float(dot), multiply rounded before the add
   // lo = rows {0-3, 8-11}, hi = rows {4-7, 12-15} of each 16-row block
   for (int b = 0; b < 6; b++) {
     const __m256i r0 = _mm256_permute2x128_si256(lo[b], hi[b], 0x20);
@@ -140,6 +178,7 @@ inline __m128i hsum4(__m256i a0, __m256i a1, __m256i a2, __m256i a3) {
 
 }  // namespace
 
+// Reference mlp.down kernel: int8 columns, int16 activations.
 // idx must have 8 readable in-range entries past nnz (prefetch lookahead)
 void spmv16_add(const int8_t* cols, const float* fold, const int16_t* a,
                 const uint16_t* idx, int nnz, float* out) {
@@ -147,6 +186,9 @@ void spmv16_add(const int8_t* cols, const float* fold, const int16_t* a,
   spmv16_half(cols, fold, a, idx, nnz, 96, out);
 }
 
+// Reference dense 192x192 kernel (int8 rows, int16 activations): per row,
+// 12 vpmaddwd of 16 sign-extended weights against 16 activations, summed in
+// int32 (|dot| <= 192 * 7 * 32768 < 2^31).
 void gemv16_add(const int8_t* rows, const float* fold, const int16_t* a,
                 float* out) {
   __m256i av[12];
@@ -189,7 +231,17 @@ void gemv16_add(const int8_t* rows, const float* fold, const int16_t* a,
 
 // ---------------------------------------------------------------------------
 // packed variants (see act16.h)
+// [this entry] These are the kernels the model runs. Two ideas:
+//  1. Weights stay 4 bits in memory (nibbles u = w + 7 in [0, 14]): half the
+//     bytes to fetch, and these kernels are limited by cache misses.
+//  2. A 16-bit activation is split into its two bytes, so the products run on
+//     vpmaddubsw (u8 x s8, 32 products per instruction) like the 8-bit
+//     kernels. The byte split and the +7 offset are undone exactly in int32.
 // ---------------------------------------------------------------------------
+
+// As relu2_quant16, plus what spmv16p_add needs: idxh = the positions whose
+// value does not fit in one byte (a >= 256; only those have a nonzero high
+// byte), and suma = the sum of all a (for the +7 offset correction).
 int relu2_quant16p(const float* h, float s, int n, int16_t* a, uint16_t* idx,
                    uint16_t* idxh, int* nh_out, int32_t* suma_out) {
   const __m256 vs = _mm256_set1_ps(s);
@@ -235,6 +287,8 @@ int relu2_quant16p(const float* h, float s, int n, int16_t* a, uint16_t* idx,
   return nnz;
 }
 
+// Load-time packing of one weight row or column into nibbles (layout in
+// act16.h); called by arena_build.cpp.
 void pack16_nibbles(const int8_t* w, int n, uint8_t* dst) {
   for (int j = 0; j < n / 64; j++)
     for (int i = 0; i < 32; i++)
@@ -244,6 +298,12 @@ void pack16_nibbles(const int8_t* w, int n, uint8_t* dst) {
 
 namespace {
 
+// The inner loop of the packed mlp.down kernel.
+// vpmaddubsw saturates its signed 16-bit result, but here one lane is at most
+// 2 * 255 * 14 = 7140, so it never does. The lanes are then added as UNSIGNED
+// 16-bit numbers: 8 pairs of low bytes give at most 8 * 7140 = 57120 and 16
+// pairs of high bytes (<= 127) at most 16 * 2 * 127 * 14 = 56896, both below
+// 65536, so nothing wraps before the widening to int32.
 // One sweep over the listed columns: S[r] += sum_k mult(idx[k]) * u[r][idx[k]]
 // with mult(c) = the byte ab[2c] (the low or the high byte of a[c]). Columns
 // go two at a time: their bytes are interleaved, so each 16-bit lane of
@@ -267,6 +327,7 @@ inline void sweep16(const uint8_t* cols, const uint16_t* idx, int n,
         _mm256_set1_epi16(static_cast<short>(m0 | (m1 << 8)));
     const uint8_t* p0 = cols + size_t(c0) * 96;
     const uint8_t* p1 = cols + size_t(c1) * 96;
+    // fetch the columns needed PD pairs from now (two cache lines each)
     if (PD) {
       const char* f0 = reinterpret_cast<const char*>(cols) +
                        size_t(idx[k + 2 * PD]) * 96;
@@ -277,6 +338,7 @@ inline void sweep16(const uint8_t* cols, const uint16_t* idx, int n,
       _mm_prefetch(f1, _MM_HINT_T0);
       _mm_prefetch(f1 + 64, _MM_HINT_T0);
     }
+    // interleave the two columns' bytes, split low / high nibbles, multiply
     for (int j = 0; j < 3; j++) {
       const __m256i v0 =
           _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + 32 * j));
@@ -299,6 +361,7 @@ inline void sweep16(const uint8_t* cols, const uint16_t* idx, int n,
           _mm256_maddubs_epi16(
               pair, _mm256_and_si256(_mm256_srli_epi16(xh, 4), m0F)));
     }
+    // widen the u16 accumulators into the int32 sums before they can wrap
     if (++pend == MAXP || k + 2 >= n) {
       // acc[4j + 2*nib + uh]: its low half is rows b..b+7 and its high half
       // rows b+16..b+23, with b = 64j + 32*nib + 8*uh
@@ -323,6 +386,12 @@ inline void sweep16(const uint8_t* cols, const uint16_t* idx, int n,
 
 }  // namespace
 
+// [this entry] mlp.down with a 16-bit input: x += W * a, a = quantized relu^2.
+// With a = al + 256 * ah (al = low byte, ah = high byte <= 127) and u = w + 7:
+//   sum a*w = sum al*u + 256 * sum ah*u - 7 * sum a
+// The first sum runs over all nonzero columns, the second only over the
+// columns with a >= 256. All three terms are exact int32 values (the largest,
+// 256 * 768 * 127 * 14, is below 2^31), so the result equals spmv16_add's.
 void spmv16p_add(const uint8_t* cols, const float* fold, const int16_t* a,
                  const uint16_t* idx, int nnz, const uint16_t* idxh, int nh,
                  int32_t suma, float* out) {
@@ -336,6 +405,7 @@ void spmv16p_add(const uint8_t* cols, const float* fold, const int16_t* a,
   const uint8_t* ab = reinterpret_cast<const uint8_t*>(a);
   sweep16<8, 6>(cols, idx, nnz, ab, SL);       // low bytes (<= 255)
   sweep16<16, 0>(cols, idxh, nh, ab + 1, SH);  // high bytes (<= 127)
+  // combine in int32, then out += fold * float(dot) (multiply, then add)
   // sum_c a*w = sum al*u + 256 * sum ah*u - 7 * sum a
   const __m256i corr = _mm256_set1_epi32(7 * suma);
   for (int r = 0; r < 192; r += 8) {
@@ -353,18 +423,27 @@ void spmv16p_add(const uint8_t* cols, const float* fold, const int16_t* a,
   }
 }
 
+// [this entry] Dense packed-row kernel for SIGNED 16-bit activations (the
+// attention output projection, mlp.up, the q/k/v projections). Here the
+// weight nibble is the unsigned operand of vpmaddubsw and the activation byte
+// the signed one, so the low byte is re-centred by 128 to fit a signed byte:
 // a = sl + 256*sh + 128 with sl = (a & 255) - 128 and sh = a >> 8, both
 // signed bytes. With u = w + 7:
 //   sum_c a*w = sum u*sl + 256 * sum u*sh - 7 * (sum sl + 256 * sum sh)
 //               + 128 * sum_c w
 // Each vpmaddubsw lane is at most 2*14*128; a row's six sum to < 32768.
-void gemv16p_add(const uint8_t* rows, const float* fold, const int32_t* krow,
-                 const int16_t* a, float* out) {
+namespace {
+template <bool ADD>
+inline void gemv16p_impl(const uint8_t* rows, const float* fold,
+                         const int32_t* krow, const int16_t* a, int nrows,
+                         float* out) {
   alignas(32) int8_t sl[192], sh[192];
   const __m256i mFF = _mm256_set1_epi16(0x00FF);
   const __m256i m80 = _mm256_set1_epi8(static_cast<char>(0x80));
   const __m256i ones = _mm256_set1_epi16(1);
   __m256i sums = _mm256_setzero_si256();  // sum of a (int32 lanes)
+  // split the 192 activations once into the byte vectors sl and sh, in the
+  // element order of the packed rows, and sum them for the correction
   for (int i = 0; i < 192; i += 32) {
     const __m256i x0 =
         _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
@@ -393,7 +472,8 @@ void gemv16p_add(const uint8_t* rows, const float* fold, const int32_t* krow,
   const __m256i c256 = _mm256_set1_epi16(256);
   const __m256i* SLv = reinterpret_cast<const __m256i*>(sl);
   const __m256i* SHv = reinterpret_cast<const __m256i*>(sh);
-  for (int r = 0; r < 192; r += 8) {
+  // 8 rows per step: 3 loads of 32 bytes per row, 4 vpmaddubsw per load
+  for (int r = 0; r < nrows; r += 8) {
     __m256i t[8];
     for (int q = 0; q < 8; q++) {
       const uint8_t* w = rows + size_t(r + q) * 96;
@@ -413,6 +493,8 @@ void gemv16p_add(const uint8_t* rows, const float* fold, const int32_t* krow,
       t[q] = _mm256_add_epi32(_mm256_madd_epi16(aL, ones),
                               _mm256_madd_epi16(aH, c256));
     }
+    // horizontal sums: one int32 dot per row, 8 rows in one vector; then
+    // undo the +7 and the +128 offsets and scale
     const __m256i q0 = _mm256_hadd_epi32(_mm256_hadd_epi32(t[0], t[1]),
                                          _mm256_hadd_epi32(t[2], t[3]));
     const __m256i q1 = _mm256_hadd_epi32(_mm256_hadd_epi32(t[4], t[5]),
@@ -422,11 +504,24 @@ void gemv16p_add(const uint8_t* rows, const float* fold, const int32_t* krow,
     dots = _mm256_add_epi32(
         _mm256_sub_epi32(dots, corr),
         _mm256_loadu_si256(reinterpret_cast<const __m256i*>(krow + r)));
-    _mm256_storeu_ps(
-        out + r, _mm256_add_ps(_mm256_loadu_ps(out + r),
-                               _mm256_mul_ps(_mm256_loadu_ps(fold + r),
-                                             _mm256_cvtepi32_ps(dots))));
+    const __m256 v =
+        _mm256_mul_ps(_mm256_loadu_ps(fold + r), _mm256_cvtepi32_ps(dots));
+    _mm256_storeu_ps(out + r,
+                     ADD ? _mm256_add_ps(_mm256_loadu_ps(out + r), v) : v);
   }
+}
+}  // namespace
+
+// attention output projection: x += W * a
+void gemv16p_add(const uint8_t* rows, const float* fold, const int32_t* krow,
+                 const int16_t* a, float* out) {
+  gemv16p_impl<true>(rows, fold, krow, a, 192, out);
+}
+
+// mlp.up (nrows = 768) and the q / k / v projections (nrows = 192): y = W * a
+void gemv16p_set(const uint8_t* rows, const float* fold, const int32_t* krow,
+                 const int16_t* a, int nrows, float* out) {
+  gemv16p_impl<false>(rows, fold, krow, a, nrows, out);
 }
 
 }  // namespace opt

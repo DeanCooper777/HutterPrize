@@ -11,6 +11,19 @@
 //
 // Pin with BENCH_CPU=<cpu> (defaults to 104, an idle core of the measured
 // CCX 40-43/104-107).
+//
+// Where it sits: speed tool for attn.cpp, the attention kernel of the three
+// vanilla-attention layers of the transformer byte model. Not a correctness
+// test (test_attn.cpp is) and not part of cmix.
+//
+// Testing: build (from cpp_infer/src/opt) with `make -f Makefile.attn`
+// (-> ../../bin/opt-attn/bench_attn; the bench_attn_prof target adds
+// per-phase timing), run as
+//   bench_attn [--capture FILE] [--reps N] [--kv8-only] [--with-naive]
+// Needs the capture file written by capture_qkv. Linux only. No pass/fail;
+// the default CPU number belongs to the previous authors' machine.
+//
+// Unchanged from the previous winning entry.
 #include <cstdint>
 #include <cstring>
 #include <memory>

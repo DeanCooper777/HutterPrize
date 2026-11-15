@@ -18,6 +18,19 @@
 //   - ONEFIVE vs TWOPASS sweep variants
 //
 // Pinning: BENCH_CPU env var, default cpu 105 (idle CCX 40-43/104-107).
+//
+// Where it sits: speed tool for kda.cpp, the recurrent-state layer used by
+// nine blocks of the transformer byte model. Not a correctness test
+// (test_kda.cpp is) and not part of cmix.
+//
+// Testing: build with `make -C cpp_infer/src/opt -f Makefile.kda`
+// (-> cpp_infer/bin/opt-kda/bench_kda), run as
+//   bench_kda [--tokens N] [--stream-kb K] [--reset-every N] [--reps N]
+//             [--no-profile] [--pf 0|1|2|3]
+// Linux only. No pass/fail. The analytic floors it prints assume the previous
+// authors' Zen 2 machine.
+//
+// Unchanged from the previous winning entry.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

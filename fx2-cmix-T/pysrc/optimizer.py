@@ -1,3 +1,16 @@
+# optimizer.py: optimizer setup for training the transformer byte model.
+#
+# What it does: splits the model's parameters into two groups and gives each its own
+# optimizer, both driven by one learning-rate multiplier schedule:
+#   - the 2-D weight matrices inside the blocks -> Muon (or SOAP);
+#   - everything else (embeddings, unembedding, quantization scales, small coefficients)
+#     -> AdamW.
+#
+# Where it fits: training side only; called from pysrc/train.py. (The stand-in mixer of the
+# cmix-aware loss is NOT handled here; train.py gives it a separate AdamW.)
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from pytorch_optimizer.optimizer.soap import SOAP
 from torch.optim import AdamW, Muon
 from torch.nn import Parameter
@@ -44,6 +57,7 @@ class LearningRates:
     adamw_lr: float
 
 
+# The pair of optimizers plus the schedule that scales both base learning rates.
 @dataclass(frozen=True, slots=True)
 class Optimizers:
     second_order: Muon | SOAP
@@ -81,6 +95,8 @@ class Optimizers:
         return learning_rates
 
 
+# Assign every parameter to exactly one optimizer (checked by the asserts). Quantization
+# scales are stored flat (1-D) precisely so that they land in the AdamW group.
 def make_optimizers(model: Transformer, cfg: OptimizerConfig) -> Optimizers:
     adamw_parameters: list[Parameter] = list(model.embedding.parameters())
     if model.cfg.prior_embedding:

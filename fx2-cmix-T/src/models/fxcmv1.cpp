@@ -17,8 +17,54 @@
     Visit <http://www.gnu.org/copyleft/gpl.html>.
 */
 
+// fxcmv1.cpp: the fxcm model. By far the largest context model of the entry.
+//
+// What it is. fxcm (Kaido Orav) is a complete paq8-style compressor core specialized for the
+// preprocessed enwik9 stream: a few hundred bit predictions from hashed context maps, match
+// models and run models, combined by its own small neural mixers and refined by APM stages.
+// fx2-cmix does not use it as a compressor. It runs it as one model inside cmix and hands
+// cmix everything fxcm computes on the way: each input of fxcm's mixers, each mixer output
+// and each APM output is one cmix mixer input (model_predictions, 431 values per bit).
+//
+// How it is driven. Once per coded bit, src/predictor.cpp calls FXCM::Perceive(bit) ->
+// Predictor::update() -> update1(): train fxcm's mixers on the bit, advance the bit/byte
+// state, call modelPrediction() to compute all predictions for the next bit, run the APM
+// chain. FXCM::Predict() only returns the array that was filled. Two values come in from
+// cmix: lstmpr / lstmex, the bit prediction and the most probable byte of the byte-level
+// predictor (the transformer); fxcm uses them as a mixer input and a mixer context. One
+// value goes out besides the predictions: wrtcxt, a selector context for a cmix mixer.
+// How it fits: preprocess -> dictionary -> [context models / PPMD / transformer byte model]
+// -> mixers -> SSE -> arithmetic coder -> self-extracting archive.
+//
+// Layout of the file, in order:
+//   - byte class tables (wrt_2b, wrt_3b), output array, squash/stretch, global bit state;
+//   - StateTable: generator of the bit-history state machines;
+//   - dictionary decoding: turns the dictionary codewords of the stream back into words;
+//   - Mixer1: fxcm's own mixer (16-bit fixed point, AVX2);
+//   - StateMap, RunContextMap, SmallStationaryContextMap: probability maps;
+//   - ContextMap, ContextMap1, ContextMap2: the hashed bit-history tables (three bucket
+//     sizes); ContextMap2 holds nearly all of fxcm's memory;
+//   - APM, SparseMatchModel, BracketContext, ColumnContext, WordsContext: refinement stage
+//     and the structure-tracking contexts (brackets, quotes, table columns, sentences);
+//   - the English stemmer (from paq8px) that classifies the decoded words;
+//   - model state, PredictorInit (sizes of all tables), MatchModel2;
+//   - modelPrediction(): builds every context at byte boundaries and runs all components
+//     for each bit; update1(): the per-bit driver; the FXCM wrapper class.
+//
+// Testing: tune key fxcm_prefetch (0 turns the prefetch off; the output is the same).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - Prefetch of the ContextMap2 buckets (ContextMap2::prefetch, called from
+//     modelPrediction and update1). The tables are far larger than the CPU caches, so each
+//     bucket lookup is a cache miss; asking for all buckets of a bit at once, and as early
+//     as their addresses are known, lets the misses overlap (speed; SUBMISSION.md reports
+//     fxcm 10% faster). No model state is touched, so the output is bit-identical.
+//   - #include <stdint.h>: needed for uintptr_t with newer standard libraries (portability).
+// Everything else, including all model parameters, is unchanged.
+
 #include "fxcmv1.h"
 
+// [this entry] Build fix, see the trailing comment.
 #include <stdint.h>  // uintptr_t: newer libstdc++ no longer pulls it in indirectly
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +75,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <memory>
+// [this entry] _mm_prefetch for the bucket prefetch, tune.h for its on/off switch.
 #include <immintrin.h>
 #include "../tune.h"
 #define NDEBUG  // remove for debugging (turns on Array bound checks)
@@ -42,6 +89,10 @@ typedef unsigned int U32;
 //
 typedef __m128i XMM;
 typedef __m256i YMM;
+// Links to the rest of cmix. wrt_2b / wrt_3b are also used by src/context-manager.cpp.
+// lstmpr, lstmex: defined in src/predictor.cpp; the byte-level predictor's probability of a 1
+// (12 bits) and its most probable byte, set before each fxcm update. wrtcxt: set here once
+// per byte, read by src/context-manager.cpp as a mixer selector context.
 extern const U8 wrt_2b[256];
 extern const U8 wrt_3b[256];
 extern int lstmpr, lstmex;
@@ -93,6 +144,10 @@ inline int min(int a, int b) {return a<b?a:b;}
 inline int max(int a, int b) {return a<b?b:a;}
 #endif
 
+// Output to cmix. model_predictions holds, for the next bit, every prediction fxcm exports,
+// as probabilities in [0, 1]. AddPrediction appends one (x is a 12-bit probability);
+// ResetPredictions starts the list again for the next bit. num_models is the fixed number
+// of exported predictions per bit and must match what modelPrediction/update1 add.
 int num_models = 439+1-2-7;
 std::valarray<float> model_predictions(0.5f, num_models);
 unsigned int prediction_index = 0;
@@ -141,6 +196,7 @@ template <class T> void alloc(T*&ptr, int c) {
   if (!ptr) exit(1);
 }
  
+// The explanation below is the previous winning entry's bug fix (see writeup.md).
 // for aligned data
 // `data` is `ptr` rounded up to `align`, so it can start up to align-1 bytes
 // into the block; the block therefore has to hold that much more than the c
@@ -198,6 +254,8 @@ inline short stretch(int p) {
     return strt[p];
 }
 
+// Input array of one mixer layer (stretched predictions, 16 bit). add() also exports the
+// prediction to cmix through AddPrediction.
 template <const int S=256 >
 struct alignas(64) Inputs{
         short n[S];
@@ -209,6 +267,8 @@ struct alignas(64) Inputs{
             AddPrediction(squash(p));
         }
     };
+// The global coding state shared by all components: the last bit, the partial byte, the last
+// four bytes, the bit position, and the input arrays of the two mixer layers.
 template <const int S >
 struct BlockData {
     int y;        // Last bit, 0 or 1, set by encoder
@@ -352,6 +412,8 @@ void __attribute__ ((noinline)) Init(int s0,int s1,int s2,int s3,int s4,int s5,i
 }
 };
 
+// Six state machines generated with different parameters (see Predictor::Predictor at the
+// end of the file); each context map is given one of them in PredictorInit.
 //State tables
  U8 STA1[256][4];
  U8 STA2[256][4];
@@ -360,6 +422,10 @@ void __attribute__ ((noinline)) Init(int s0,int s1,int s2,int s3,int s4,int s5,i
  U8 STA6[256][4];
  U8 STA7[256][4];
 
+// The preprocessed stream contains dictionary codewords (bytes >= 128) in place of common
+// words. This part loads the word list from the file ".dict" in the working directory, if it
+// is there, and maps a codeword back to its word, so that the stemmer and the word contexts
+// below can work on real text. Without the file this decoding is inactive.
 // Dictionary reverse decoding
 int wfgets(char *str, int count, FILE  *fp) {
     int c, i = 0;
@@ -476,6 +542,9 @@ void decodeWord(int c){
 // w[i] += ((t[i]*2*err)+(1<<16))>>17 bounded to +- 32K.
 // n is rounded up to a multiple of 8.
 
+// fxcm's own mixer: a set of weight vectors selected by a context, 16-bit fixed-point
+// weights and inputs, AVX2 dot product and update. Not related to the cmix Mixer class in
+// src/mixer/. The description above this struct is from paq8.
 struct Mixer1 { 
   int N, M;   // max inputs, max contexts, max context sets
   short *tx;  // N inputs from add()  
@@ -634,6 +703,8 @@ struct StateMap {
   } 
 }; 
 
+// Variant of StateMap; used for smA[], the probability maps of the match model
+// (MatchModel2mix).
 struct StateMap1 {
   int N;        // Number of contexts
   int cxt;      // Context of last prediction
@@ -898,6 +969,12 @@ short st2_p0[4096];
 short st2_p1[4096];
 short st2_p2[4096];
 
+// The three context-map variants below share one design (described above) and differ in the
+// hash bucket: ContextMap uses 64-byte buckets with 7 elements, ContextMap1 32-byte buckets
+// with 3 elements, ContextMap2 128-byte buckets with 14 elements. Each object handles up to
+// MAXCXT contexts per byte: set() is called once per context at the byte boundary, mix() once
+// per bit; mix() looks up the bit-history states, converts them to predictions and adds them
+// to the mixer inputs.
 struct ContextMap {
   int C;  // max number of contexts
   U8* cp[MAXCXT];   // C pointers to current bit history
@@ -1104,6 +1181,7 @@ int mix1(const int cc,const int bp,const int c1) {
 }
 };
 
+// Small variant: 32-byte buckets, 3 elements. For many small contexts.
 struct ContextMap1 {
   int C;  // max number of contexts
   U8* cp[MAXCXT];   // C pointers to current bit history
@@ -1311,6 +1389,8 @@ int __attribute__ ((noinline))  mix() {
 };
 
 template <const int A, const int B> // Warning: values 3, 7 for A are the only valid parameters
+// Bucket of ContextMap2: 14 elements (2-byte checksum + 7 bit-history bytes each) padded
+// to 128 bytes = two cache lines.
 union  E1 {  // hash element, 64 bytes
   struct{ // this is bad uc
     U16 chk[A];  // byte context checksums
@@ -1337,6 +1417,9 @@ union  E1 {  // hash element, 64 bytes
     
 };
 
+// Large variant: 128-byte buckets, 14 elements. Used for the large high-order contexts
+// (cmC2[]); these tables hold nearly all of fxcm's memory, so their lookups are the cache
+// misses that this entry's prefetch() targets.
 struct ContextMap2 {
   int C;  // max number of contexts
   U8* cp[MAXCXT];   // C pointers to current bit history
@@ -1464,6 +1547,10 @@ inline int mix3(const int s, StateMap& sm) {
     return 1;
   }
 }
+// [this entry] Added. A bucket is selected by (context hash + c0) & tmask, the same
+// expression mix() uses, at the three bit positions where mix() changes bucket. A bucket is
+// 128 bytes, so two cache lines are requested. Contexts that mix() skips (cxtMask) are
+// skipped here too.
 // Prefetch the 128-byte buckets that mix() is about to look up at this bit
 // (bpos 0, 2 and 5 hash in c0; the other bits stay inside the bucket found
 // then). The tables are hundreds of MB, so each lookup is a DRAM miss; issuing
@@ -1591,6 +1678,7 @@ struct  APM {
 };
 
 short pre1[256];
+// Not used: its instances (dcsm, dcsm1) are commented out below.
 struct DirectStateMap {
   StateMap *sm;
   int *cxt;
@@ -1640,6 +1728,8 @@ int pos;
 
 // This is from paq8px(d)
 template <typename T = int,const int S=4>
+// Small move-to-front list; SparseMatchModel uses it to keep its candidate hashes in order
+// of recent success.
 struct MTFList{
   int Root, Index;
   T Previous[S];
@@ -1776,6 +1866,7 @@ struct SparseMatchModel {
   }
 };
 
+// Map 8 bit byte to a 4 bit class.
 const U8 wrt_4b[256]={
  6, 0,12,15,12,15,14,14, 5, 3,14, 0,15,13, 8,13,
  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1797,6 +1888,8 @@ const U8 wrt_4b[256]={
  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
  };
 
+// Names for byte values of the preprocessed stream. The preprocessor replaces some
+// punctuation by other codes, so e.g. '{' arrives as 'P' and '<' as 'L'.
 //wrt
 #define COLON         'J' // :
 #define SEMICOLON     'K' // ;
@@ -1945,6 +2038,8 @@ struct BracketContext {
 };
 
 // Table/row & column context
+// Column / ColumnContext: remember the last rows of text (and the cell positions of wiki
+// tables) so that the byte "above" the current position can be used as a context.
 struct Column {
     U32 linepos;
     U8 fc;
@@ -2102,6 +2197,9 @@ const U8 fchar[20]={FIRSTUPPER,LF, TEXTDATA,LF, COLON,LF, LESSTHAN,GREATERTHAN,E
 const U16 html[2]={'&'*256+'L','&'*256+'N'};
 // Sentence & words context
 
+// List of the recent words of a sentence / paragraph (hash, type from the stemmer, and the
+// bytes between words), from which the word-order contexts are built. Three instances with
+// different word filters: worcxt, worcxt1, worcxt2 (see setbufstem).
 struct WordsContext {
     vec<U16,64*4> sbytes; // List of bytes surrounded by a current word, max 64*4
     vec<U32,64*4> type;   // List of bytes surrounded by a current word, max 64*4
@@ -2607,6 +2705,8 @@ inline bool CharInArray(const char c, const char a[], const int len){
   return i<len;
 }
 
+// English stemmer (Porter2 based, from paq8px): reduces a decoded word to its stem and
+// assigns word-type flags (verb, noun, plural, ...). Stem hashes and types are contexts.
 class EnglishStemmer {
 private:
   inline bool IsVowel(const char c){
@@ -3155,6 +3255,8 @@ public:
   }
 };
 
+// From here: the state of the fxcm model itself (context hashes, word and number state, the
+// 2/3/4-bit class streams of recent bytes, buffers), then the model components.
 // Predictor
 
 const U32 primes[14]={0, 257,251,241,239,233,229,227,223,211,199,197,193,191};
@@ -3219,6 +3321,10 @@ int utf8left=0;
 
 int pr; // Our most important variable - final prediction
 
+// The model components. smA: the probability maps of the match model; scmA: direct maps
+// over small contexts (last bytes, class streams); mxA: mixers 0..9 form the first layer,
+// each with its own selector context, 10 and 11 the final layer; cmC, cmC1, cmC2: the
+// context maps; apmA*: the final APM chain; then the structure contexts.
 StateMap1 smA[3];
 SmallStationaryContextMap scmA[7];   // 1x7 inputs fp
 Mixer1 mxA[12]; 
@@ -3232,6 +3338,7 @@ ContextMap1 cmC1[8];
 // large state memory, per context max 14 uniqe contexts state sets
 // for large amount of large contexts
 ContextMap2 cmC2[18];
+// [this entry]
 // Prefetch the cmC2 buckets of each bit before they are looked up (tune
 // fxcm_prefetch=0 disables; the output is identical either way).
 static bool fxcm_prefetch = true;
@@ -3257,6 +3364,7 @@ BracketContext<U16> htcxt;
 SparseMatchModel smatch; // 2 inputs to fp
 
 void PredictorInit() {
+    // [this entry] In the official build tune::Get returns the default (prefetch on).
     fxcm_prefetch = tune::Get("fxcm_prefetch", 1) != 0;
     n3bState=n2bState=0xffffffff;
     pr=2048;
@@ -3385,6 +3493,8 @@ const int LEN1 = 5;      // order x
 const int LEN2 = 7;      //
 const int LEN3 = 9;
 
+// One match candidate: where in the buffer the text being followed is, how long it has
+// matched, and a backup that lets a match survive a one-byte mismatch.
 struct MatchInfo {
     U32 length;      // rebased length of match (length=1 represents the smallest accepted match length), or 0 if no match
     U32 index;       // points to next byte of match in buf, 0 when there is no match
@@ -3574,6 +3684,9 @@ void MatchModel2update() {
   }
 }
 
+// Update the match candidates, pick the best one and add its predictions to the mixer
+// inputs: the expected bit weighted by the match length, and the outputs of three learned
+// maps (smA). Returns the match length (0 = no match).
 int MatchModel2mix() {
   MatchModel2update();
 
@@ -3747,6 +3860,13 @@ void __attribute__ ((noinline)) procWord() {
 }
 
 // Main context parsing and prediction
+// Called once per bit with the partial byte c0, the bit position and the last four bytes.
+// At bpos 0 (a new byte): update every piece of parsing state with the byte just completed
+// (class streams, brackets, quotes, columns, words, numbers, dictionary decoding and
+// stemming), then compute all context hashes and hand them to the context maps with set().
+// At every bit: run each component's mix() so it adds its predictions to the first-layer
+// inputs, choose the selector context of each mixer, run the ten first-layer mixers and
+// the final mixer. Returns the mixed 12-bit probability.
 int modelPrediction(int c0,int bpos,int c4){
     int i,c;
     U32 h,j;
@@ -4531,6 +4651,7 @@ int modelPrediction(int c0,int bpos,int c4){
     //indirectBrByte
     const int c0b=c0<<(8-bpos);
 
+    // [this entry]
     // bpos 0: all contexts were just set above; start every big-table lookup
     // of this bit (bpos 2 and 5 were started earlier, in update1).
     if (fxcm_prefetch && bpos == 0) for (auto& m : cmC2) m.prefetch();
@@ -4697,6 +4818,8 @@ int modelPrediction(int c0,int bpos,int c4){
     // mixer 9
     mxA[9].cxt=(x.bpos<<8)*4+(fails&3)*256 + lstmex;
 
+    // The byte-level predictor's (transformer's) bit prediction is an input of both mixer
+    // layers. prediction_index-- takes it out of the list exported to cmix: cmix already has it.
     x.mxInputs1.add(stretch(lstmpr)); prediction_index--;
     x.mxInputs2.add(mxA[0].p1());
     x.mxInputs2.add(mxA[1].p1());
@@ -4712,6 +4835,10 @@ int modelPrediction(int c0,int bpos,int c4){
     return squash((mxA[10].p1()*7+mxA[11].p1()+4)>>3);
 }
 
+// The per-bit driver: learn from bit x.y, then predict the next bit. Order: shift the bit
+// into the byte state; update all mixers; update the "fails" history of badly predicted
+// bits; modelPrediction(); then the APM chain, which refines the mixed probability with
+// several contexts and averages the results. Every intermediate probability is exported.
 int rate=6;
 void update1() {
     x.c0+=x.c0+x.y;
@@ -4735,6 +4862,8 @@ void update1() {
     x.bpos=(x.bpos+1)&7;
     x.bposshift=7-x.bpos;
     x.c0shift_bpos=(x.c0<<1)^(256>>(x.bposshift));
+    // [this entry] Bit positions 2 and 5 are where the context maps switch bucket; the bucket
+    // address depends on c0, which is complete as soon as the previous bit is known.
     // c0 of the next bit is known: start its bucket lookups now, so they
     // overlap the mixer updates below and the rest of the bit's models.
     if (fxcm_prefetch && (x.bpos == 2 || x.bpos == 5))
@@ -4796,6 +4925,8 @@ void update1() {
 
 }
 
+// One-time setup: lookup tables, the six bit-history state machines, the dictionary, and
+// PredictorInit() (all tables and components).
 inline Predictor::Predictor()  {
     // Precalculate tabeles
     int o=2;
@@ -4846,6 +4977,8 @@ inline void Predictor::update() {
 
 }
 
+// The cmix-facing wrapper (see fxcmv1.h). Predict() returns the predictions computed during
+// the last Perceive(); Perceive(bit) runs one fxcm update step.
 FXCM::FXCM() {
     predictor_.reset(new fxcmv1::Predictor());
 }

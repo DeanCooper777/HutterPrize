@@ -1,15 +1,29 @@
+// bracket.cpp: Bracket, see bracket.h.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "bracket.h"
 
 Bracket::Bracket(const unsigned int& bit_context, int distance_limit,
     int stack_limit, int stats_limit, const std::vector<bool>& vocab) :
     ByteModel(vocab), distance_limit_(distance_limit),
     stack_limit_(stack_limit), stats_limit_(stats_limit), byte_(bit_context),
+    // Every counter starts at 1 hit in 256 trials (the uniform guess).
     stats_(256, std::vector<std::pair<unsigned int, unsigned int>>
     (distance_limit_, {1, 256})) {
+  // Opening byte -> closing byte. In the preprocessed stream 'P' / 'R' stand for { / } and
+  // 'L' / 'N' for < / > (see the #defines under "//wrt" in fxcmv1.cpp). The two quote
+  // characters close themselves.
   brackets_ = {{'(',')'}, {'P','R'}, {'[',']'}, {'L','N'}, {'\'','\''},
       {'"','"'}};
 }
 
+// Called once per byte with byte_ = the byte just coded. Three cases:
+//  - the byte opens a bracket (and is not the closing quote of an open quote): push it and
+//    predict its closing byte with the distance-0 statistics;
+//  - a bracket is open: count whether this byte closed it; pop it if it did or if it has been
+//    open too long, and predict the closing byte of the new innermost bracket;
+//  - nothing is open: the distribution stays uniform.
 void Bracket::ByteUpdate() {
   probs_ = 1./256;
   if (active_.empty() || (brackets_.find(byte_) != brackets_.end() &&

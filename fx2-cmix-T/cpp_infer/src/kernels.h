@@ -1,5 +1,15 @@
 // Free-function kernels for the fx2 transformer (correctness-first AVX2/scalar).
 // Numerical contracts follow cpp_infer/SPEC.md and cpp_infer/KIMI_SEMANTICS.md.
+//
+// How it fits: the reference kernels of the naive model (model.cpp); not in
+// the cmix binary. The optimized kernels in opt/ (qmat, attn, kda, glue) are
+// validated against these. opt/model_opt.cpp includes this header only in
+// the FX2_XCHECK_NAIVE_* debug builds.
+//
+// Testing: see kernels.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <cmath>

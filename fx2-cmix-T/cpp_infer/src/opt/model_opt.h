@@ -10,6 +10,22 @@
 // whole-model probability drift <= ~1e-5 absolute.
 // The vanilla-attention low-prob skip is hardwired OFF (exact softmax; at the
 // SPEC-safe threshold 21 it never fires anyway).
+//
+// How it fits: this is the transformer byte model that cmix links
+// (src/predictor.cpp owns one TransformerOpt). Per symbol cmix calls step()
+// with the symbol and the PPMD prior, and feeds the returned probabilities to
+// the mixers -> SSE -> arithmetic coder. The naive src/model.cpp is the test
+// reference only and is not part of the cmix binary.
+//
+// Testing: test_e2e_opt, test_xcheck, bench_opt (cpp_infer/Makefile).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] 16-bit activation inputs for most matmuls (act16.h,
+//   CMIX_ACT16, default 15); see model_opt.cpp for the per-layer kernel map.
+//   With them the model is no longer bit-exact vs src/model.cpp (which is
+//   all 8-bit); CMIX_ACT16=0 restores the statement above.
+// - [this entry] ShareWeights constructor, last_hidden(), MLP activation
+//   capture (see the members below).
 #pragma once
 
 #include <cstdint>
@@ -28,6 +44,7 @@ struct TransformerOpt {
   explicit TransformerOpt(const char* weights_path,
                           AttnKind attn = AttnKind::KVF32);
   ~TransformerOpt();
+  // [this entry] for the multi-core experiment mode (CMIX_PIPE).
   // A second instance with its own streaming state (KV rings, KDA states,
   // scratch) that reads the weights of `shared`, which must outlive it.
   // Instances can step concurrently on different threads.
@@ -48,9 +65,12 @@ struct TransformerOpt {
 
   // the 205 post-softcap logits of the last step (valid until the next step)
   const float* last_logits() const;
+  // [this entry] input of the online output-layer adaptation in cmix.
   // the final rms-normed hidden state (192 floats) the head was applied to
   const float* last_hidden() const;
 
+  // [this entry] experiment hook. Only the 8-bit mlp.down path fills the
+  // capture (CMIX_ACT16 bit 1 clear).
   // capture the sparse relu^2 MLP activations (u8, 0..127) of the layers in
   // mask (bit l = layer l) at every step; mlp_acts returns the last step's
   // active count for layer l and points idx/q at its indices and the dense

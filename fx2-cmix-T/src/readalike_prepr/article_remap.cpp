@@ -4,6 +4,16 @@
 
 // To use: ./remap article_path enwik9_path > src/readalike_prepr/data/new_article_order
 
+//
+// Stand-alone build-time tool; it is not linked into cmix. It produced the checked-in
+// table src/readalike_prepr/data/new_article_order, which the build script compresses
+// and appends to the compressor (see self_extract.h). reorder() in article_reorder.h
+// applies the inverse numbering when it reads the table.
+//
+// Place in the pipeline: prepares the data for the first stage (article reordering).
+//
+// Unchanged from the previous winning entry.
+
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -20,6 +30,7 @@ int main(int argc, char** argv) {
 
   std::ifstream infile(enwik9_path);
   std::string line;
+  // count1 numbers all pages, count2 only the pages that are not redirects.
   int count1 = -1, count2 = -1;
   bool redirect = false;
   std::vector<std::string> prefix = {

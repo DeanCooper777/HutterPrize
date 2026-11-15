@@ -1,3 +1,9 @@
+// lstm-layer.h: one layer of the fx2-cmix LSTM (see lstm.h). The code is in lstm-layer.hpp.
+//
+// Not used when the transformer is loaded, and not part of the official build.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #ifndef LSTM_LAYER_H
 #define LSTM_LAYER_H
 
@@ -6,6 +12,11 @@
 #include <stdlib.h>
 #include <math.h>
 
+// One gate (a set of num_cells neurons) with everything needed to train it: weights_, their
+// gradient sums (update_) and Adam moments (m_, v_); the layer-normalization gain and bias
+// (gamma_, beta_) with their gradient sums and moments; and, per time step of the horizon,
+// the normalized pre-activations (norm_), their inverse standard deviation (ivar_) and the
+// gate outputs (state_).
 struct NeuronLayer {
   NeuronLayer(unsigned int input_size, unsigned int num_cells, int horizon,
     int offset) : error_(num_cells), ivar_(horizon), gamma_(1.0, num_cells),
@@ -25,6 +36,8 @@ struct NeuronLayer {
       transpose_, norm_;
 };
 
+// An LSTM layer with three gates: forget gate, input node and output gate. The input gate
+// is tied to the forget gate (input gate = 1 - forget gate).
 class LstmLayer {
  public:
   LstmLayer(unsigned int input_size, unsigned int auxiliary_input_size,

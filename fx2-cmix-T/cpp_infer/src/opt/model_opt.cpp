@@ -6,6 +6,58 @@
 // measure ~10-20 core cycles) section accumulators, one per call site,
 // aggregated into the four SPEC section-9 groups at print time and
 // overhead-corrected by the measured empty-section delta.
+//
+// What this file is: the forward pass of the transformer byte model as cmix
+// runs it. One call of step() takes the current symbol (a byte of the
+// preprocessed, dictionary-coded text; 205 distinct values) and the PPMD
+// model's probabilities for it as a "prior", and returns the transformer's
+// probabilities for the NEXT symbol. cmix (src/predictor.cpp) feeds those
+// into its mixers, then SSE, then the arithmetic coder. Compressor and
+// decompressor run this same code on the same inputs and must get the same
+// bits out, which is why every kernel is either exact integer arithmetic or a
+// fixed sequence of single IEEE operations.
+//
+// The forward pass, with the kernel that serves each matrix. "8" = 8-bit
+// input (the previous winner's kernels, qmat_dense.h / qmat_sparse.h), "16" =
+// [this entry] 16-bit input (act16.h), as selected by the default
+// CMIX_ACT16 = 15:
+//   input   x = tok_table[token] + rms_norm(prior_embedding(prior))
+//             prior_embedding 192x205   8  qsparse4_f32 (sparse columns)
+//   layers l = 0..11 (9 Kimi linear-attention layers, 3 vanilla: 3, 7, 11):
+//     x += skip_w * (output of layer 11-l)           (layers 6..11 only)
+//     x  = rsc[l] * x + tec[l] * tok                 (token connection)
+//     xn = rms_norm(x)
+//     q, k, v = Q(xn), K(xn), V(xn)   3 x 192x192   16  gemv16p_set
+//     Kimi layer:
+//       forget gate  192->64->192      8  qgemv_quant_bias, qgemv_f32
+//       output gate  192->64->192      8  qgemv_quant_bias, qgemv_f32
+//       beta         3x192 fp32           dot192
+//       conv+silu, state update, gated norm:  kda_layer_step (kda.h)
+//     vanilla layer:
+//       per-head rms_norm of q and k, RoPE, 8-bit q/k/v, KV ring insert,
+//       softmax over the last 1024 positions: attn_step_var / _fixed (attn.h)
+//     x += O(attention output)         192x192      16  gemv16p_add
+//     xn = rms_norm(x)
+//     h  = relu(up(xn))^2              768x192      16  gemv16p_set
+//     x += down(h)                     192x768      16  spmv16p_add (sparse)
+//   output  logits = unembed(rms_norm(x))  205x192   8  qgemv_f32
+//           probs  = softmax(15 * tanh(logits / 15))    head_softcap_softmax
+//
+// Testing: test_e2e_opt (loss on the 1024-article test set against the Python
+// reference), test_xcheck (against the naive src/model.cpp), bench_opt /
+// bench_opt_prof (-DFX2_PROF profile below). CMIX_ACT16=0 gives the previous
+// winner's all-8-bit forward pass.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] 16-bit activation inputs for the q/k/v projections, the
+//   attention output projection, mlp.up and mlp.down (act16.h): the same
+//   weights with 256 times finer input rounding predict better, so the
+//   archive is smaller.
+// - [this entry] the weights can be shared between instances (ShareWeights),
+//   for the multi-core experiment mode CMIX_PIPE (never in the submission).
+// - [this entry] last_hidden() and the MLP activation capture: inputs for the
+//   online adaptation of the output layer in src/predictor.cpp.
+// - [this entry] FX2_DMLP: compile-time MLP width for experiments.
 
 #include "model_opt.h"
 
@@ -230,7 +282,10 @@ void prof_print(double tsc_to_core, long tokens) {
 // ---------------------------------------------------------------------------
 // the model
 // ---------------------------------------------------------------------------
+// State and scratch of one model instance. The weights (OptModel) are
+// read-only; everything that changes from byte to byte lives here.
 struct TransformerOptImpl {
+  // [this entry] pointer instead of a member, so instances can share weights
   OptModel* Mp;  // the weights; shared (not owned) if !owns
   bool owns;
   OptModel& M;
@@ -273,7 +328,11 @@ struct TransformerOptImpl {
   alignas(64) float qf[D] = {}, kf[D] = {}, vf[D] = {}, pre[D] = {};
   alignas(64) int8_t qq[D] = {}, kk[D] = {}, vv[D] = {};
   alignas(64) uint8_t q768[DMLP] = {};
-  // 16-bit activation path (act16.h)
+  // [this entry] 16-bit activation path (act16.h): cur_l = layer being
+  // evaluated (the 16-bit arenas are indexed by layer); h768 = mlp.up output;
+  // a768 / a192 = 16-bit quantized activations; idx768 = positions of the
+  // nonzero a768, idxh768 = positions with a768 >= 256. ident192 is not read
+  // by the shipped paths.
   int cur_l = 0;
   alignas(64) float h768[DMLP] = {};
   alignas(64) int16_t a768[DMLP] = {};
@@ -286,7 +345,8 @@ struct TransformerOptImpl {
   alignas(64) uint16_t idxp[224 + 16] = {};
   alignas(64) float logits[208] = {};
   alignas(64) float probs208[208] = {};
-  // MLP activation capture (TransformerOpt::set_capture_layers)
+  // [this entry] MLP activation capture (TransformerOpt::set_capture_layers);
+  // filled only on the 8-bit mlp.down path (CMIX_ACT16 bit 1 clear)
   uint32_t cap_mask = 0;
   int cap_nnz[12] = {};
   uint16_t cap_idx[12][DMLP + 16] = {};
@@ -316,6 +376,8 @@ struct TransformerOptImpl {
       ident192[i] = static_cast<uint16_t>(i < D ? i : D - 1);
   }
 
+  // Start of a new article: clear the Kimi states and conv histories and
+  // restart the position counter (which also empties the attention window).
   void begin(int64_t rope_position_offset) {
     for (int i = 0; i < 9; i++) kda_layer_reset(kst[i]);
 #ifdef FX2_XCHECK_NAIVE_KDA
@@ -325,20 +387,49 @@ struct TransformerOptImpl {
     rope_off = rope_position_offset;
   }
 
+  // [this entry] Each projection has its own activation scale, so xn is
+  // quantized three times (IEEE divide + round-half-even), then one exact
+  // integer matmul each.
+  // 16-bit query / key / value projections of layer cur_l from xn
+  void qkv16(float* oq, float* ok, float* ov) {
+    float* const o[3] = {oq, ok, ov};
+    for (int c = 0; c < 3; c++) {
+      const OptModel::Rows16& r = M.qkv16[cur_l][c];
+      quant192_i16(xn, r.s16, a192);
+      gemv16p_set(r.rows, r.fold, r.k, a192, D, o[c]);
+    }
+  }
+
+  // Attention half of a Kimi (linear attention) layer: x += O(kda(xn)).
+  // The layer keeps a 64x64 fp32 state per head instead of a window of past
+  // keys and values (KIMI_SEMANTICS.md).
   void kimi_layer(int ki) {
     KimiArenas& L = M.kimi[ki];
+    // xn = rms_norm(x), and the 8-bit quantized copies of xn that the 8-bit
+    // matmuls below read (one copy per site: each has its own scale).
+    // [this entry] with 16-bit q/k/v only the two gate inputs are needed.
     {
       PSCOPE(PS_EL_NQ_KIMI);
       const float s5[5] = {L.qp.s_act, L.kp.s_act, L.vp.s_act, L.fg_up.s_act,
                            L.og_up.s_act};
-      rms_norm_quant192_multi(x, xn, s5, 5, q5);
+      if (M.act16 & 8)
+        rms_norm_quant192_multi(x, xn, s5 + 3, 2, q5 + 3 * D);
+      else
+        rms_norm_quant192_multi(x, xn, s5, 5, q5);
     }
+    // query / key / value projections (192x192 each) -> bq, bk, bv
     {
       PSCOPE(PS_MM_KQKV);
-      qgemv_f32(L.qp.m, q5, bq);
-      qgemv_f32(L.kp.m, q5 + D, bk);
-      qgemv_f32(L.vp.m, q5 + 2 * D, bv);
+      if (M.act16 & 8) {
+        qkv16(bq, bk, bv);
+      } else {
+        qgemv_f32(L.qp.m, q5, bq);
+        qgemv_f32(L.kp.m, q5 + D, bk);
+        qgemv_f32(L.vp.m, q5 + 2 * D, bv);
+      }
     }
+    // forget gate, low rank: 192 -> 64 (quantized again to 8 bits in the
+    // kernel's epilogue) -> 192 = graw, the per-channel decay pre-activation
     {
       PSCOPE(PS_MM_GUP);
       qgemv_quant_bias(L.fg_up.m, q5 + 3 * D, L.fg_down.s_act, q64b);
@@ -347,6 +438,7 @@ struct TransformerOptImpl {
       PSCOPE(PS_MM_GDN);
       qgemv_f32(L.fg_down.m, q64b, graw);
     }
+    // output gate, same shape -> og192
     {
       PSCOPE(PS_MM_GUP);
       qgemv_quant_bias(L.og_up.m, q5 + 4 * D, L.og_down.s_act, q64b);
@@ -355,11 +447,14 @@ struct TransformerOptImpl {
       PSCOPE(PS_MM_GDN);
       qgemv_f32(L.og_down.m, q64b, og192);
     }
+    // beta (write strength per head): unquantized fp32 3x192 matvec on xn
     {
       PSCOPE(PS_KD_BETA);
       for (int h = 0; h < NH; h++)
         braw[h] = dot192(xn, L.beta_w + size_t(h) * D);
     }
+    // the recurrent step: causal conv + silu on q/k/v, state decay, delta-rule
+    // update, read-out, gated rms norm -> gn (192 fp32)
     {
       PSCOPE(PS_KD_STEP);
 #ifdef FX2_XCHECK_NAIVE_KDA
@@ -388,6 +483,8 @@ struct TransformerOptImpl {
       kda_layer_step(L.kw, kst[ki], bq, bk, bv, graw, og192, braw, gn);
 #endif
     }
+    // output projection added to the residual stream: x += O(quant(gn))
+    // [this entry] 16-bit quantizer + gemv16p_add instead of 8-bit + qgemv_add
     {
       PSCOPE(PS_EL_OQ);
       if (M.act16 & 2) quant192_i16(gn, M.op_s16[cur_l], a192);
@@ -402,19 +499,34 @@ struct TransformerOptImpl {
     }
   }
 
+  // Attention half of a vanilla layer (3, 7, 11): softmax attention over the
+  // last 1024 positions of the article (SPEC.md section 3.5).
   void van_layer(int vi) {
     VanArenas& L = M.van[vi];
+    // xn = rms_norm(x) (+ its three 8-bit copies on the 8-bit path)
     {
       PSCOPE(PS_EL_NQ_VAN);
       const float s3[3] = {L.qp.s_act, L.kp.s_act, L.vp.s_act};
-      rms_norm_quant192_x3(x, xn, s3, q5, q5 + D, q5 + 2 * D);
+      if (M.act16 & 8)
+        rms_norm192(x, xn);
+      else
+        rms_norm_quant192_x3(x, xn, s3, q5, q5 + D, q5 + 2 * D);
     }
+    // query / key / value projections -> qf, kf, vf
     {
       PSCOPE(PS_MM_VQKV);
-      qgemv_f32(L.qp.m, q5, qf);
-      qgemv_f32(L.kp.m, q5 + D, kf);
-      qgemv_f32(L.vp.m, q5 + 2 * D, vf);
+      if (M.act16 & 8) {
+        qkv16(qf, kf, vf);
+      } else {
+        qgemv_f32(L.qp.m, q5, qf);
+        qgemv_f32(L.kp.m, q5 + D, kf);
+        qgemv_f32(L.vp.m, q5 + 2 * D, vf);
+      }
     }
+    // per head: normalize q and k, rotate both by the position (RoPE), then
+    // quantize q, k, v to int8 with their per-head scales. These quantizers
+    // stay 8-bit in this entry: the KV cache stores int8 and the q.k dot
+    // products are exact int32.
     {
       PSCOPE(PS_EL_HEADPREP);
       for (int h = 0; h < NH; h++) rms_norm64(qf + h * DH, qf + h * DH);
@@ -442,6 +554,8 @@ struct TransformerOptImpl {
         quant64_i8(vf + h * DH, L.sv[h], vv + h * DH);
       }
     }
+    // store this position's k and v in the ring, then attend over the n
+    // valid positions (variable-length kernel until the window is full)
     const int slot = static_cast<int>(t % WIN);
     const int64_t n = t + 1;
 #ifdef FX2_EXP_KPF
@@ -497,6 +611,8 @@ struct TransformerOptImpl {
       }
     }
 #endif
+    // output projection added to the residual stream: x += O(quant(pre))
+    // [this entry] 16-bit quantizer + gemv16p_add instead of 8-bit + qgemv_add
     {
       PSCOPE(PS_EL_OQ);
       if (M.act16 & 2) quant192_i16(pre, M.op_s16[cur_l], a192);
@@ -511,19 +627,34 @@ struct TransformerOptImpl {
     }
   }
 
+  // MLP half of a layer: x += down(relu(up(rms_norm(x)))^2).
   void mlp_block(int l) {
     MlpArenas& mm = M.mlp[l];
+    // xn = rms_norm(x) and its quantized form ([this entry] 16-bit: a192)
     {
       PSCOPE(PS_EL_NQ_MLP);
-      rms_norm_quant192(x, xn, mm.up.s_act, q5);
+      if (M.act16 & 4) {
+        rms_norm192(x, xn);
+        quant192_i16(xn, M.up16[l].s16, a192);
+      } else {
+        rms_norm_quant192(x, xn, mm.up.s_act, q5);
+      }
     }
     int nnz;
+    // [this entry] the shipped path. up: 768 exact int32 dots -> fp32 h768.
+    // relu2_quant16p: h = relu(h)^2 quantized to 16 bits, with the list of
+    // nonzero positions (most are zero). down: only those columns are added
+    // into x. All dots are exact; the fp32 steps are single IEEE operations.
     if (M.act16 & 1) {
       int nh16 = 0;
       int32_t suma16 = 0;
       {
         PSCOPE(PS_MM_MLP_UP);
-        qgemv_f32(mm.up.m, q5, h768);
+        if (M.act16 & 4)
+          gemv16p_set(M.up16[l].rows, M.up16[l].fold, M.up16[l].k, a192, DMLP,
+                      h768);
+        else
+          qgemv_f32(mm.up.m, q5, h768);
         nnz = relu2_quant16p(h768, M.down_s16[l], DMLP, a768, idx768, idxh768,
                              &nh16, &suma16);
       }
@@ -534,6 +665,9 @@ struct TransformerOptImpl {
       }
       return;
     }
+    // the previous winner's 8-bit path (CMIX_ACT16 bit 1 clear): up with the
+    // relu^2 + 8-bit quantizer fused into its epilogue, then the int4 column
+    // kernel (or its dense fallback when nearly all columns are active)
     {
       PSCOPE(PS_MM_MLP_UP);
       nnz = qgemv_relu2q(mm.up.m, q5, mm.down_s_act, q768, idx768);
@@ -552,10 +686,13 @@ struct TransformerOptImpl {
     }
   }
 
+  // One symbol: the whole forward pass (see the table at the top of the file).
   // prior must be the cap-208 internal buffer with pads [205..208) zeroed
   void step(uint8_t token, float* probs_out) {
     const float* tok = M.tok_table + size_t(token) * D;
     int nnzp;
+    // input embedding. The prior probabilities are quantized to 8 bits; most
+    // round to zero, so the 192x205 prior embedding is a sparse column sum.
     {
       PSCOPE(PS_EL_PRIORQ);
       prior_quant_raw(prior_f32, M.prior_s_act, q8p);  // raw u8; q8p[208..224)=0
@@ -575,6 +712,8 @@ struct TransformerOptImpl {
       embed_combine192(tok, yb, x);  // x0 = tok_row + rms_norm(prior_y)
     }
 
+    // the 12 layers. Layers 0..5 save their output; layers 6..11 add the
+    // saved output of layer 11-l (U-net style skip connections).
     for (int l = 0; l < NL; l++) {
       {
         PSCOPE(PS_EL_RESID);
@@ -594,6 +733,8 @@ struct TransformerOptImpl {
       }
     }
 
+    // output head: final norm (xn is what last_hidden() returns), 205 logits
+    // (8-bit input), soft cap 15 * tanh(l / 15), softmax
     {
       PSCOPE(PS_EL_NQ_FIN);
       rms_norm_quant192(x, xn, M.unembed.s_act, q5);
@@ -614,6 +755,7 @@ struct TransformerOptImpl {
 TransformerOpt::TransformerOpt(const char* weights_path, AttnKind attn)
     : impl(new TransformerOptImpl(weights_path, nullptr, attn)) {}
 
+// [this entry] second instance on the same weights (CMIX_PIPE worker threads)
 TransformerOpt::TransformerOpt(const TransformerOpt& shared, ShareWeights)
     : impl(new TransformerOptImpl(nullptr, shared.impl->Mp,
                                   shared.impl->kind)) {}
@@ -624,6 +766,7 @@ void TransformerOpt::begin_article(int64_t rope_position_offset) {
   impl->begin(rope_position_offset);
 }
 
+// public step: bring the prior into the internal 208-float buffer, then run
 void TransformerOpt::step(uint8_t token, const uint16_t* prior_f16,
                           float* probs_out) {
   prior_f16_to_f32(prior_f16, impl->prior_f32);  // exact; pads zeroed
@@ -639,6 +782,7 @@ void TransformerOpt::step(uint8_t token, const float* prior205,
 
 const float* TransformerOpt::last_logits() const { return impl->logits; }
 
+// [this entry] accessors used by the online adaptation in src/predictor.cpp
 const float* TransformerOpt::last_hidden() const { return impl->xn; }
 
 void TransformerOpt::set_capture_layers(uint32_t mask) {

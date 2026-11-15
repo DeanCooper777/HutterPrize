@@ -1,3 +1,23 @@
+// model.cpp - the NAIVE reference implementation of the transformer byte
+// model (fx2::Transformer): a direct, correctness-first transcription of
+// SPEC.md section 3 on top of the plain kernels of kernels.cpp. All matmul
+// inputs are 8-bit, weights are stored one int8 per weight in padded rows,
+// and libm supplies exp / tanh.
+//
+// How it fits: NOT part of the cmix binary. cmix runs the optimized
+// opt/model_opt.cpp (fx2::opt::TransformerOpt); this file is what that
+// implementation is checked against, and it is itself checked against the
+// Python model.
+//
+// Testing: test_components (every intermediate against the Python dumps,
+// using set_capture / set_block_input_override), test_e2e (loss on the
+// 1024-article test set), bench, opt/test_xcheck (naive against optimized).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] FX2_DMLP: the MLP width as a compile-time constant (default
+//   768, the submitted model) for experiments with narrower models.
+// Note: this reference has no 16-bit activation path. It matches
+// TransformerOpt only when that runs with CMIX_ACT16=0.
 #include "model.h"
 
 #include <cmath>
@@ -9,6 +29,7 @@
 #include "kernels.h"
 #include "weights_io.h"
 
+// [this entry] MLP width switch (see the header)
 #ifndef FX2_DMLP
 #define FX2_DMLP 768  // MLP width; phase 2 builds use -DFX2_DMLP=384/512
 #endif
@@ -60,6 +81,7 @@ struct QLinear {
   int d_out = 0, d_in = 0, stride = 0;
 };
 
+// weights of a Kimi linear-attention layer (KIMI_SEMANTICS.md)
 struct KimiLayer {
   QLinear qp, kp, vp, fg_up, fg_down, og_up, og_down, op;
   const float* wt_q = nullptr;  // conv weights, tap-major [4][192]
@@ -71,6 +93,7 @@ struct KimiLayer {
   float a_neg[NH] = {};            // -exp(A_log[h])
 };
 
+// weights of a vanilla sliding-window attention layer (layers 3, 7, 11)
 struct VanLayer {
   QLinear qp, kp, vp, op;
   float sq[NH] = {}, sk[NH] = {}, sv[NH] = {};
@@ -81,16 +104,20 @@ struct MlpW {
   QLinear up, down;
 };
 
+// per-article state of a Kimi layer: the 64x64 memory matrix of each head and
+// the last three inputs of the three causal convolutions
 struct KimiState {
   alignas(64) float S[NH][DH * DH];  // [head][k*64 + v]
   alignas(64) float hist[3][3][D];   // [conv q/k/v][tap: 0=t-3,1=t-2,2=t-1][ch]
 };
 
+// per-article state of a vanilla layer: the last 1024 quantized keys / values
 struct VanState {
   alignas(64) int8_t kring[WIN][D];
   alignas(64) int8_t vring[WIN][D];
 };
 
+// the whole model: weights, streaming state, scratch
 struct TransformerImpl {
   Arena wa, fa;
 
@@ -144,6 +171,9 @@ struct TransformerImpl {
   }
 };
 
+// Loads one quantized linear layer: copies the int8 weights into rows padded
+// to a multiple of 16 and folds activation scale * row scale into one fp32
+// factor per output.
 QLinear TransformerImpl::load_qlinear(const WeightsFile& wf,
                                       const std::string& prefix, int d_out,
                                       int d_in) {
@@ -179,6 +209,8 @@ QLinear TransformerImpl::load_qlinear(const WeightsFile& wf,
   return ql;
 }
 
+// Reads the uncompressed FX2TFW01 weights file (SPEC.md section 4) and
+// builds all layers.
 void TransformerImpl::load(const char* path) {
   WeightsFile wf = WeightsFile::load(path);
 
@@ -324,6 +356,9 @@ void TransformerImpl::begin(int64_t rope_position_offset) {
   rope_off = rope_position_offset;
 }
 
+// Kimi linear attention for one token (SPEC.md 3.7): q/k/v projections,
+// causal conv + silu, forget gate, beta, output gate, the per-head state
+// recurrence, gated norm, output projection. capL calls feed the tests.
 void TransformerImpl::kimi_attention(int ki, int l, const float* xn, float* y) {
   KimiLayer& L = kimi[ki];
   KimiState& st = kst[ki];
@@ -382,6 +417,9 @@ void TransformerImpl::kimi_attention(int ki, int l, const float* xn, float* y) {
   qmatvec(L.op.w, L.op.stride, L.op.fold, D, q8, y);
 }
 
+// Vanilla attention for one token (SPEC.md 3.5): q/k/v projections, per-head
+// norm of q and k, RoPE, 8-bit quantization, ring insert, softmax attention
+// over the valid window, output projection.
 void TransformerImpl::van_attention(int vi, int l, const float* xn, float* y) {
   VanLayer& L = van[vi];
   VanState& st = vst[vi];
@@ -460,6 +498,9 @@ void TransformerImpl::van_attention(int vi, int l, const float* xn, float* y) {
   qmatvec(L.op.w, L.op.stride, L.op.fold, D, q8, y);
 }
 
+// One token through the whole network (SPEC.md 3.2-3.4, 3.9): embedding,
+// 12 blocks (skip add, token connection, attention, MLP), final norm,
+// unembedding, logit soft cap, softmax.
 void TransformerImpl::step(uint8_t token, const float* prior,
                            float* probs_out) {
   if (token >= V) die("token out of range");

@@ -17,7 +17,7 @@
 // bit-identically the naive arithmetic of src/kernels.cpp kda_head_step
 // (mul-round decay, then fma updates, same per-lane accumulation order);
 // the only divergence from the naive path is <= ~2 ulp per elementary
-// exp/log-family call (see vmath.h and the accuracy tables in test_kda).
+// exp/log-family call (see vec_math.h and the accuracy tables in test_kda).
 //
 // State layout (owned here):
 //   S[3][64*64] fp32, 48 KB/layer, contiguous, 64-byte aligned:
@@ -26,6 +26,15 @@
 //     Slot (pos & 3) holds x[t]; taps read slots (pos+1..3)&3 = x[t-3..t-1].
 //   pos: steps since article start. kda_layer_reset zeroes everything
 //   (article start: conv history and state are zero per cu_seqlens semantics).
+//
+// How it fits: used by model_opt.cpp for the 9 Kimi layers (all layers except
+// 3, 7, 11); the weights struct is filled by arena_build.cpp with pointers
+// into the weight stream.
+//
+// Testing: test_kda.cpp, bench_kda.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <cstdint>

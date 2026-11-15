@@ -1,3 +1,18 @@
+// glue.cpp - the small fp32 operations between the matmuls of the optimized
+// model: rms norm fused with the 8-bit activation quantizers, residual and
+// skip-connection updates, the token + prior input embedding, RoPE, and the
+// output head (logit soft cap + softmax). Contracts in glue.h.
+//
+// How it fits: called by model_opt.cpp many times per symbol. The 8-bit
+// quantizers here feed the qmat kernels; the 16-bit quantizers of this entry
+// are in act16.cpp and follow the same recipe (IEEE divide, clamp in float,
+// round-half-even convert).
+//
+// Testing: test_glue (bit-exact against kernels.cpp / model.cpp except the
+// documented head ulps), bench_glue.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #include "glue.h"
 
 #include <immintrin.h>
@@ -86,6 +101,7 @@ inline void rms_norm_quant_impl(const float* x, float* xn, const float* s,
 
 }  // namespace
 
+// ---------- rms norm and activation quantizers ----------
 void rms_norm192(const float* x, float* xn) {
   const float denom = rms_denom(x, 192);
   const __m256 vden = _mm256_set1_ps(denom);

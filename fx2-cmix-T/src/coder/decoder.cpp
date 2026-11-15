@@ -1,3 +1,6 @@
+// decoder.cpp: implementation of the arithmetic decoder (see decoder.h).
+// Unchanged from the previous winning entry.
+
 #include "decoder.h"
 
 Decoder::Decoder(std::ifstream* is, Predictor* p) : is_(is), x1_(0),
@@ -7,6 +10,7 @@ Decoder::Decoder(std::ifstream* is, Predictor* p) : is_(is), x1_(0),
   }
 }
 
+// Past the end of the file the stream is continued with zero bytes.
 int Decoder::ReadByte() {
   int byte = (unsigned char)(is_->get());
   if (!is_->good()) return 0;
@@ -17,6 +21,8 @@ unsigned int Decoder::Discretize(float p) {
   return 1 + 65534 * p;
 }
 
+// Must compute xmid from exactly the same prediction as Encoder::Encode did, which is
+// why the model has to be bit-for-bit reproducible between the two programs.
 int Decoder::Decode() {
   const unsigned int p = Discretize(p_->Predict());
   const unsigned int xmid = x1_ + ((x2_ - x1_) >> 16) * p +

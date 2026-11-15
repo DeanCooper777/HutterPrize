@@ -1,4 +1,12 @@
 #!/bin/bash
+# linux_sub_st1.sh: variant of linux_sub.sh (build, compress enwik9, decompress, compare) for
+# one particular source snapshot; see the notes below for which one. It differs from
+# linux_sub.sh only in the tarball it builds, the result directory, and in keeping its logs on
+# local disk.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Full compress + decompress check of the "st1" stacked entry (2026-11-13).
 # Same as linux_sub.sh, with: source /workspace/sub/st1_src.tar.gz, results in
 # /workspace/sub/out_st1/, and all big/long-lived logs on the pod's LOCAL disk

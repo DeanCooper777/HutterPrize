@@ -2,9 +2,56 @@
 // mod_ppmd is adapted from ppmd by Eugene Shelwien.
 // This file is adapted from mod_ppmd_v2: http://encode.su/threads/2515-mod_ppmd
 
+
+// ppmd.cpp: the PPMD byte model and the memory budget that keeps it inside the 10 GB limit.
+//
+// What it is. PPM ("prediction by partial matching") keeps a tree of contexts: for every
+// byte sequence up to `order` bytes long that has occurred, the bytes that followed it and
+// how often. To predict, it starts at the longest context that matches the current history
+// and falls back to shorter ones through "escape" probabilities. Here the order is 25 and the
+// tree lives in a 14,000 MB heap (Predictor::AddPPMD in src/predictor.cpp, tune key ppmd_mb).
+//
+// Role in this entry. PPMD does not code anything itself. Once per byte, PPMD::ByteUpdate
+// (end of this file) updates the tree with the byte just coded and computes the probability
+// of each of the 256 possible next bytes. That distribution is used in two places:
+//   - as a mixer input: ByteModel (byte-model.*) turns it into one probability per bit, and
+//     that is one of the inputs of every cmix mixer (src/mixer/mixer.*);
+//   - as an input of the transformer byte model (cpp_infer/), which was trained with the
+//     PPMD distribution as side information (see writeup.md).
+// How it fits: preprocess -> dictionary -> context models / [PPMD] / transformer byte model
+// -> mixers -> SSE -> arithmetic coder -> self-extracting archive.
+//
+// Memory. The heap is larger than the 10 GB the contest allows, so it is a shared mapping
+// of a temporary file ("ppm.temp" in the working directory) instead of ordinary memory. The
+// operating system can then write heap pages to the file and drop them from RAM; only the
+// pages touched recently are resident. The previous entry forced this by remapping the file
+// every 20000 bytes. This entry remaps only when the process's resident memory is over a
+// budget: see "Memory budget" below and in PPMD::ByteUpdate.
+//
+// Layout of the file: the suballocator (the heap's own memory manager); tables; the model
+// structures (STATE, PPM_CONTEXT, SEE2_CONTEXT); model update (UpdateModel, processSymbol*);
+// the read-only pass that lists the probabilities of all bytes (process*_T, ConvertSQ);
+// the cmix wrapper class PPMD.
+//
+// Testing: tune keys ppmd_disk (0 = heap in RAM), ppmd_rss_mb, ppmd_trim, ppmd_ws_mb
+// (Windows) and ppmd_mb (heap size, src/predictor.cpp). Experiments only; the official build
+// uses the defaults. --save-ppmd-probs (src/runner.cpp, src/predictor.cpp) writes the
+// distributions to a file to make training data for the transformer.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - Memory budget: the remap that releases heap pages happens when the resident set
+//     exceeds ppmd_rss_mb (default 8600 MB), not every 20000 bytes. This keeps the peak
+//     under 10 GB late in the run and avoids useless page faults early in the run
+//     (memory, speed). The model contents and the output are unchanged.
+//   - Windows port of the file-backed heap, for the development build (portability).
+//   - ppmd_disk tune key to keep the heap in RAM in experiments.
+// The PPMD engine itself is unchanged. (The MAP_FIXED remap fix is from the previous entry.)
+
 #include "ppmd.h"
 #include <cstring>
 #include <stdlib.h>
+// [this entry] POSIX headers for the Linux (submitted) build, Win32 headers for the
+// development build.
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -39,6 +86,10 @@ typedef unsigned long long qword;
 // write a *lot* of data to disk, so can reduce the lifespan of SSDs. Not
 // recommended for normal usage.
 //
+// For the Hutter Prize run the disk-backed heap is required, and it is the default here:
+// the 14 GB heap does not fit in the 10 GB RAM limit.
+//
+// [this entry] The Windows port described next:
 // Windows port: the heap is a view of a file mapping (a FILE_ATTRIBUTE_TEMPORARY,
 // delete-on-close file), so it is not charged to the process's commit, and the
 // periodic "remap" below becomes a working-set trim (VirtualUnlock on unlocked
@@ -56,6 +107,9 @@ static unsigned long long trim_every = 20000;  // bytes between checks (0: never
 static unsigned long long ws_budget = 0;       // trim only above this working set
 #else
 static constexpr char mmap_path[] = "ppm.temp";
+// [this entry] Memory budget (Linux, the submitted build). rss_check: how often, in coded
+// bytes, the resident set is looked at. rss_budget: the limit in bytes; 0 = no budget.
+// Both are set in the PPMD constructor.
 // The remap that drops the heap's pages from the resident set is done when
 // the process's resident set exceeds rss_budget, checked every rss_check
 // bytes (tune keys ppmd_rss_mb, default 8600 MB, and ppmd_trim). Upstream
@@ -67,6 +121,8 @@ static constexpr char mmap_path[] = "ppm.temp";
 static unsigned long long rss_check = 2000;
 static unsigned long long rss_budget = 0;
 
+// [this entry] Reads the second field of /proc/self/statm (resident pages). The file is
+// opened once and re-read with pread, so a check costs one system call.
 // resident set of this process in bytes; 0 if it cannot be read
 static unsigned long long ResidentBytes() {
   static int fd = open("/proc/self/statm", O_RDONLY);
@@ -83,10 +139,13 @@ static unsigned long long ResidentBytes() {
 
 const int ORealMAX=256;
 
+// Constants of the escape estimation, from mod_ppmd.
 static signed char EscCoef[12] = { 16, -10, 1, 51, 14, 89, 23, 35, 64, 26, -42, 43 };
 
 static const byte ExpEscape[16]={ 51,43,18,12,11,9,8,7,6,5,4,3,3,2,2,2 };
 
+// The PPMD engine: one object holds the heap, the suballocator and the model. Unchanged from
+// mod_ppmd apart from the heap allocation in StartSubAllocator / StopSubAllocator.
 struct ppmd_Model {
 
   typedef unsigned short word;
@@ -104,6 +163,9 @@ struct ppmd_Model {
 
   byte* HeapStart;
 
+  // The model stores 32-bit indices, not pointers, so that a heap larger than 4 GB can be
+  // addressed: below UnitsStart (the text area) an index is a byte offset; above it an index
+  // counts units of UNIT_SIZE (12) bytes.
   uint Ptr2Indx( void* p ) {
     qword addr = ((byte*)p)-HeapStart;
     uint lim = (UnitsStart-HeapStart);
@@ -117,6 +179,8 @@ struct ppmd_Model {
     return HeapStart + addr;
   }
 
+// Suballocator: memory inside the heap is handed out in units of 12 bytes, with one free
+// list (BList) per block size class.
 struct _MEM_BLK {
   uint Stamp;
   uint NextIndx;
@@ -184,12 +248,17 @@ uint U2B( uint NU ) {
   return 8*NU+4*NU;
 }
 
+// Allocate the heap of SASize megabytes. With mmap_to_disk (the default) it is a shared
+// mapping of a file created for the purpose, so its pages are backed by the file and can be
+// dropped from RAM; otherwise it is plain memory.
 int StartSubAllocator( qword SASize ) {
   qword t = SASize << 20U;
 
 #ifndef _WIN32
   if (mmap_to_disk) {
     mmap_size = t;
+    // Linux: create the file, extend it to the heap size by writing one byte at the end (the
+    // file is sparse: blocks are allocated only when pages are written back), and map it.
     int fd = open(mmap_path, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0664);
     if(fd < 0){
       exit(EXIT_FAILURE);
@@ -211,6 +280,7 @@ int StartSubAllocator( qword SASize ) {
 #else
   if (mmap_to_disk) {
     mmap_size = t;
+    // [this entry] Windows: the same with a file mapping; see the comment near the top.
     snprintf(mmap_path, sizeof mmap_path, "ppm.%d.temp", _getpid());
     mmap_file = CreateFileA(mmap_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
@@ -243,6 +313,8 @@ int StartSubAllocator( qword SASize ) {
   return 1;
 }
 
+// Heap layout: the text area (the bytes seen, used by the highest-order contexts) grows up
+// from HeapStart; the top 7/8 of the heap holds the units.
 void InitSubAllocator() {
   memset( BList, 0, sizeof(BList) );
   HiUnit = (pText=HeapStart) + SubAllocatorSize;
@@ -262,6 +334,9 @@ qword GetUsedMemory() {
   return RetVal;
 }
 
+// [this entry] Handles the mapped heap as well (on Windows it must be unmapped and the file
+// closed; on Linux the mapping ends with the process and ~PPMD removes the file). Not called
+// in normal operation: see ~ppmd_Model.
 void StopSubAllocator() {
   if( SubAllocatorSize ) {
     SubAllocatorSize=0;
@@ -494,6 +569,8 @@ byte Units2Indx[128];
 byte NS2BSIndx[256];
 byte QTable[260];
 
+// Fill the constant tables: block size classes, and the quantization tables used to pick
+// escape-estimation contexts.
 void PPMD_STARTUP( void ) {
   int i, k, m, Step;
 
@@ -528,6 +605,8 @@ enum {
 
 struct PPM_CONTEXT;
 
+// One symbol in a context: the byte, its frequency, and the index of the context reached by
+// appending the byte (the successor).
 struct STATE {
   byte Symbol;
   byte Freq;
@@ -547,6 +626,9 @@ void SWAP( STATE& s1, STATE& s2 ) {
   s2.iSuccessor = t2;
 }
 
+// One context node: its symbols (NumStats = number of symbols - 1; with a single symbol the
+// STATE is stored inline, see oneState), their total frequency, and the index of the
+// context one byte shorter (the suffix).
 struct PPM_CONTEXT {
 
   byte NumStats;
@@ -585,6 +667,8 @@ enum {
   ROUND = 16
 };
 
+// Adaptive estimate of an escape probability (secondary escape estimation), one per
+// quantized situation.
 struct SEE2_CONTEXT {
   word Summ;
   byte Shift;
@@ -767,6 +851,7 @@ uint cutOff( PPM_CONTEXT& q, int Order, int MaxOrder ) {
   return Ptr2Indx(&q);
 }
 
+// (Re)initialize the model: empty tree with the order-0 context, initial tables.
 void StartModelRare( void ) {
   int i, k, s;
   byte i2f[25];
@@ -815,6 +900,7 @@ void StartModelRare( void ) {
   }
 }
 
+// Out of heap with CutOff set: prune the tree (cutOff) to free memory and continue.
 void RestoreModelRare( void ) {
   STATE* p;
   pText = HeapStart;
@@ -851,6 +937,8 @@ void RestoreModelRare( void ) {
 
 PPM_CONTEXT* saved_pc;
 
+// After a symbol is known: raise its frequency in the contexts that were visited and add
+// the new contexts and successors. Returns 0 when the heap is exhausted.
 PPM_CONTEXT* UpdateModel( PPM_CONTEXT* MinContext ) {
   byte Flag, FSymbol;
   uint ns1, ns, cf, sf, s0, FFreq;
@@ -1081,6 +1169,9 @@ LOOP_ENTRY:
 int PrevSuccess;
 word BinSumm[25][64];
 
+// processBinSymbol / processSymbol1 / processSymbol2: find the coded symbol in a context
+// with one symbol / in the longest context / in a shorter context after an escape, and
+// update the statistics. FoundState is left null when the symbol is not there (escape).
 template< int ProcMode >
 void processBinSymbol( PPM_CONTEXT& q, int symbol ) {
   STATE& rs = q.oneState();
@@ -1237,6 +1328,11 @@ void processSymbol2( PPM_CONTEXT& q, int symbol ) {
 
 }
 
+// Read-only prediction pass. The process*_T functions below walk the same contexts as the
+// functions above but, instead of coding one symbol, append a record (symbol, frequency,
+// total) for every symbol of each context to SQ, with symbol 256 standing for "escape".
+// ConvertSQ multiplies the escape probabilities down the chain and leaves in sqp[c] the
+// probability of each byte c, as a 32-bit fixed-point number (0 if c was never listed).
 struct qsym {
   word sym;
   word freq;
@@ -1386,6 +1482,9 @@ void processSymbol2_T( PPM_CONTEXT& q, int ) {
     //StopSubAllocator();
   }
 
+// Compute sqp[] for the next byte: list the symbols of the longest context, then of each
+// shorter context (skipping symbols already listed), down to order 0. Does not change the
+// model statistics.
 void ppmd_PrepareByte( void ) {
   SQ_ptr=0; NumMasked=0;
   int _OrderFall = OrderFall;
@@ -1412,6 +1511,8 @@ void ppmd_PrepareByte( void ) {
   ConvertSQ();
 }
 
+// Update the model with the byte c that was coded. If the heap is exhausted, prune (with
+// CutOff, which the cmix wrapper sets) or restart the model.
 void ppmd_UpdateByte( uint c ) {
   PPM_CONTEXT* MinContext = MaxContext;
   if( MinContext->NumStats ) {
@@ -1451,8 +1552,13 @@ void ppmd_UpdateByte( uint c ) {
 
 #pragma pack()
 
+// Number of bytes processed; drives the periodic memory check in PPMD::ByteUpdate.
 unsigned long long counter_ = 0;
 
+// The cmix wrapper. order = maximum context length, memory = heap size in MB, bit_context =
+// ContextManager::bit_context_, which holds the whole byte when ByteUpdate is called.
+// [this entry] The settings of the memory budget are read here. In the official build
+// tune::Get returns the defaults: heap on disk, budget 8600 MB, check every 2000 bytes.
 PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
     const std::vector<bool>& vocab) : ByteModel(vocab), byte_(bit_context) {
   mmap_to_disk = tune::Get("ppmd_disk", 1) != 0;
@@ -1461,6 +1567,8 @@ PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
   ws_budget = (unsigned long long)tune::Get("ppmd_ws_mb", 8500) << 20;
 #else
   rss_budget = (unsigned long long)tune::Get("ppmd_rss_mb", 8600) << 20;
+  // With a budget the check is cheap, so it runs every 2000 bytes; without one (ppmd_rss_mb =
+  // 0) the default is the previous entry's fixed remap period of 20000 bytes.
   rss_check = (unsigned long long)tune::Get("ppmd_trim", rss_budget ? 2000 : 20000);
   if (!rss_check) rss_check = 20000;
 #endif
@@ -1468,6 +1576,7 @@ PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
   ppmd_model_->Init(order,memory,1,0);
 }
 
+// Remove the heap file (Linux; on Windows it is deleted when its handle closes).
 PPMD::~PPMD() {
 #ifndef _WIN32
   if (mmap_to_disk) {
@@ -1476,6 +1585,9 @@ PPMD::~PPMD() {
 #endif
 }
 
+// Once per coded byte: update the model with the byte, compute the distribution of the next
+// byte, and copy it into ByteModel::probs_ (floored at 1 unit, about 2^-32, so that no byte of the
+// vocabulary is impossible, then normalized). After that, the memory budget.
 void PPMD::ByteUpdate() {
   ++counter_;
   ppmd_model_->ppmd_UpdateByte(byte_);
@@ -1487,12 +1599,25 @@ void PPMD::ByteUpdate() {
   ByteModel::ByteUpdate();
   probs_ /= probs_.sum();
 #ifndef _WIN32
+  // [this entry] Memory budget. Why: the heap is 14 GB and the limit is 10 GB. Heap pages
+  // are file-backed, so the kernel may drop them, but it does so only under memory pressure;
+  // to stay under a fixed limit the process must give them up itself. Remapping the file over
+  // the same address range (below) does that: the old mapping's pages leave this process's
+  // resident set (their contents stay in the file / page cache), and each page comes back
+  // through a page fault when PPMD next touches it.
+  // How: every rss_check bytes, read the resident set size; remap only if it is above
+  // rss_budget. So nothing is released while there is room (no wasted page faults), and near
+  // the budget the heap is released as often as needed, however fast it grows.
+  // The decision depends on the machine's memory state, which differs between compression and
+  // decompression. That is harmless: the remap changes where the bytes are held, never their
+  // values, so the model and the coded output are identical either way.
   bool remap = false;
   if (mmap_to_disk && counter_ % rss_check == 0) {
     unsigned long long rss = rss_budget ? ResidentBytes() : 0;
     // no budget, or /proc unreadable: the fixed period
     remap = rss ? rss > rss_budget : counter_ % 20000 == 0;
   }
+  // The remap itself. The explanation of MAP_FIXED below is from the previous entry.
   if (remap) {
     // The suballocator keeps absolute pointers into the heap (pText,
     // UnitsStart, LoUnit, HiUnit, AuxUnit, MinContext, MaxContext,
@@ -1515,6 +1640,7 @@ void PPMD::ByteUpdate() {
     close(fd);
   }
 #else
+  // [this entry] Windows development build: the same budget idea with a working-set trim.
   if (mmap_to_disk && trim_every && counter_ % trim_every == 0) {
     // Same effect as the remap above: drop the heap's pages from the working
     // set (they stay in the file / standby list, contents unchanged; VirtualUnlock

@@ -1,3 +1,12 @@
+# find_syncs.py: list the GPU-to-host synchronisation points in one training micro batch. Each
+# such point stalls the GPU; removing them (host copies of the sequence boundaries in
+# pysrc/data.py and pysrc/model.py, torch.where instead of boolean indexing in
+# pysrc/cmix_loss.py) was a large part of making the fine-tune fast. Output: call sites and
+# counts on stdout.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # List every GPU->host synchronization in one run A training micro batch
 # (forward + mixture loss + backward), grouped by the calling code.
 # Run from /workspace/opt:

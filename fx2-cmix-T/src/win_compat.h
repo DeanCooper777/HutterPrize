@@ -1,5 +1,11 @@
 // Windows portability shims. Force-included (clang -include) by the Windows
 // build script (../build.ps1); not used by the Linux makefile.
+//
+// Place in the pipeline: none; it only supplies POSIX names the sources use (fseeko,
+// ftello, S_ISDIR, fmemopen) when compiling with clang on Windows.
+//
+// New in this entry. The Windows build is a development convenience: the submission is
+// the Linux build, and archives are not portable between the two builds.
 #ifndef FX2_WIN_COMPAT_H
 #define FX2_WIN_COMPAT_H
 #ifdef _WIN32

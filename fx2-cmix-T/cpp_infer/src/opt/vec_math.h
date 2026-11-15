@@ -27,6 +27,18 @@
 //        exp256's ~1.0 ulp passing straight through their result)
 //
 // (libm scalar baselines on this box: expf 9.1 c/elem, tanhf 44-56 c/elem.)
+//
+// How it fits: the exp / log / sigmoid / silu / softplus / tanh used by the
+// attention softmax (attn.cpp), the Kimi step (kda.cpp) and the output head
+// (glue.cpp). Built only from explicit IEEE operations (no libm, no
+// reciprocal estimates whose results differ between CPU vendors), so the
+// compressor and the decompressor compute identical probabilities.
+// [this entry] src/predictor.cpp also includes this header.
+//
+// Testing: test_glue.cpp (accuracy sweeps), bench_glue.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <immintrin.h>

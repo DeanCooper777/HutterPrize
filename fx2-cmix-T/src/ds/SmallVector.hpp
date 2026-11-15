@@ -14,6 +14,11 @@
 // replaced llvm::safe_malloc with std::bad_alloc
 // deleted LLVM_ENABLE_EXCEPTIONS
 
+// SmallVector.hpp (third party, LLVM via ATen): the non-template part of SmallVector.h.
+//
+// Third-party container, used as it is. Not part of the compression method.
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include <cstdint>
 #include <stdexcept>
 #include <string>

@@ -1,6 +1,15 @@
 // Section timing for performance work. Compiled in only with -DCMIX_PROFILE;
 // otherwise every macro expands to nothing. Times are rdtsc ticks, reported
 // as percentages of the instrumented total at process exit.
+//
+// Place in the pipeline: none; Predictor::Predict / Perceive (predictor.cpp) carry
+// PROF_BEGIN / PROF_MARK marks between their stages.
+//
+// Testing: build with -DCMIX_PROFILE (Windows: build.ps1 -Defines CMIX_PROFILE) and run
+// any compression; the table is printed to stderr when the process exits.
+//
+// New in this entry. It was used for the speed work; the submitted binary is built
+// without it.
 #ifndef CMIX_PROF_H
 #define CMIX_PROF_H
 
@@ -14,6 +23,7 @@
 #endif
 
 namespace prof {
+// The timed sections, in the order they occur in Predict() and then Perceive().
 #define PROF_SECTIONS(X) \
   X(bracket_pred) X(fxcm_pred) X(direct_pred) X(match_pred) X(indirect_pred) \
   X(indirect_r_pred) X(ppmd_pred) X(mixer0_mix) X(mixer1_mix) X(sse_pred) \
@@ -45,6 +55,8 @@ struct Registrar { Registrar() { atexit(Report); } };
 inline Registrar registrar;
 }  // namespace prof
 
+// PROF_BEGIN() starts the clock in a function; PROF_MARK(s) charges the ticks since the
+// previous mark to section s.
 #define PROF_BEGIN() unsigned long long _prof_t0 = __rdtsc(), _prof_t1
 #define PROF_MARK(s) (_prof_t1 = __rdtsc(), prof::t[prof::s] += _prof_t1 - _prof_t0, _prof_t0 = _prof_t1)
 #else

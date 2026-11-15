@@ -1,3 +1,13 @@
+// dictionary.cpp: implementation of the WRT dictionary transform (see dictionary.h).
+//
+// Code assignment by position (line) in the dictionary file, most frequent words first:
+//   first 80 words     1 byte:  0x80..0xCF
+//   next 3840 words    2 bytes: 0xD0..0xFF, 0x80..0xCF
+//   next 40960 words   3 bytes: 0xF0..0xFF, 0xD0..0xEF, 0x80..0xCF
+// A byte above 0xCF therefore says "another code byte follows".
+//
+// Unchanged from the previous winning entry.
+
 #include "dictionary.h"
 
 #include <stdio.h>
@@ -7,11 +17,14 @@ namespace preprocessor {
 
 namespace {
 
+// Flag bytes: next word is Capitalized / UPPERCASE / end of an upper-case run / escape
+// for a literal byte that would otherwise be read as a flag or a code.
 const unsigned char kCapitalized = 0x40;
 const unsigned char kUppercase = 0x07;
 const unsigned char kEndUpper = 0x06;
 const unsigned char kEscape = 0x0C;
 
+// Writes a literal byte, escaped if it collides with a flag or code value.
 void EncodeByte(unsigned char c, FILE* output) {
   if (c == kEndUpper || c == kEscape || c == kUppercase ||
       c == kCapitalized || c >= 0x80) {
@@ -20,6 +33,7 @@ void EncodeByte(unsigned char c, FILE* output) {
   putc(c, output);
 }
 
+// Writes a 1 to 3 byte word code, lowest byte first.
 void EncodeBytes(unsigned int bytes, FILE* output) {
   putc((unsigned char)bytes&0xFF, output);
   if (bytes & 0xFF00) {
@@ -34,6 +48,8 @@ void EncodeBytes(unsigned int bytes, FILE* output) {
 
 }
 
+// Reads the dictionary (one lower-case word per line) and builds the word -> code map
+// (encoder) and/or the code -> word map (decoder).
 Dictionary::Dictionary(FILE* dictionary, bool encode, bool decode) {
   fseek(dictionary, 0L, SEEK_END);
   unsigned long long len = ftell(dictionary);
@@ -66,6 +82,8 @@ Dictionary::Dictionary(FILE* dictionary, bool encode, bool decode) {
   }
 }
 
+// Splits the input into words (letters, with at most a leading capital or all capitals)
+// and everything else; words go through EncodeWord, other bytes through EncodeByte.
 void Dictionary::Encode(FILE* input, int len, FILE* output) {
   std::string word;
   int num_upper = 0, num_lower = 0;
@@ -120,6 +138,8 @@ void Dictionary::Encode(FILE* input, int len, FILE* output) {
   }
 }
 
+// Emits the capitalization flag, then the word's code; if the word is unknown, tries a
+// known suffix or prefix (EncodeSubstring), else writes the letters.
 void Dictionary::EncodeWord(const std::string& word, int num_upper,
     bool next_lower, FILE* output) {
   if (num_upper > 1) putc(kUppercase, output);
@@ -137,6 +157,8 @@ void Dictionary::EncodeWord(const std::string& word, int num_upper,
   }
 }
 
+// For words longer than 7 letters: code the longest dictionary word of at least 7
+// letters that is a suffix (first choice) or a prefix, and spell out the rest.
 bool Dictionary::EncodeSubstring(const std::string& word, FILE* output) {
   if (word.size() <= 7) return false;
   unsigned int size = word.size() - 1;
@@ -168,6 +190,7 @@ bool Dictionary::EncodeSubstring(const std::string& word, FILE* output) {
   return false;
 }
 
+// Returns the next decoded byte; words are expanded into output_buffer_.
 unsigned char Dictionary::Decode(FILE* input) {
   while (output_buffer_.empty()) {
     AddToBuffer(input);
@@ -177,6 +200,8 @@ unsigned char Dictionary::Decode(FILE* input) {
   return next;
 }
 
+// Reads one byte and undoes the byte remapping that encode_text (preprocessor.cpp)
+// applied after the dictionary transform.
 unsigned char NextChar(FILE* input) {
   int c = getc(input);
   if (c>='{' && c<127) c+='P'-'{';
@@ -186,6 +211,7 @@ unsigned char NextChar(FILE* input) {
   return c;
 }
 
+// Decodes one item: a flag, an escaped literal, a word code or a plain byte.
 void Dictionary::AddToBuffer(FILE* input) {
   unsigned char c = NextChar(input);
   if (c == kEscape) {

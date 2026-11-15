@@ -1,3 +1,7 @@
+// direct.cpp: Direct, see direct.h.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "direct.h"
 
 Direct::Direct(const unsigned long long& byte_context,

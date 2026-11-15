@@ -1,3 +1,20 @@
+// qmat_sparse.cpp - matrix x vector kernels for inputs that are mostly zero
+// (8-bit, non-negative), over column-major weight arenas: only the columns of
+// the nonzero inputs are read. Contract in qmat_sparse.h, layouts in qmat.h.
+// Two families: int8 columns (QSparse) and nibble-packed columns (QSparse4,
+// two cache lines per column), each with an index-driven kernel and a dense
+// fallback, and qsparse_make_idx, which lists the nonzero positions.
+//
+// How it fits: model_opt.cpp uses qsparse_make_idx + qsparse4_f32 for the
+// prior embedding (the PPMD prior has only a few nonzero entries after 8-bit
+// quantization) on every symbol. mlp.down used qsparse4_add in the previous
+// winner; in this entry it goes through act16.cpp (spmv16p_add) unless
+// CMIX_ACT16 bit 1 is cleared.
+//
+// Testing: test_qmat (int32 dots against a scalar reference), bench_qmat.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #include "qmat_sparse.h"
 
 #include <immintrin.h>
@@ -87,6 +104,8 @@ const IdxLut8 g_lut;
     QS_BLOCK(2, a8, a9, a10, a11)                                            \
   }
 
+// int8 columns. Two columns per step, interleaved so that one vpmaddubsw
+// yields q0*w0 + q1*w1 per row; int16 sums are widened every FLUSH_PAIRS.
 // index-driven accumulation of nnz nonzero columns into acc[192] (zeroed here)
 template <bool PF>
 void sparse_accum(const int8_t* __restrict cols, const uint8_t* __restrict q8,
@@ -172,6 +191,7 @@ void dense_accum(const int8_t* __restrict cols, const uint8_t* __restrict q8,
   }
 }
 
+// epilogues: out = fold * float(dot), or out += (multiply rounded, then add)
 inline void epi_f32(const int32_t* acc, const float* fold, float* out) {
   for (int k = 0; k < 24; k++) {
     __m256 y = _mm256_mul_ps(
@@ -394,6 +414,7 @@ inline void warm_epilogue(const float* fold, const float* out) {
 
 }  // namespace
 
+// ---- public kernels (thin wrappers: accumulate, then an epilogue) ----
 void qsparse_f32(const QSparse& m, const uint8_t* q8, const uint16_t* idx,
                  int nnz, float* out) {
   alignas(64) int32_t acc[192];
@@ -487,6 +508,7 @@ void qsparse4_dense_i32(const QSparse4& m, const uint8_t* q8, int32_t* out) {
   for (int r = 0; r < 192; r++) out[r] = acc[r] - corr;
 }
 
+// list of the nonzero positions of q8 (32 bytes per step, table-driven)
 int qsparse_make_idx(const uint8_t* q8, int n, uint16_t* idx) {
   int nnz = 0;
   const int nblk = (n + 31) / 32;

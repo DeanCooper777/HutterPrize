@@ -25,6 +25,18 @@
 // (measured 37 cyc/vec for interleaved conv+silu vs 22 staged; 92 cyc/vec
 // for softplus+exp decay vs 58 staged). Staging preserves the exact
 // per-element operation sequence (bit-identical results).
+//
+// How it fits: the recurrent core of the 9 Kimi linear-attention layers of
+// the transformer byte model; model_opt.cpp (kimi_layer) calls
+// kda_layer_step once per such layer per symbol, after the q/k/v and gate
+// matmuls and before the output projection. All fp32; the state it updates
+// is what lets these layers remember the article without a window.
+//
+// Testing: test_kda (against the naive kernels.cpp and the Python dumps),
+// bench_kda. kda_set_sweep / kda_set_pf_mode select measured alternatives.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 
 #include "kda.h"
 
@@ -277,6 +289,8 @@ void kda_sweep_head(float* S, const float* decay, const float* kn,
   }
 }
 
+// The per-token step of one layer (contract and math in kda.h): conv + silu,
+// gates, then for each head the state sweep, then the gated norm.
 void kda_layer_step(const KdaWeights& w, KdaState& st, const float* q_in,
                     const float* k_in, const float* v_in, const float* g_raw,
                     const float* og, const float* beta_raw, float* out,

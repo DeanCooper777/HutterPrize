@@ -1,3 +1,10 @@
+// byte-mixer.cpp: ByteMixer, see byte-mixer.h.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - In the official build (CMIX_OFFICIAL) the lstm branch of ByteUpdate() is compiled out.
+//     That build always runs the transformer, so the branch is dead; removing it removes the
+//     last call into the lstm code and keeps it out of the submitted binary (size).
+
 #include "byte-mixer.h"
 
 ByteMixer::ByteMixer(unsigned int num_models, const unsigned int& bit_context,
@@ -12,6 +19,8 @@ ByteMixer::ByteMixer(unsigned int num_models, const unsigned int& bit_context,
   offset_ = 0;
 }
 
+// lstm path: add one byte probability of a byte model to the lstm's input vector. Called for
+// index 0..255 in order; bytes outside the vocabulary are skipped.
 void ByteMixer::SetInput(int index, float val) {
   if (!vocab_[index]) return;
   inputs_[offset_] += val;
@@ -19,6 +28,7 @@ void ByteMixer::SetInput(int index, float val) {
   if (offset_ == vocab_size_) offset_ = 0;
 }
 
+// Transformer path: take the distribution as given (see byte-mixer.h).
 void ByteMixer::SetProbs(const float* vocab_probs) {
   unsigned int k = 0;
   for (int i = 0; i < 256; ++i) {
@@ -32,7 +42,10 @@ void ByteMixer::SetProbs(const float* vocab_probs) {
   ByteModel::ByteUpdate();
 }
 
+// lstm path, once per byte: train the lstm on the byte just coded and read its prediction
+// for the next byte.
 void ByteMixer::ByteUpdate() {
+// [this entry] The official build has no lstm: see the header of this file.
 #ifdef CMIX_OFFICIAL
   ByteModel::ByteUpdate();  // never reached: the official build has no lstm (see predictor.cpp)
 #else

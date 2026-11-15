@@ -1,3 +1,61 @@
+# weights_compress.py: lossless coder for the transformer weights file (.tfwc1 / .tfwc2).
+#
+# Where it fits: last step of the training side. pysrc/export_weights.py writes the plain
+# reference file (weights.bin); this module packs it into the container that is appended to the
+# compressor binary, and therefore also ends up inside the self-extracting archive. Every byte
+# saved here is saved twice in the score. At start-up the compressor / decompressor unpacks it
+# again with cpp_infer/src/weights_io_compressed.cpp, which mirrors the reader in this file
+# (read_tensor_file_v2) statement for statement; this file is the readable specification.
+#
+# Testing: every "compress*" command decodes its own output and compares it bit for bit with
+# the input; "verify" does the same for an existing pair of files.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1):
+#   - [this entry] ENC_INTC, the count-based integer coder for the quantized weights
+#     (encode_tree_counts / decode_tree_counts, _intc_bits, command "compress3"). It replaces
+#     the shared shift-5 adaptive model (ENC_INT4) by exact per-tensor symbol counts, which
+#     code the 4-bit weights in fewer bytes; it also handles other widths (2..8 bits).
+#   - Everything else (v1, the v2 container, the rope-table reconstruction) is unchanged.
+#
+# The tfwc2 container, as the C++ decoder reads it:
+#
+#   bytes 0..7    magic "FX2TFWC2"
+#   bytes 8..11   number of tensors, uint32 little endian
+#   rest          ONE range-coded bit stream holding, for each tensor in order:
+#       name length            1 byte   (meta model)
+#       name characters        order-2 character model (context = the two previous characters,
+#                              0,0 at the start of each name)
+#       dtype code             1 byte   (meta model; codes as in export_weights.py)
+#       number of dimensions   1 byte   (meta model)
+#       each dimension         4 bytes, little endian (meta model)
+#       encoding               1 byte   (meta model; one of the ENC_* values below)
+#       [ENC_INTC only] nbits  1 byte   (meta model)
+#       payload                element count = product of the dimensions, coded per encoding
+#
+#   "meta model" = a 256-leaf bit tree selected by the previous meta byte (order 1; the previous
+#   byte starts at 0 and carries over from tensor to tensor).
+#
+# Bit coding. All models are binary. A "bit tree" codes an n-bit symbol MSB first: start at
+# node 1, code the bit with the model stored at index `node`, then node = 2 * node + bit.
+# Two kinds of binary model exist:
+#   - adaptive probability (everything except ENC_INTC): p = P(bit = 0) in 11 bits, initially
+#     1024; after a 0, p += (2048 - p) >> 5; after a 1, p -= p >> 5.  bound = (range >> 11) * p.
+#   - [this entry] counts (ENC_INTC): each node keeps n0 and n1, the zeros and ones seen so
+#     far in THIS tensor; P(0) = (2 * n0 + 1) / (2 * (n0 + n1) + 2) scaled to 12 bits and
+#     clamped to 1..4095.  bound = (range >> 12) * p.  This is the Krichevsky-Trofimov
+#     estimate: with no forgetting it converges on the tensor's actual symbol frequencies.
+# In both cases bit 0 takes the lower part [0, bound) of the range and bit 1 the rest, and the
+# coder renormalises a byte at a time while range < 2^24.
+#
+# Payload encodings:
+#   ENC_RAW      every byte through one shared 8-bit tree
+#   ENC_INT4     value + 7 (0..14) through one 4-bit tree shared by all such tensors
+#   ENC_INTC     value + (2^(nbits-1) - 1) through an nbits-bit count tree, fresh per tensor
+#   ENC_BF16     each uint16: high byte through one tree, low byte through a tree selected by
+#                the high byte
+#   ENC_PLANE4   the raw little-endian bytes; byte i uses tree number (i mod 4)
+#   ENC_ROPE_*   nothing stored; the table is recomputed from the tensor "rope.inv_freq", which
+#                must already have been decoded
 """losslessly compressed variants of cpp_infer/data/weights.bin
 
 the uncompressed format (pysrc/export_weights.py, cpp_infer/SPEC.md section 4)
@@ -50,6 +108,9 @@ _TOP = 1 << 24
 _MASK32 = 0xFFFFFFFF
 
 
+# Format v1 (kept for reference; the shipped file is v2).
+# Multi-symbol range coder used by v1 only: encode(cum, freq, tot) narrows the range to the
+# slice [cum, cum + freq) out of tot.
 class RangeEncoder:
     """LZMA-style byte-wise range coder (identical to the C++ decoder's model
     of the stream: 32-bit range, 64-bit low with carry propagation through a
@@ -62,6 +123,9 @@ class RangeEncoder:
         self.cache_size = 1
         self.out = bytearray()
 
+    # Emit the top byte of `low`. A byte of 0xFF cannot be written yet, because a later carry
+    # could still ripple through it, so such bytes are only counted (cache_size) and flushed, with
+    # the carry added, once a byte that settles the question arrives.
     def _shift_low(self) -> None:
         if self.low < 0xFF000000 or self.low > _MASK32:
             carry = self.low >> 32
@@ -87,6 +151,7 @@ class RangeEncoder:
         return bytes(self.out)
 
 
+# Decoder for the v1 multi-symbol range coder (uniform models only).
 class RangeDecoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -189,6 +254,7 @@ def read_tensor_file_v1(filename: str) -> dict[str, tuple[int, np.ndarray]]:
 # format v2
 # ---------------------------------------------------------------------------
 
+# The v2 container layout and its models are described at the top of this file.
 MAGIC_V2 = b"FX2TFWC2"
 
 # payload encodings (one byte per tensor in the v2 stream)
@@ -224,6 +290,9 @@ _I2OPI = (0x3C439041, 0xDB629599, 0xF534DDC0, 0xFC2757D1, 0x4E441529, 0xA2F9836E
 _TRIG_PLOSS = np.float32(105615.0)
 
 
+# The helpers below reproduce, on the host and bit for bit, the float32 sin / cos that the GPU
+# computed when the model's rotary position tables were built. That lets the weights file omit
+# the two tables (they are large fp32 arrays that compress poorly) and rebuild them at load.
 def _round_fraction_to_f32(x: Fraction) -> np.float32:
     """round-to-nearest-even of an exact rational to float32 (finite range)"""
     if x == 0:
@@ -309,6 +378,7 @@ def _trig_slowpath(a: np.float32) -> tuple[np.float32, int]:
     return r, q
 
 
+# The rope.sin / rope.cos table: element [t, k] = sin or cos of float32(t * inv_freq[k]).
 def cuda_rope_table(inv_freq: np.ndarray, n_pos: int, cos: bool) -> np.ndarray:
     """(n_pos, len(inv_freq)) float32 table equal bit-for-bit to
     torch.outer(arange(n_pos), inv_freq).sin()/.cos() on a CUDA device"""
@@ -346,6 +416,8 @@ def cuda_rope_table(inv_freq: np.ndarray, n_pos: int, cos: bool) -> np.ndarray:
 # --- adaptive binary range coder (LZMA-style, 11-bit probs, shift-5) ---------
 
 
+# Binary range encoder of the v2 stream. State: 32-bit `range`, `low` with one spare carry bit,
+# and the pending-byte cache explained at RangeEncoder._shift_low.
 class BinEncoder:
     def __init__(self) -> None:
         self.low = 0
@@ -365,6 +437,7 @@ class BinEncoder:
         self.cache_size += 1
         self.low = (self.low << 8) & _MASK32
 
+    # Code one bit with the adaptive 11-bit model probs[idx] (P(bit = 0)) and update the model.
     def encode_bit(self, probs: list, idx: int, bit: int) -> None:
         p = probs[idx]
         bound = (self.range >> 11) * p
@@ -379,6 +452,7 @@ class BinEncoder:
             self.range = self.range << 8
             self._shift_low()
 
+    # Code an nbits-wide symbol MSB first through a bit tree of adaptive models.
     def encode_tree(self, probs: list, nbits: int, symbol: int) -> None:
         node = 1
         for k in range(nbits - 1, -1, -1):
@@ -386,6 +460,10 @@ class BinEncoder:
             self.encode_bit(probs, node, bit)
             node = (node << 1) | bit
 
+    # [this entry] The ENC_INTC coder: the same tree walk, but each node's probability comes from
+    # the exact counts of zeros and ones coded at that node so far (no shift-based forgetting).
+    # The integer formula must match weights_io_compressed.cpp exactly: both sides have to derive
+    # the same 12-bit p from the same counts or the stream desynchronises.
     def encode_tree_counts(self, counts: list, nbits: int, symbol: int) -> None:
         """counts: 2 << nbits ints, [2*node] zeros and [2*node + 1] ones seen;
         P(0) = (2*n0 + 1) / (2*(n0 + n1) + 2) in 12 bits, clamped to [1, 4095]"""
@@ -408,12 +486,15 @@ class BinEncoder:
                 self._shift_low()
             node = (node << 1) | bit
 
+    # Flush the remaining bytes of `low` (4 bytes plus the cached one).
     def finish(self) -> bytes:
         for _ in range(5):
             self._shift_low()
         return bytes(self.out)
 
 
+# Binary range decoder: the mirror image of BinEncoder. `code` holds the 32 stream bits under
+# the current range; reading past the end of the data yields zero bytes.
 class BinDecoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -428,6 +509,8 @@ class BinDecoder:
         self.pos += 1
         return b
 
+    # Decode one bit: it is 0 when code falls in the lower part [0, bound), else 1. The model
+    # update is the same as in the encoder.
     def decode_bit(self, probs: list, idx: int) -> int:
         p = probs[idx]
         bound = (self.range >> 11) * p
@@ -445,12 +528,14 @@ class BinDecoder:
             self.range = self.range << 8
         return bit
 
+    # Decode an nbits-wide symbol; the leading 1 of `node` is removed at the end.
     def decode_tree(self, probs: list, nbits: int) -> int:
         node = 1
         for _ in range(nbits):
             node = (node << 1) | self.decode_bit(probs, node)
         return node - (1 << nbits)
 
+    # [this entry] ENC_INTC decoder, the counterpart of encode_tree_counts.
     def decode_tree_counts(self, counts: list, nbits: int) -> int:
         node = 1
         for _ in range(nbits):
@@ -474,6 +559,10 @@ class BinDecoder:
         return node - (1 << nbits)
 
 
+# All adaptive models of one v2 stream. Encoder and decoder each create a fresh set and update
+# it identically. Trees that depend on a context (meta, name, bf16 low byte) are created on
+# first use, all probabilities starting at 1024 (= 1/2). ENC_INTC's counts are not kept here:
+# they are created anew for every tensor.
 class _Models:
     """the adaptive model set of the v2 stream (same on both sides)"""
 
@@ -508,6 +597,8 @@ class _Models:
         return t
 
 
+# [this entry] Width of the count tree for a tensor: 4 for the usual -7..7 weights, 3 for the
+# 7-level (-3..3) experiment, and so on.
 def _intc_bits(array: np.ndarray) -> int:
     """smallest n in 2..8 with all values in [-(2^(n-1)-1), 2^(n-1)-1]; 0 if none"""
     flat = array.astype(np.int32).ravel()
@@ -518,6 +609,9 @@ def _intc_bits(array: np.ndarray) -> int:
     return 0
 
 
+# Choose the payload encoding of one tensor. `seen` holds the fp32 tensors written so far, so
+# that the rope tables can be checked against a recomputation from rope.inv_freq; they are
+# dropped only if that recomputation is bit-identical.
 def _pick_encoding(
     name: str,
     dtype_code: int,
@@ -526,6 +620,7 @@ def _pick_encoding(
     count_coder: bool = False,
 ) -> int:
     if dtype_code == DTYPE_INT8:
+        # [this entry] with the count coder enabled every int8 tensor that fits in 2..8 bits uses it
         if count_coder and _intc_bits(array):
             return ENC_INTC
         flat = array.astype(np.int32).ravel()
@@ -569,6 +664,7 @@ def write_tensor_file_v2(
         enc.encode_tree(models.meta_tree(), 8, b)
         models.meta_prev = b
 
+    # One pass over the tensors: header fields first, then the payload, all into one stream.
     seen: dict[str, np.ndarray] = {}
     for name, dtype_code, array in entries:
         assert array.dtype == _DTYPE_TO_NUMPY[dtype_code], name
@@ -591,6 +687,8 @@ def write_tensor_file_v2(
         encoding = _pick_encoding(name, dtype_code, data, seen, count_coder)
         put_meta(encoding)
 
+        # [this entry] ENC_INTC: one extra meta byte (the tree width), then the weights shifted to
+        # 0 .. 2^nbits - 2, with fresh zeroed counts for this tensor.
         if encoding == ENC_INTC:
             nbits = _intc_bits(data)
             put_meta(nbits)
@@ -623,12 +721,15 @@ def write_tensor_file_v2(
         if dtype_code == DTYPE_FLOAT32:
             seen[name] = data
 
+    # The 12-byte clear header, then the whole range-coded stream.
     with open(filename, "wb") as f:
         f.write(MAGIC_V2)
         f.write(struct.pack("<I", len(entries)))
         f.write(enc.finish())
 
 
+# Reference decoder of the v2 container. cpp_infer/src/weights_io_compressed.cpp implements
+# exactly this sequence of reads and model updates.
 def read_tensor_file_v2(filename: str) -> dict[str, tuple[int, np.ndarray]]:
     with open(filename, "rb") as f:
         assert f.read(8) == MAGIC_V2
@@ -664,6 +765,7 @@ def read_tensor_file_v2(filename: str) -> dict[str, tuple[int, np.ndarray]]:
         encoding = get_meta()
 
         dtype = np.dtype(_DTYPE_TO_NUMPY[dtype_code])
+        # [this entry] count-based weight coder
         if encoding == ENC_INTC:
             assert dtype_code == DTYPE_INT8
             nbits = get_meta()
@@ -736,6 +838,7 @@ def _verify_equal(
         assert np.array_equal(decoded_array, array), name
 
 
+# Pick the reader from the file's magic.
 def _read_compressed(filename: str) -> dict[str, tuple[int, np.ndarray]]:
     with open(filename, "rb") as f:
         magic = f.read(8)
@@ -746,6 +849,8 @@ def _read_compressed(filename: str) -> dict[str, tuple[int, np.ndarray]]:
     raise ValueError(f"{filename}: unknown magic {magic!r}")
 
 
+# Command line: compress (v2, ENC_INT4 weights), compress1 (v1), compress3 (v2 with
+# [this entry] ENC_INTC weights), decompress, verify.
 def main() -> None:
     import os
 

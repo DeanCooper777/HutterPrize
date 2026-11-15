@@ -1,3 +1,7 @@
+// sparse.cpp: Sparse, see sparse.h.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "sparse.h"
 
 #include <limits.h>
@@ -5,6 +9,7 @@
 Sparse::Sparse(const std::vector<unsigned long long>& recent_contexts,
     const std::vector<unsigned int>& orders) :
     recent_contexts_(recent_contexts), orders_(orders), factors_(6, 1) {
+  // Multipliers that spread the selected values over the 64-bit context (at most 6 values).
   factors_[1] = 256;
   factors_[2] = 29 * 31;
   factors_[3] = 29 * 31 * 37;
@@ -14,6 +19,7 @@ Sparse::Sparse(const std::vector<unsigned long long>& recent_contexts,
   size_ = ULLONG_MAX;
 }
 
+// context_ = sum of factor[i] * recent_contexts[orders[i]].
 void Sparse::Update() {
   context_ = recent_contexts_[orders_[0]];
   for (unsigned int i = 1; i < orders_.size(); ++i) {
@@ -21,6 +27,7 @@ void Sparse::Update() {
   }
 }
 
+// Same source vector and same list of orders = same context.
 bool Sparse::IsEqual(Context* c) const {
   Sparse* p = dynamic_cast<Sparse*>(c);
   if (!p) return false;

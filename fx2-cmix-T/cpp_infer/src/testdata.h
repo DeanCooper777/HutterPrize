@@ -1,4 +1,14 @@
 // shared test-data loading for test_components / test_e2e / bench
+//
+// Locates the data directory and maps the test set of SPEC.md section 5:
+// tokens, article boundaries, PPMD prior rows, RoPE offsets, reference
+// probabilities and the reference loss. POSIX only (mmap).
+//
+// How it fits: test and benchmark programs only (also the opt/ ones); not
+// part of the cmix binary.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <fcntl.h>

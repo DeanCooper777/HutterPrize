@@ -1,3 +1,33 @@
+// qmat_dense.cpp - the dense quantized matrix x vector kernels for 8-bit
+// activations and 4-bit weights (contract in qmat_dense.h, arena format in
+// qmat.h), and the builders of all qmat.h arenas.
+//
+// What a kernel does: for each output row, the exact int32 dot product of
+// the u8 activation vector with the row's weights, minus a per-row integer
+// correction (the +128 input bias), then an fp32 "epilogue" (scale, add to
+// the residual, or re-quantize for the next matmul). Because the dots are
+// exact integers, every variant below (AVX2, AVX-VNNI, AVX512-VNNI, packed
+// or unpacked weights) returns the same bits; they differ only in speed.
+//
+// How it fits: called by model_opt.cpp for the matmuls that keep 8-bit
+// inputs: the Kimi gate projections and the unembedding always, and the
+// q/k/v, output and mlp.up projections when CMIX_ACT16 clears their bit
+// (act16.h serves them by default). Transformer byte model -> mixers -> SSE
+// -> arithmetic coder.
+//
+// Testing: test_qmat (int32 dots against a scalar reference), bench_qmat.
+// Environment switches, speed only: CMIX_NO_VNNI=1 (force the AVX2 kernels),
+// CMIX_QMAT_UNPACKED=1 (keep one byte per weight), CMIX_QMAT_PF_NTA=1
+// (non-temporal prefetch hint).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] AVX-VNNI and AVX512-VNNI kernels (vpdpbusd), chosen at run
+//   time by CPUID, and a nibble-packed arena for them that halves the weight
+//   bytes read per symbol. Speed only: bit-identical output. They are used
+//   by development builds; the submitted Linux binary is built with
+//   -DFX2_NO_VNNI, which compiles them out and leaves the previous winner's
+//   AVX2 kernels (run_g8 / run_g4_768).
+// - [this entry] MSVC-compatible CPUID include (Windows development build).
 #include "qmat_dense.h"
 
 #include <immintrin.h>
@@ -21,6 +51,7 @@ namespace {
   std::exit(1);
 }
 
+// Lookup table for the nonzero index list built by qgemv_relu2q.
 // positions of set bits per 8-bit mask; unset slots hold 0 (an in-range row
 // index) so the 16 B slack writes of the index list stay harmless.
 struct IdxLut {
@@ -44,6 +75,7 @@ constexpr int PFN_DEFAULT = 4;
 // epilogue functors: operator()(g, sums8, scl) for 8-row groups,
 //                    g4(g, sums4, scl) for 4-row groups
 // ---------------------------------------------------------------------------
+// out = float(dot) * scale: a fresh fp32 vector
 struct EpiF32 {
   float* out;
   inline void operator()(int g, __m256i sums, const float* scl) {
@@ -56,6 +88,8 @@ struct EpiF32 {
   }
 };
 
+// out += float(dot) * scale: the product is rounded first, then added (two
+// IEEE operations, never one fused multiply-add), as the reference model does
 struct EpiAdd {
   float* out;
   inline void operator()(int g, __m256i sums, const float* scl) {
@@ -68,6 +102,7 @@ struct EpiAdd {
   }
 };
 
+// the raw int32 dots (tests)
 struct EpiI32 {
   int32_t* out;
   inline void operator()(int g, __m256i sums, const float*) {
@@ -81,6 +116,11 @@ struct EpiI32 {
 // ---------------------------------------------------------------------------
 // core: 8-row groups, d_in <= 256 (NC chunks of 32 columns)
 // ---------------------------------------------------------------------------
+// The previous winner's AVX2 kernel and the one the submitted binary runs.
+// Eight rows at a time. vpmaddubsw multiplies 32 u8 activations by 32 s8
+// weights and adds neighbouring products into 16 int16 lanes; the lanes of at
+// most 8 chunks are added in int16 (bound in qmat.h: no saturation), widened
+// with vpmaddwd by 1, and reduced to one int32 per row.
 template <int NC, int PFN, class Epi>
 inline void run_g8(const QDense& m, const uint8_t* act, Epi& epi) {
   const __m256i ones = _mm256_set1_epi16(1);
@@ -125,6 +165,8 @@ inline void run_g8(const QDense& m, const uint8_t* act, Epi& epi) {
       s6 = _mm256_add_epi16(s6, _mm256_maddubs_epi16(av, wc[6]));
       s7 = _mm256_add_epi16(s7, _mm256_maddubs_epi16(av, wc[7]));
     }
+    // widen to int32 and sum each row's lanes; then subtract the row's
+    // correction (first 32 bytes of the group block) and run the epilogue
     __m256i p01 = _mm256_hadd_epi32(_mm256_madd_epi16(s0, ones),
                                     _mm256_madd_epi16(s1, ones));
     __m256i p23 = _mm256_hadd_epi32(_mm256_madd_epi16(s2, ones),
@@ -193,12 +235,15 @@ inline void run_g4_768(const QDense& m, const uint8_t* act, Epi& epi) {
 }
 
 // ---------------------------------------------------------------------------
+// [this entry] Everything from here to dispatch() is new: faster kernels for
+// CPUs with VNNI. None of it is in the submitted binary (FX2_NO_VNNI).
 // AVX-VNNI variants (vpdpbusd: u8 x s8 -> int32, accumulated). Bit-identical
 // to the vpmaddubsw kernels above: the activations/weights and therefore the
 // exact int32 dot products are the same (the AVX2 path never saturates, see
 // qmat.h), only the partition of the integer sum differs. Selected at run
 // time when the CPU supports AVX-VNNI; CMIX_NO_VNNI=1 forces the AVX2 path.
 // ---------------------------------------------------------------------------
+// CPUID leaf 7 subleaf 1, EAX bit 4 = AVX-VNNI
 bool detect_vnni() {
   if (const char* e = std::getenv("CMIX_NO_VNNI"))
     if (*e && *e != '0') return false;
@@ -258,6 +303,8 @@ const bool g_vnni512 = !g_vnni && detect_vnni512();
 #endif
 
 #ifndef FX2_NO_VNNI
+// run_g8 with vpdpbusd: the products go straight into int32 accumulators, so
+// there is no int16 stage and no widening step. Same unpacked arena.
 template <int NC, int PFN, class Epi>
 __attribute__((target("avxvnni"), noinline)) void run_g8_vnni(
     const QDense& m, const uint8_t* act, Epi& epi) {
@@ -312,6 +359,7 @@ __attribute__((target("avxvnni"), noinline)) void run_g8_vnni(
   }
 }
 
+// run_g4_768 with vpdpbusd
 template <int PFN, class Epi>
 __attribute__((target("avxvnni"), noinline)) void run_g4_768_vnni(
     const QDense& m, const uint8_t* act, Epi& epi) {
@@ -391,6 +439,12 @@ inline void qm_pf(const char* p) {
   else _mm_prefetch(p, _MM_HINT_T0);
 }
 
+// The packed kernels, written once as a macro and instantiated for the two
+// encodings of vpdpbusd (DP): run_g8_vnni4* for 8-row groups (d_in <= 256)
+// and run_g4_768_vnni4* for 4-row groups (d_in = 768). Each 32-byte load
+// holds two rows (low and high nibbles), which are split with a mask and a
+// shift and accumulated separately; the epilogue subtracts 7 * sum(act) and
+// the row correction.
 #ifndef FX2_NO_VNNI
 #define QM_PACKED_KERNELS(SUF, TGT, DP) \
 template <int NC, int PFN, class Epi>                                             \
@@ -484,6 +538,9 @@ QM_PACKED_KERNELS(_512, "avx512vnni,avx512vl,avx512f", _mm256_dpbusd_epi32)
 #undef QM_PACKED_KERNELS
 #endif  // FX2_NO_VNNI
 
+// [this entry] Kernel selection for 8-row groups: packed arena -> a VNNI
+// packed kernel; else VNNI unpacked; else (and always in the submission
+// build) the AVX2 kernel. All return the same int32 dots.
 template <int NC, int PFN, class Epi>
 inline void run_g8_any(const QDense& m, const uint8_t* act, Epi& epi) {
 #ifdef FX2_NO_VNNI
@@ -498,6 +555,7 @@ inline void run_g8_any(const QDense& m, const uint8_t* act, Epi& epi) {
 #endif
 }
 
+// [this entry] the same selection for the 4-row-group (d_in = 768) kernels
 template <int PFN, class Epi>
 inline void run_g4_768_any(const QDense& m, const uint8_t* act, Epi& epi) {
 #ifdef FX2_NO_VNNI
@@ -512,6 +570,8 @@ inline void run_g4_768_any(const QDense& m, const uint8_t* act, Epi& epi) {
 #endif
 }
 
+// Picks the kernel instantiation by input width: 64 (gate down), 192 (most
+// matmuls), 205/224 (a dense prior), 768.
 template <int PFN, class Epi>
 inline void dispatch(const QDense& m, const uint8_t* act, Epi& epi) {
   switch (m.d_in) {
@@ -535,6 +595,8 @@ inline void dispatch(const QDense& m, const uint8_t* act, Epi& epi) {
 
 // ---------------------------------------------------------------------------
 // packed int4 core (4-row groups; unsigned nibbles w+7, signed act)
+// The previous winner's AVX2 comparison format (QPacked in qmat.h); used by
+// test_qmat / bench_qmat only, not by the model.
 // ---------------------------------------------------------------------------
 template <int NPAIR, class Epi>
 inline void run_packed(const QPacked& m, const int8_t* act, int32_t corr7,
@@ -614,6 +676,8 @@ inline void dispatch_packed(const QPacked& m, const int8_t* act, int32_t corr7,
 // ---------------------------------------------------------------------------
 // public kernels
 // ---------------------------------------------------------------------------
+// (a) y = W q: the gate-down projections and the unembedding; also q/k/v and
+// mlp.up when their inputs are 8-bit
 void qgemv_f32(const QDense& m, const uint8_t* act, float* out) {
   EpiF32 e{out};
   dispatch<PFN_DEFAULT>(m, act, e);
@@ -624,6 +688,7 @@ void qgemv_f32_nopf(const QDense& m, const uint8_t* act, float* out) {
   dispatch<0>(m, act, e);
 }
 
+// (b) x += W q: the attention output projection on the 8-bit path
 void qgemv_add(const QDense& m, const uint8_t* act, float* out) {
   EpiAdd e{out};
   dispatch<PFN_DEFAULT>(m, act, e);
@@ -696,6 +761,8 @@ int qgemv_relu2q(const QDense& m, const uint8_t* act, float s_next,
   return nnz;
 }
 
+// (d) the 192 -> 64 half of a Kimi gate: matmul, then quantize the 64
+// outputs to biased u8 for the 64 -> 192 half
 void qgemv_quant_bias(const QDense& m, const uint8_t* act, float s_next,
                       uint8_t* q_out) {
   if (m.d_in != 192) die("quant_bias epilogue requires d_in==192");
@@ -738,6 +805,7 @@ void qgemv_packed_i32(const QPacked& m, const int8_t* act, int32_t corr7,
 // ---------------------------------------------------------------------------
 // builders
 // ---------------------------------------------------------------------------
+// [this entry] the packed arena stores two weights per byte (g_packed)
 size_t qdense_bytes(int d_out, int d_in) {
   const int gr = qmat_group_rows(d_in);
   const int stride = qmat_round_up(d_in, 32);
@@ -777,6 +845,10 @@ QDense qdense_build(uint8_t* dst, const int8_t* qw, const float* fold,
       corr[r] = 128 * s;
       scl[r] = row < d_out ? fold[row] : 0.0f;
     }
+    // [this entry] packed layout: byte b of vector j of chunk c = row 2j in
+    // the low nibble, row 2j+1 in the high nibble, both as w + 7. Padding
+    // weights are 0, stored as 7, and are cancelled by the 7 * sum(act)
+    // correction like every other weight.
     if (m.packed) {
       auto wt = [&](int row, int col) -> int {
         if (row >= d_out || col >= d_in) return 0;
@@ -794,6 +866,7 @@ QDense qdense_build(uint8_t* dst, const int8_t* qw, const float* fold,
         }
       continue;
     }
+    // unpacked layout (the previous winner's; the submission build's)
     int8_t* w = reinterpret_cast<int8_t*>(gp + meta);
     for (int c = 0; c < m.nchunk; c++)
       for (int r = 0; r < G; r++) {
@@ -812,6 +885,7 @@ QDense qdense_build(uint8_t* dst, const int8_t* qw, const float* fold,
   return m;
 }
 
+// column-major int8 arena (one byte per weight) for the sparse kernels
 size_t qsparse_bytes(int d_in) { return static_cast<size_t>(d_in) * 192; }
 
 QSparse qsparse_build(int8_t* dst_cols, float* dst_fold, const int8_t* qw,
@@ -833,6 +907,8 @@ QSparse qsparse_build(int8_t* dst_cols, float* dst_fold, const int8_t* qw,
   return s;
 }
 
+// column-major nibble arena (QSparse4): the prior embedding, and mlp.down on
+// the 8-bit path
 size_t qsparse4_bytes(int d_in) { return static_cast<size_t>(d_in) * 128; }
 
 QSparse4 qsparse4_build(uint8_t* dst_cols, float* dst_fold, const int8_t* qw,
@@ -858,6 +934,7 @@ QSparse4 qsparse4_build(uint8_t* dst_cols, float* dst_fold, const int8_t* qw,
   return s;
 }
 
+// the AVX2 packed comparison format (tests / benchmarks only)
 size_t qpacked_bytes(int d_out, int d_in) {
   const int stride4 = qmat_round_up(d_in, 64);
   const int ng = qmat_round_up(d_out, 4) / 4;

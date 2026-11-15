@@ -1,4 +1,15 @@
 // fx2-cmix transformer: single-thread streaming inference (SPEC.md section 6)
+//
+// This is the interface of the NAIVE reference model (model.cpp). The model
+// cmix actually runs is opt/model_opt.h (TransformerOpt), which has the same
+// begin_article / step interface. Not part of the cmix binary.
+//
+// Testing: used by test_components, test_e2e, bench, opt/test_xcheck and
+// opt/capture_qkv; set_capture and set_block_input_override exist for them.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
+// (model.cpp gained a compile-time MLP width, FX2_DMLP.)
 #pragma once
 
 #include <cstdint>

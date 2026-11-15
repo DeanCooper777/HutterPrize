@@ -1,3 +1,16 @@
+# kda_reference.py: a plain, one-token-at-a-time PyTorch reference of the Kimi linear
+# attention pieces that training takes from the fla library (chunk_kda, the gated RMS norm and
+# the causal convolution).
+#
+# Where it fits: testing / documentation only. Training uses fla's chunked GPU kernels; the
+# compressor needs the same function evaluated one token at a time on the CPU. This file pins
+# down the exact per-step semantics (constants, epsilons, order of operations) and validates
+# them against fla; the C++ implementation in cpp_infer/ follows these reference functions.
+#
+# Testing: run this file directly (see the docstring) to compare against fla on random data.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 """Pure-PyTorch per-time-step reference for the three fla 0.5.1 components used
 by pysrc/model.py KimiLinearAttention:
 

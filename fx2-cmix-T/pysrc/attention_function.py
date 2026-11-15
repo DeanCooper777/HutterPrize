@@ -1,3 +1,17 @@
+# attention_function.py: the sliding-window causal attention used by the non-Kimi layers of
+# the transformer byte model, with three interchangeable back ends (PyTorch scaled dot-product
+# attention with a dense mask, flash-attn, and flex_attention with a block-sparse mask).
+#
+# What the mask means: position i may attend to position j only if j <= i (causal),
+# i - j < window_size (sliding window) and both lie in the same article (document). The C++
+# inference in cpp_infer/ implements the same rule with a ring buffer of the last
+# window_size keys and values.
+#
+# Where it fits: training side only; called from Attention.forward in pysrc/model.py. The
+# shipped configuration uses the "flex_attention" back end.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention.flex_attention import flex_attention, BlockMask
 from torch import Tensor, arange
@@ -56,6 +70,7 @@ class AttentionFunctionArguments:
         return self.queries.device
 
 
+# Dispatch to the selected back end.
 def attention_function(
     args: AttentionFunctionArguments,
 ) -> Float[Tensor, "batch position n_heads d_head"]:
@@ -112,6 +127,7 @@ def validate_attention_arguments(args: AttentionFunctionArguments) -> None:
     )
 
 
+# Reference back end: a dense boolean mask built from the three rules above.
 def sdpa_attention_function(
     args: AttentionFunctionArguments,
 ) -> Float[Tensor, "batch position n_heads d_head"]:
@@ -349,6 +365,8 @@ def dense_mask_to_ordered(dense_mask):
     return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
 
+# Build the block-sparse mask for flex_attention once per micro batch; it is shared by all
+# attention layers.
 def make_flex_attention_block_mask(
     cumulative_sequence_lengths: Int[Tensor, "batch document"] | None,
     sequence_length: int,

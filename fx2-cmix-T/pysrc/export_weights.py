@@ -1,3 +1,29 @@
+# export_weights.py: turn a trained PyTorch checkpoint into the weights file the C++
+# transformer byte model loads.
+#
+# Where it fits: the bridge from training to the compressor.
+#   checkpoint (.tch) -> export_weights.py -> weights.bin (plain reference format)
+#   -> pysrc/weights_compress.py -> .tfwc2 -> appended to the cmix binary (and so also part of
+#   the self-extracting archive) -> decoded at start-up by cpp_infer/src/weights_io*.cpp.
+#
+# What is written, per tensor (name, dtype, shape, data):
+#   <weight>.q       int8, the quantized weights exactly as training computed them (-7..7)
+#   <weight>.scale   bfloat16 bits, one scale per output row
+#   activation / query / key / value scales   bfloat16 bits
+#   the few unquantized fp32 tensors, the rotary position tables, and the config integers
+# The integers are recomputed here and compared bit for bit with the model's own quantizers
+# before anything is written, because the decompressor must reproduce the compressor's
+# arithmetic exactly.
+#
+# Testing: the file is read back and compared; pysrc/export_testdata.py dumps reference
+# activations for the C++ tests from the same model.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1):
+#   - [this entry] EXPORT_MODEL / EXPORT_OUTPUT select the checkpoint and the output file, so
+#     the retrained (cmix-aware) checkpoints can be exported without editing the source.
+#   - [this entry] experiment switches A_DMLP (MLP width) and A_MLP_BITS (MLP weight bits);
+#     the shipped weights use the defaults, 768 and 4. Both variants were rejected.
+#   - [this entry] query_key_norm_gain=False is passed explicitly in the reference config.
 """export the reference checkpoint models/6m-q4-fp32.tch to
 cpp_infer/data/weights.bin in the binary format of cpp_infer/SPEC.md section 4
 
@@ -69,6 +95,10 @@ _UNQUANTIZED_FP32_SUFFIXES = (
 )
 
 
+# The architecture of the shipped model: 12 layers, d_model 192, 3 heads of 64, MLP width 768,
+# layers alternate three Kimi linear-attention layers with one sliding-window attention layer,
+# 15-level weights and 256-level activations. It must equal the config the checkpoint was
+# trained with (the recipes in training_recipes/ repeat it).
 def make_reference_config() -> TransformerConfig:
     """exactly the config of training_recipes/save_outputs.py"""
     quantization_block_size: int | None = None
@@ -174,6 +204,9 @@ def load_reference_model(device: torch.device) -> Transformer:
     return model
 
 
+# The weight quantizer written out by hand (bf16-rounded scale, fp32 division, round half to
+# even, clamp); export_weights() checks it against the model's Quantize module.
+# [this entry] qmax is a parameter (7 for the shipped 4-bit weights) for the A_MLP_BITS test.
 def quantize_weight_rows(
     weight: Tensor, scale_fp32: Tensor, qmax: int = 7
 ) -> tuple[Tensor, Tensor]:
@@ -198,6 +231,9 @@ def bf16_bits(x: Tensor) -> np.ndarray:
     return x.detach().to(torch.bfloat16).view(torch.uint16).cpu().numpy()
 
 
+# The plain reference container: magic "FX2TFW01", uint32 tensor count, then for each tensor
+# name length + name, dtype code (1 byte), ndim, the dimensions (uint32 each) and raw
+# little-endian data. pysrc/weights_compress.py codes the same entries compactly.
 def write_tensor_file(
     filename: str, entries: list[tuple[str, int, np.ndarray]]
 ) -> None:
@@ -256,6 +292,9 @@ def export_weights(model: Transformer, output_filename: str) -> None:
     n_quantized = n_activation_scales = n_raw_fp32 = 0
     negative_scale_weights: list[tuple[str, int]] = []
 
+    # Walk the state dict in registration order and classify every tensor: quantized weight (with
+    # its row scales), activation scale, or one of the listed raw fp32 tensors. Anything else is
+    # an error, so a model change cannot silently drop a tensor.
     for key, value in state_dict.items():
         value = value.detach()
 
@@ -362,6 +401,7 @@ def export_weights(model: Transformer, output_filename: str) -> None:
         )
     )
 
+    # Tensor counts of the 12-layer architecture; a guard against exporting a different model.
     assert n_quantized == 111, n_quantized
     assert n_activation_scales == 119, n_activation_scales
     assert n_raw_fp32 == 88, n_raw_fp32

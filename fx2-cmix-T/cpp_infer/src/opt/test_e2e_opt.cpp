@@ -1,6 +1,33 @@
 // test_e2e_opt: src/test_e2e.cpp adapted to the optimized TransformerOpt.
 // Streams the test articles, computes the loss two ways, compares with
 // ref_loss.txt and the reference probability file (SPEC section 6).
+//
+// What it verifies: the OPTIMIZED transformer (fx2::opt::TransformerOpt in
+// model_opt.cpp, built on the arena of arena_build.cpp and the qmat / attn /
+// kda / glue kernels) reaches the same loss as the Python/PyTorch model over
+// the whole test set. Reference = ref_loss.txt and test_ref_probs.f16 in the
+// data directory, the same files src/test_e2e.cpp uses for the naive model.
+//
+// Where it sits: TransformerOpt is the transformer byte model that cmix runs
+// (src/predictor.cpp), whose 205-way distribution goes to the mixers. This is
+// the end-to-end check of the code that ships; it protects model_opt.cpp and
+// arena_build.cpp and everything below them.
+//
+// Testing: build with `make test_e2e_opt` in cpp_infer/ (-> bin/test_e2e_opt),
+// run as
+//   bin/test_e2e_opt [--data DIR] [--articles N] [--attn f32|int8]
+// --attn selects how the attention layers keep past values (f32 = fast, the
+// default; int8 = compact). Pass (full run only): "VERDICT: PASS ..." and
+// exit code 0 (mean loss within 0.1% of the reference; 0.01% is the target).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged.
+// [this entry] The optimized model now quantizes four matmul inputs to 16 bits
+// by default (CMIX_ACT16 = 15, see act16.h and arena_build.h); the naive model
+// and the Python reference dumps use the original 8-bit quantizers. Run with
+// the environment variable CMIX_ACT16=0 to compare like with like. The link
+// also needs act16.cpp, which cpp_infer/Makefile (unchanged from the previous
+// winner) does not yet list among the opt objects.
 #include <cmath>
 #include <cstdio>
 #include <cstring>

@@ -1,3 +1,17 @@
+# cooldown.py: stage 3 of 3 of the previous winner's recipe: a short, very low learning rate
+# pass over the quantized model with all activations in float32 instead of bfloat16.
+# Why (previous winner's writeup.md): stage 2 trains in bf16 for speed, but the reference model
+# for the C++ inference should be float32, so that a difference between the two
+# implementations can be told apart from bf16 rounding. This pass moves the model to float32.
+#
+# Input: models/6m-q4.tch.  Output: models/6m-q4-fp32.tch, the checkpoint that
+# pysrc/export_weights.py exports. (This entry uses cooldown_A.py instead, which is the same
+# stage with the cmix-aware loss.)
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.cooldown
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch
@@ -16,6 +30,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -27,6 +42,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,
@@ -47,6 +63,8 @@ def main() -> None:
         weight=weight_quantization, activation=activation_quantization
     )
 
+    # The model. The architecture must stay identical across the three stages and equal to
+    # make_reference_config in pysrc/export_weights.py (which the C++ inference hard-codes).
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -145,6 +163,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

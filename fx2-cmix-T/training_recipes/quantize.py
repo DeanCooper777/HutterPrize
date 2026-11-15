@@ -1,3 +1,15 @@
+# quantize.py: stage 2 of 3 of the previous winner's recipe: quantization-aware training.
+# Loads the float model of stage 1 (models/6m.tch), calibrates the quantization scales
+# (256 steps), then trains with fake quantization (pysrc/quantization.py: 15-level weights,
+# 256-level activations) in bfloat16 on plain cross-entropy.
+#
+# Output: models/6m-q4.tch. This checkpoint is the starting point of this entry's cmix-aware
+# fine-tune (train_A_finetune.py); in the previous winner it went straight to cooldown.py.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.quantize
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch
@@ -16,6 +28,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -28,6 +41,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,
@@ -48,6 +62,8 @@ def main() -> None:
         weight=weight_quantization, activation=activation_quantization
     )
 
+    # The model. The architecture must stay identical across the three stages and equal to
+    # make_reference_config in pysrc/export_weights.py (which the C++ inference hard-codes).
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -148,6 +164,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

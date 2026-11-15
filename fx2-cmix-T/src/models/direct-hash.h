@@ -1,3 +1,10 @@
+// direct-hash.h: like Direct (direct.h), but for contexts too large to index directly: the
+// context is hashed into a table with a checksum per slot and linear probing.
+//
+// Inherited from cmix. Compiled, but not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #ifndef DIRECT_HASH_H
 #define DIRECT_HASH_H
 

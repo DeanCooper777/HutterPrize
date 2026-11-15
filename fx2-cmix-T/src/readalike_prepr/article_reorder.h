@@ -1,3 +1,15 @@
+// article_reorder.h: enwik9-specific article reordering. The compressor writes the
+// <page> elements of the main part of enwik9 in an order that puts similar articles
+// next to each other (the order is a fixed table shipped inside the compressor), which
+// helps every model that learns from recent text. The decompressor needs no table: it
+// sorts the pages by <id>, which restores the original enwik9 order.
+//
+// Place in the pipeline: the first stage, before the phda9 text transform:
+//   enwik9 -> split (misc.h) -> [reorder] -> phda9 -> cmix preprocessor -> models ...
+// and the last stage of decompression ([sort]). Called from main() in runner.cpp.
+//
+// Unchanged from the previous winning entry.
+
 #ifndef ARTICLE_REORDER_H 
 #define ARTICLE_REORDER_H 
 
@@ -9,8 +21,10 @@
 #include <unordered_map>
 #include <fstream>
 
+// Number of <page> elements in the main part of enwik9 (.main).
 #define NUM_OF_ARTICLES 243425
 
+// One page: its <id> and its first and last line in the loaded file.
 struct Accumulator {
   int id;
   int start;
@@ -31,6 +45,7 @@ enum ParserState {
 int line_count = 0;
 static char s[8192*8];
 
+// Sorts the pages by id (decompression).
 void bubblesort(std::vector<Accumulator>& mylist) {
     for (int i = 1; i < mylist.size(); i++)	{
         for (int j = 0; j < mylist.size() - i; j++) {
@@ -48,6 +63,8 @@ std::vector<std::string> lines;
 int wfgets(char *str, int count, FILE  *fp);
 void wfputs(const char *str,FILE *fp);
 
+// Reads the file line by line into `lines` and records every page (start line, id, end
+// line) in `vec`, using a three-state scan: <page> -> first <id> -> </page>.
 void loadFile(const char *fname) {
    
     line_count = 0;
@@ -89,6 +106,10 @@ void loadFile(const char *fname) {
   fclose(file);
   
 }
+// Compression: .main -> .main_reordered. The order table lists page numbers counted
+// over non-redirect pages only (smaller numbers, so the table compresses better; see
+// article_remap.cpp); `remap` converts them back to page numbers in .main. Pages the
+// table does not mention (the redirects) are appended in their original order.
 void reorder() {
     std::vector<int> positions;
     std::vector<int> used(NUM_OF_ARTICLES, 0);
@@ -163,6 +184,8 @@ void reorder() {
   std::vector<std::string>(lines).swap(lines);
 }
 
+// Decompression: .main_decomp_restored -> .main_decomp_restored_sorted, pages in
+// ascending <id> order, which is the original enwik9 order.
 void sort() {
   loadFile(".main_decomp_restored");
  

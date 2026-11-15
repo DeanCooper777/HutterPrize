@@ -1,4 +1,12 @@
 // minimal .npy reader (test-only): supports '<f4' and '|i1', C order
+//
+// How it fits: reads the per-component reference dumps written by the Python
+// side (SPEC.md section 5). Not part of the cmix binary.
+//
+// Testing: used by test_components and opt/test_kda.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <cstdint>

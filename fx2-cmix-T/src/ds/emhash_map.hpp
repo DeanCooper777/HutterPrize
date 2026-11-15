@@ -24,6 +24,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE
 
+// emhash_map.hpp (third party, emhash6::HashMap by Huang Yuanbing): open-addressing hash map.
+// Used by src/mixer/mixer.h (context -> weight row), src/models/bracket.h,
+// src/contexts/bracket-context.h and src/preprocess/dictionary.h.
+//
+// Third-party container, used as it is. Not part of the compression method.
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #pragma once
 
 #include <cstring>

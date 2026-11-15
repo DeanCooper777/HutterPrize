@@ -1,3 +1,10 @@
+# test_fused_quant.py: unit test and timing of the fused fake quantization against the eager
+# reference (fx2-cmix-T/pysrc/quantization.py): forward results and input gradients must be
+# identical, scale gradients equal to rounding. Needs a GPU. Prints ALL OK or SOME MISMATCH.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Compare pysrc.quantization's fused fake quantization with the eager
 # reference (QuantizeFunction) on run A's shapes: forward must match bit for
 # bit, gradients to rounding; then time both. Run from /workspace/train:

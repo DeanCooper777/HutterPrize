@@ -1,3 +1,14 @@
+// dictionary.h: the WRT (word replacing transform) dictionary. Words of the input that
+// occur in the dictionary file are replaced by 1 to 3 byte codes (bytes >= 0x80), with
+// separate flag bytes for capitalized and upper-case words. Shorter, more regular input
+// for the models, and word identities become explicit.
+//
+// Place in the pipeline: preprocess -> [dictionary] -> models. Used by
+// preprocessor.cpp (encode_text / decode_text) and by runner.cpp's
+// --save-article-boundaries check.
+//
+// Unchanged from the previous winning entry.
+
 #ifndef DICTIONARY_H
 #define DICTIONARY_H
 

@@ -5,6 +5,28 @@
 // Pinning: --cpu N (default 42; the measured idle CCX is {40-43,104-107},
 // see MACHINE.md). Core cycles are computed from the measured tsc->core
 // ratio (bench_common.h calibration, AVX2-warm).
+//
+// What it measures: tokens per second and core cycles per token of
+// fx2::opt::TransformerOpt (model_opt.cpp), the transformer byte model that
+// cmix runs once per coded byte. Compare with ../bench.cpp (naive model).
+// No reference and no pass/fail: after a warm-up pass it prints one line per
+// repeat and a "MEDIAN:" line. The -DFX2_PROF build also prints the time
+// spent in each part of the model (the accumulators live in model_opt.cpp).
+//
+// Testing: build with `make bench_opt bench_opt_prof` in cpp_infer/
+// (-> bin/bench_opt, bin/bench_opt_prof), run as
+//   bin/bench_opt [--data DIR] [--articles N] [--repeats R] [--cpu C|-1]
+//                 [--attn f32|int8] [--kda-pf M]
+// Linux only (sched_setaffinity). --cpu -1 disables pinning; the default CPU
+// number belongs to the previous authors' build machine. It protects nothing
+// by itself; it is how speed changes to model_opt.cpp and the kernels were
+// judged.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged. [this entry] The model it times now takes the
+// 16-bit activation path by default (CMIX_ACT16 = 15; set CMIX_ACT16=0 for
+// the original 8-bit path), and the link needs act16.cpp, which
+// cpp_infer/Makefile (unchanged) does not yet list among the opt objects.
 #include <sched.h>
 
 #include <cstdio>

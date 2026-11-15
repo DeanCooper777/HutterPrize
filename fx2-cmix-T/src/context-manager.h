@@ -1,3 +1,14 @@
+// context-manager.h: ContextManager owns the shared state that the context models and
+// the mixers select on: the current partial byte, the byte history, word hashes, and a
+// set of small derived contexts (mx*, b2stream, b3stream, ind*, ...). Models and mixers
+// hold references to these fields, so one update per bit serves all of them.
+//
+// Place in the pipeline: feeds [context models] and the weight-set selection of the
+// [mixers]. Predictor owns one instance (manager_) and calls UpdateContexts(bit) from
+// Perceive().
+//
+// Unchanged from the previous winning entry.
+
 #ifndef CONTEXT_MANAGER_H
 #define CONTEXT_MANAGER_H
 
@@ -22,6 +33,8 @@
 struct ContextManager {
   ContextManager();
 
+  // Add*Context: create a context object, or return the existing one with the same
+  // parameters, so that models asking for the same context share one hash computation.
   template<typename ... Args>
   const BracketContext& AddBracketContext(Args&& ...args) {
     BracketContext tmp(std::forward<Args>(args)...);
@@ -53,12 +66,16 @@ struct ContextManager {
     return sparse_contexts_[sparse_contexts_.size() - 1];
   }
 
+  // UpdateContexts runs every bit; the other Update* functions run once per completed byte.
   void UpdateContexts(int bit);
   void UpdateHistory();
   void UpdateWords();
   void UpdateRecentBytes();
   void UpdateWRTContext();
 
+  // bit_context_: 1 followed by the bits of the current byte seen so far (1..255); at a
+  // byte boundary it briefly holds the completed byte value. The mx* fields are the
+  // contexts of the layer-0 mixers (see Predictor::AddMixers).
   unsigned int bit_context_ = 1, wrt_state_ = 0, bpos=0;
   unsigned long long long_bit_context_ = 1, zero_context_ = 0, history_pos_ = 0,
       line_break_ = 0, longest_match_ = 0, auxiliary_context_ = 0,

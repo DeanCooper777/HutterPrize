@@ -3,6 +3,34 @@
 // probability rows (and capped logits) row by row. Expected divergence:
 // vanilla-softmax reassociation ~4e-6 + KDA exp-family drift <= ~1e-5;
 // anything much larger indicates an integration bug.
+//
+// What it verifies: fx2::opt::TransformerOpt (model_opt.cpp, the model cmix
+// runs) against fx2::Transformer (../model.cpp, the naive reference that
+// test_components / test_e2e tie to the Python model), fed the same tokens
+// and priors. Unlike test_e2e_opt, which only compares an average loss, this
+// compares every probability row, so a localized error cannot hide.
+//
+// Where it sits: the transformer byte model's output is a mixer input in
+// cmix; this test protects the integration in model_opt.cpp / arena_build.cpp
+// (the kernels have their own tests: test_qmat, test_attn, test_kda,
+// test_glue, test_act16).
+//
+// Testing: build with `make test_xcheck` in cpp_infer/ (-> bin/test_xcheck),
+// run as
+//   bin/test_xcheck [--data DIR] [--articles N] [--attn f32|int8] [--gate X]
+//                   [--trace THR]
+// Pass: "VERDICT: PASS" and exit code 0, i.e. the largest absolute
+// probability difference over all rows is <= the gate (default 5e-5).
+// --trace THR prints each row whose difference exceeds THR.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged.
+// [this entry] The optimized model now quantizes four matmul inputs to 16 bits
+// by default (CMIX_ACT16 = 15, see act16.h and arena_build.h); the naive model
+// and the Python reference dumps use the original 8-bit quantizers. Run with
+// the environment variable CMIX_ACT16=0 to compare like with like. The link
+// also needs act16.cpp, which cpp_infer/Makefile (unchanged from the previous
+// winner) does not yet list among the opt objects.
 #include <cmath>
 #include <cstdio>
 #include <cstring>

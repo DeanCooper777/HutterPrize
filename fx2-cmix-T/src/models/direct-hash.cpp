@@ -1,3 +1,7 @@
+// direct-hash.cpp: DirectHash, see direct-hash.h. Not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "direct-hash.h"
 
 DirectHash::DirectHash(const unsigned long long& byte_context,
@@ -28,6 +32,8 @@ void DirectHash::Perceive(int bit) {
       (bit - predictions_[index_][bit_context_]) * divisor;
 }
 
+// Find the slot of the new context: probe up to 20 slots for its checksum or a free slot; if
+// all 20 belong to other contexts, take over the last one and reset its statistics.
 void DirectHash::ByteUpdate() {
   index_ = byte_context_ % predictions_.size();
   for (int i = 0; i < 20; ++i) {

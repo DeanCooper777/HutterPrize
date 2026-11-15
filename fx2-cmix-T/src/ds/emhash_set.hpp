@@ -24,6 +24,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE
 
+// emhash_set.hpp (third party, emhash by Huang Yuanbing): open-addressing hash set.
+// Included by src/predictor.h and src/mixer/lstm.h.
+//
+// Third-party container, used as it is. Not part of the compression method.
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include <cstring>
 #include <string>
 #include <cmath>

@@ -14,6 +14,11 @@
 // ATen: modified from llvm::AlignOf
 // replaced LLVM_ALIGNAS with alignas
 
+// AlignOf.h (third party, LLVM via ATen): aligned storage helper used by SmallVector.h.
+//
+// Third-party container, used as it is. Not part of the compression method.
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #pragma once
 
 #include <cstddef>

@@ -1,3 +1,19 @@
+# train_6m.py: stage 1 of 3 of the previous winner's training recipe: train the ~6M-parameter
+# transformer byte model from scratch, unquantized, in bfloat16, on plain next-token
+# cross-entropy (320 epochs over the enwik9 token stream).
+#
+# Inputs (data/): ppmd-bytes.uint8 (token stream), ppmd-probs.float16 (PPMD prior per token),
+# article-boundaries.int32, all written by the compressor (make_training_data.sh).
+# Output: models/6m.tch, the input of stage 2 (quantize.py), then stage 3 (cooldown.py).
+#
+# Where it fits: training side; the weights eventually ship inside the compressor binary.
+# This entry did NOT rerun this stage: its weights start from the previous winner's stage-2
+# checkpoint and are fine-tuned by train_A_finetune.py / cooldown_A.py.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.train_6m
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch
@@ -15,6 +31,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -25,6 +42,8 @@ def main() -> None:
     micro_batch_tokens: int = 2**20 // world_size
     max_article_tokens: int | None = 2**17
 
+    # The model. The architecture must stay identical across the three stages and equal to
+    # make_reference_config in pysrc/export_weights.py (which the C++ inference hard-codes).
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -105,6 +124,7 @@ def main() -> None:
     warmup_learning_rate_multiplier: int = 8
     final_learning_rate_multiplier: float = 0.025
 
+    # One optimizer step = 2**20 tokens in total, split evenly over the GPUs.
     data = CollatedArticlesDataLoader(
         tokens_filename="data/ppmd-bytes.uint8",
         priors_filename="data/ppmd-probs.float16",
@@ -125,6 +145,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

@@ -1,3 +1,11 @@
+// indirect-hash.h: two-step ("indirect") context: a hash of the last order1 bytes selects a
+// slot that remembers what followed that hash last time; the remembered history is the context.
+//
+// Inherited from cmix. Compiled, but not instantiated by this entry (the indirect contexts this
+// entry uses, ind1, ind2, ind3 and ind5, are computed directly in src/context-manager.cpp).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #ifndef INDIRECT_HASH_H
 #define INDIRECT_HASH_H
 

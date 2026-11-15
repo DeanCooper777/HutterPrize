@@ -1,3 +1,28 @@
+// phda9_preprocess.h: enwik9-specific, reversible text transform applied to the
+// reordered main part before the generic cmix preprocessor (the section marked "WIT"
+// below). It makes the XML / wiki markup shorter and more regular:
+//   - HTML entities are abbreviated (&amp; &quot; &lt; &gt; and the double-escaped
+//     &amp;quot; ... forms; numeric &#NNN; entities become UTF-8 behind an escape byte);
+//   - single and double runs of { } [ ] & are swapped ("[[" is the common case in wiki
+//     text, so it becomes the one-byte form);
+//   - the per-page header lines between </title> and the article text (<id>,
+//     <timestamp>, <contributor> ...) are taken out of the text and stored compactly in
+//     a separate "header" stream (ids as differences, timestamps as numbers);
+//   - the interlanguage links at the end of each article are moved to a separate
+//     "lang" stream.
+// Output file layout (encode_txt_wit):
+//   line 1: the size of the tail in decimal, padded with spaces to 21 characters;
+//   the transformed main text;
+//   the tail: "<header size>\n<lang size>\n", the header stream, the lang stream.
+// Also here: cat() (file concatenation) and the wfgets / wfputs line helpers that
+// article_reorder.h uses.
+//
+// Place in the pipeline: split -> reorder -> [phda9 transform] -> cmix preprocessor
+// (WRT dictionary) -> models. phda9_prepr() is called by "cmix -e", phda9_resto() by
+// the self-extracting decompressor (main() in runner.cpp).
+//
+// Unchanged from the previous winning entry.
+
 #ifndef PREPR_H 
 #define PREPR_H 
 
@@ -10,11 +35,13 @@ typedef unsigned short U16;
 typedef unsigned int   U32;
 typedef uint64_t       U64;
 
+// 64-bit file position and block I/O helpers.
 void setpos(FILE *file, U64 newpos) { fseeko(file, newpos, SEEK_SET); }
 U64 curpos(FILE *file) { return ftello(file); }
 U64 blockread(FILE *file,U8 *ptr, U64 count) {return fread(ptr,1,count,file);}
 U64 blockwrite(FILE *file,U8 *ptr, U64 count) {return fwrite(ptr,1,count,file);}
 
+// Anonymous temporary file (the WINDOWS branch is upstream's).
 FILE* tmpfile2(void){
     FILE *f;
 #ifdef WINDOWS  
@@ -41,6 +68,7 @@ FILE* tmpfile2(void){
 
 // WIT
 typedef enum {FDECOMPRESS, FCOMPARE, FDISCARD} FMode;
+// Number of continuation bytes that follow a UTF-8 lead byte.
 const char UTF8bytes[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -65,6 +93,7 @@ int utf8len(char *s){
     return UTF8bytes[(U32)(U8)s[0]] + 1;
 }
 
+// Reads one line including its '\n'; returns its length (0 at end of file).
 int wfgets(char *str, int count, FILE  *fp) {
     int c, i = 0;
     while (i<count-1 && ((c=getc(fp))!=EOF)) {
@@ -145,6 +174,7 @@ int numlen(char *str) {
 } 
 // reduce
 //re3
+// Decoder: "&&" -> "&amp;", "&\"" -> "&quot;", "&<" -> "&lt;", "&>" -> "&gt;".
 void hent1(char *in,char *out){
     int j, k;
     do {
@@ -161,6 +191,7 @@ void hent1(char *in,char *out){
   while (j!=0);
 }
 // reverse html entity numbers
+// Decoder: '&', escape byte 5, UTF-8 character -> "&#NNN;".
 void hent6(char *in,char *out){
     int j, k;
     do {
@@ -183,6 +214,8 @@ void hent6(char *in,char *out){
   while (j!=0);
 }
 //re4
+// Decoder: after "&amp;", a marker character -> the entity name it stands for
+// ("quot;", "lt;", "gt;", "nbsp;", "ndash;", "mdash;", "deg;", "times;").
 void hent3(char *in,char *out) {
     int j, k;
     do {
@@ -211,6 +244,8 @@ void hent3(char *in,char *out) {
   while (j!=0);
 }
 //pre3
+// Encoder: "&amp;" -> "&&" (followed by byte 3 if the next character could be mistaken
+// for a marker), "&quot;" -> "&\"", "&lt;" -> "&<", "&gt;" -> "&>".
 void hent(char *in,char *out){
     int j, k;
     do {
@@ -243,6 +278,7 @@ void hent(char *in,char *out){
   while (j!=0);
 }
 //pre4
+// Encoder: after "&&" (was "&amp;"), an entity name -> its one-character marker.
 void hent2(char *in,char *out){
     int j, k;
     char *start = in;
@@ -276,6 +312,7 @@ void hent2(char *in,char *out){
 }
 //Html Entity numbers
 //&#
+// Encoder: "&&#NNN;" with NNN > 255 -> '&', escape byte 5, the character in UTF-8.
 void hent5( char *in,char *out){
     int j, k;
     do {
@@ -300,6 +337,8 @@ void hent5( char *in,char *out){
   while (j!=0);
 }
 
+// Both directions (it is its own inverse): for each of { } [ ] &, a run of one becomes a
+// run of two and a run of two becomes a run of one; longer runs are kept.
 void hent9( char *in,char *out){
     int j, k;
      int t=0;
@@ -332,6 +371,7 @@ void hent9( char *in,char *out){
 
 
 }
+// Plain string copy.
 void skipline( char *in,char *out ){
     int j;
     do {
@@ -340,6 +380,8 @@ void skipline( char *in,char *out ){
     while (j!=0);
 }
 // &" -> "   for now
+// Encoder, inside article text: drop the '&' in front of '"', '<' and '>' (after the
+// first `skip` characters of the line). restoreamp puts it back.
 void removeamp( char *in,char *out ,int skip){
     int j;
     for (int i=0;i<skip;i++) {j=*in++; *out++=j;
@@ -366,6 +408,9 @@ void restoreamp( char *in,char *out,int skip ){
       while (j!=0); 
 }
 
+// Encoder: recognizes the block of interlanguage links ("[[xx:...]]" lines) at the end
+// of an article's text and writes those lines to the lang stream `o` instead of `out`.
+// Keeps its state (line counters, inside-block flag) in static variables.
 void henttail( char *in,char *out,FILE *o){
     int c, i=0,  j=0;
     static  int lnu=0,f=0, b1=0, lc=0,co=0;
@@ -473,6 +518,8 @@ void henttail( char *in,char *out,FILE *o){
     }
 }
 
+// Decoder: at the line that closes an article's text, re-inserts that article's
+// interlanguage links from the lang stream (p2, consumed through the static p4).
 void henttail1( char *in,char *out,FILE *o,char *p2){
     int i, j, k;
     static int c=0 ,lnu=0, f=0;
@@ -520,6 +567,10 @@ void henttail1( char *in,char *out,FILE *o,char *p2){
 // above needs global vars to remove some functions (less code)
 // 
 // wit restore
+// Inverse transform. Reads the tail size from line 1, loads the header and lang streams
+// from the tail, then walks the main text line by line: after each </title> line it
+// rebuilds the page header lines from the header stream, and every text line goes
+// through the inverse entity / bracket steps.
 void decode_txt_wit(FILE*in,  FILE*out1,U64 size){
     char s[8192*8];
     char o[8192*8];
@@ -665,6 +716,8 @@ void decode_txt_wit(FILE*in,  FILE*out1,U64 size){
    
 }
 
+// Forward transform (see the layout at the top of this file). out3 collects the header
+// stream, out1 the lang stream; the state f tracks where in a page header the scan is.
 void encode_txt_wit(FILE* in, FILE* out) {
     char s[8192*8];
     char o[8192*8];
@@ -822,6 +875,7 @@ void encode_txt_wit(FILE* in, FILE* out) {
 // end WIT
 
 
+// filename_to = filename_from1 followed by filename_from2.
 bool cat(char const * filename_from1, char const * filename_from2, char const * filename_to) {
   FILE* ifile1 = fopen(filename_from1, "rb");
   FILE* ifile2 = fopen(filename_from2, "rb");
@@ -846,6 +900,7 @@ bool cat(char const * filename_from1, char const * filename_from2, char const * 
   return true;
 }
 
+// Compression: .main_reordered -> .main_phda9prepr
 int phda9_prepr() {
    // open files
   FILE *in=fopen(".main_reordered", "rb");
@@ -860,6 +915,7 @@ int phda9_prepr() {
   return 0;
 }
 
+// Decompression: .main_decomp -> .main_decomp_restored
 int phda9_resto() {
     
   FILE *in=fopen(".main_decomp", "rb");

@@ -1,4 +1,13 @@
 #!/bin/sh
+# dyn_try.sh: one trial run for tuning the online adaptation ("dynamic evaluation") of the
+# transformer's output layer (Predictor::DynApply / DynLearn in fx2-cmix-T/src/predictor.cpp).
+#
+# Testing: an experiment tool only (Windows development machine, Git Bash). It writes the
+# given "name value" pairs to a CMIX_TUNE file and runs a development build on a test prefix.
+# By default only the transformer is run (--transformer-only) and the script prints the
+# transformer's loss; with MODE=full the whole compressor runs and the output size counts.
+# Inputs: data/<file>, the weights file, the dictionary. Environment: EXE (binary under
+# build/), MODE. Output: runs/dyn/<tag>/ (p.tune, log.txt, out). New in this entry.
 # usage: dyn_try.sh <file> <tag> "name val" ...   -- transformer-only loss run
 f=$1; tag=$2; shift 2
 R=/c/Dean/Projects/HutterPrize

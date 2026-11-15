@@ -1,3 +1,12 @@
+// lstm-layer.hpp: implementation of LstmLayer (see lstm-layer.h). Included at the end of
+// lstm-layer.h.
+//
+// UPDATE_LIMIT is a compile-time definition (-DUPDATE_LIMIT=..., set in
+// build_and_construct_comp.sh): after that many updates the step size and the Adam bias
+// corrections stop changing.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "lstm-layer.h"
 
 #include "sigmoid.h"
@@ -35,6 +44,8 @@ namespace {
 //   return __tmp;
 // }
 
+// One Adam step on weights w with gradient g and moment estimates m, v. The step size
+// decays with the update count t until t reaches UPDATE_LIMIT.
 inline void Adam(std::valarray<float>* g, std::valarray<float>* m,
     std::valarray<float>* v, std::valarray<float>* w, float learning_rate,
     float t) {
@@ -73,6 +84,8 @@ inline LstmLayer::LstmLayer(unsigned int input_size, unsigned int auxiliary_inpu
     forget_gate_(input_size, num_cells, horizon, output_size_ + input_size_),
     input_node_(input_size, num_cells, horizon, output_size_ + input_size_),
     output_gate_(input_size, num_cells, horizon, output_size_ + input_size_) {
+  // Random uniform start in [-val, val]. rand() is seeded identically in the compressor and
+  // the decompressor, so both start from the same weights.
   float val = sqrt(6.0f / float(input_size_ + output_size_));
   float low = -val;
   float range = 2 * val;
@@ -86,6 +99,8 @@ inline LstmLayer::LstmLayer(unsigned int input_size, unsigned int auxiliary_inpu
   }
 }
 
+// One time step: compute the three gates, update the cell state and write this layer's
+// hidden output into hidden[hidden_start ...].
 inline void LstmLayer::ForwardPass(const std::valarray<float>& input, int input_symbol,
     std::valarray<float>* hidden, int hidden_start) {
   last_state_[epoch_] = state_;
@@ -109,6 +124,8 @@ inline void LstmLayer::ForwardPass(const std::valarray<float>& input, int input_
   if (epoch_ == horizon_) epoch_ = 0;
 }
 
+// Pre-activations of one gate: the weight column of the previous symbol (a one-hot input)
+// plus the weighted input vector, followed by layer normalization (gamma_, beta_).
 inline void LstmLayer::ForwardPass(NeuronLayer& neurons,
     const std::valarray<float>& input, int input_symbol) {
   for (unsigned int i = 0; i < num_cells_; ++i) {
@@ -132,6 +149,9 @@ inline void LstmLayer::ClipGradients(std::valarray<float>* arr) {
   }
 }
 
+// Backpropagation for one time step (called from the last step of the horizon back to the
+// first): turn the error of the hidden output into errors of the three gates and of the
+// cell state, and pass the rest on to the previous time step and the layer below.
 inline void LstmLayer::BackwardPass(const std::valarray<float>&input, int epoch,
     int layer, int input_symbol, std::valarray<float>* hidden_error) {
   if (epoch == (int)horizon_ - 1) {
@@ -169,6 +189,10 @@ inline void LstmLayer::BackwardPass(const std::valarray<float>&input, int epoch,
   ClipGradients(hidden_error);
 }
 
+// Backpropagation through one gate: through the layer normalization, into the gradient sums,
+// and into the errors for the layer below (hidden_error) and the previous time step
+// (stored_error_). At the first time step of the horizon (epoch 0) the summed gradients are
+// applied with Adam.
 inline void LstmLayer::BackwardPass(NeuronLayer& neurons,
     const std::valarray<float>&input, int epoch, int layer, int input_symbol,
     std::valarray<float>* hidden_error) {

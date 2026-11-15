@@ -1,3 +1,21 @@
+// arena_build.cpp - OptModel::load: reads the weights file and lays every
+// matrix out in the order the forward pass reads it (see arena_build.h for
+// the stream order and for which sites use 16-bit activations).
+//
+// How it fits: load-time only (once per run, compiled -Os in the submission
+// makefile). Input: the tensors of weights_io.h (raw FX2TFW01 or the
+// compressed FX2TFWC1/2 file, same tensors). Output: the pool that
+// model_opt.cpp streams through for every byte.
+//
+// Testing: CMIX_ACT16 (environment) selects the 16-bit sites; every test or
+// bench that constructs a TransformerOpt runs this code.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] cols16 / rows16 builders and the CMIX_ACT16 switch: nibble
+//   packed weights + folds for the 16-bit activation kernels of act16.h.
+//   The weights file is unchanged; only the activation scale is divided by
+//   256 here.
+// - [this entry] Windows (VirtualAlloc) branch of HugeBuf, for development.
 #include "arena_build.h"
 
 #include "act16.h"
@@ -33,6 +51,8 @@ constexpr size_t round64(size_t x) { return (x + 63) & ~size_t(63); }
 
 }  // namespace
 
+// Allocates n bytes rounded up to 2 MB, zeroed. Linux: anonymous mmap with a
+// transparent-huge-page hint. [this entry] Windows: VirtualAlloc.
 void HugeBuf::alloc(size_t n) {
   bytes = (n + (size_t(2) << 20) - 1) & ~((size_t(2) << 20) - 1);
 #ifdef _WIN32
@@ -79,6 +99,9 @@ void OptModel::load(const char* weights_path) {
       if ((ck.i32()[i] != 0) != KIMI_L[i]) die("config.kimi mismatch");
   }
 
+  // One 16 MB pool holds the whole weight stream. take(n) returns the next
+  // 64-byte-aligned block of it, so the order of the take calls below IS the
+  // memory order.
   pool.alloc(size_t(16) << 20);
   size_t off = 0;
   auto take = [&](size_t n) -> uint8_t* {
@@ -89,7 +112,9 @@ void OptModel::load(const char* weights_path) {
     return q;
   };
 
-  // dense arena site in stream order
+  // dense arena site in stream order (8-bit input). fold[o] = activation
+  // scale * weight scale of row o: the one fp32 factor that turns the integer
+  // dot product into the fp32 output.
   auto qsite = [&](const std::string& prefix, int d_out, int d_in,
                    bool biased) -> QSite {
     const WTensor& wq =
@@ -131,13 +156,25 @@ void OptModel::load(const char* weights_path) {
     return qsparse4_build(cols, foldp, wq.i8(), fold.data(), D, d_in);
   };
 
+  // unquantized fp32 weights copied into the stream at their point of use
   auto f32block = [&](const float* src, size_t n) -> float* {
     float* p = reinterpret_cast<float*>(take(sizeof(float) * n));
     std::memcpy(p, src, sizeof(float) * n);
     return p;
   };
 
+  // [this entry] which matmul inputs are quantized to 16 bits (arena_build.h)
+  // The official build (-DCMIX_OFFICIAL) uses the default only: nothing in the environment of
+  // the machine that decompresses may change a prediction.
+#ifndef CMIX_OFFICIAL
   if (const char* e = std::getenv("CMIX_ACT16")) act16 = std::atoi(e);
+#endif
+  // [this entry] Builder for a 192-output site with 16-bit input: mlp.down
+  // (by_rows = false: one packed column per input, for the sparse kernel
+  // spmv16p_add) and the attention output projection (by_rows = true, for
+  // gemv16p_add). The 16-bit quantizer has 256 times as many levels over the
+  // same range, so its step is the stored scale / 256; 1/256 is a power of
+  // two, so that multiply is exact.
   // 16-bit activation path (act16.h), in the stream at the place of the
   // 8-bit arena it replaces: nibble-packed weights (96 B per column, or per
   // row if by_rows) + fold with the activation scale / 256 (exact); for rows also
@@ -183,7 +220,46 @@ void OptModel::load(const char* weights_path) {
     *foldp = f;
   };
 
+  // [this entry] Builder for mlp.up (768 rows) and the q / k / v projections
+  // (192 rows), kernel gemv16p_set. k[o] = 128 * (sum of row o's weights)
+  // undoes the re-centring of the activation's low byte (act16.cpp).
+  // packed-row site with 192 inputs and d_out rows (act16 bits 4 and 8)
+  auto rows16 = [&](const std::string& prefix, int d_out) -> Rows16 {
+    const WTensor& wq =
+        wf.get(prefix + ".weight.q", DT_I8,
+               {static_cast<uint32_t>(d_out), static_cast<uint32_t>(D)});
+    const WTensor& ws = wf.get(prefix + ".weight.scale", DT_BF16,
+                               {static_cast<uint32_t>(d_out)});
+    const WTensor& sa =
+        wf.get(prefix + ".quantize_activation.scale", DT_BF16, {1});
+    Rows16 r;
+    r.s16 = bf16_to_f32(sa.bf16_bits()[0]) * (1.0f / 256.0f);
+    float* f = reinterpret_cast<float*>(take(sizeof(float) * d_out));
+    for (int o = 0; o < d_out; o++)
+      f[o] = r.s16 * bf16_to_f32(ws.bf16_bits()[o]);
+    const int8_t* q = wq.i8();
+    for (size_t i = 0; i < size_t(d_out) * D; i++)
+      if (q[i] < -7 || q[i] > 7) die("act16: weight outside [-7, 7]");
+    int32_t* k = reinterpret_cast<int32_t*>(take(sizeof(int32_t) * d_out));
+    uint8_t* c = take(size_t(d_out) * (D / 2));
+    for (int o = 0; o < d_out; o++) {
+      int32_t sum = 0;
+      for (int i = 0; i < D; i++) sum += q[size_t(o) * D + i];
+      k[o] = 128 * sum;
+      pack16_nibbles(q + size_t(o) * D, D, c + size_t(o) * (D / 2));
+    }
+    r.rows = c;
+    r.k = k;
+    r.fold = f;
+    return r;
+  };
+  if ((act16 & 4) && !(act16 & 1)) die("CMIX_ACT16: bit 4 needs bit 1");
+  const char* const qkv_names[3] = {"query_projection", "key_projection",
+                                    "value_projection"};
+
   // ---- stream, in per-token consumption order ----
+  // prior embedding: 192 x 205, input = the PPMD prior probabilities quantized
+  // to 8 bits (mostly zeros), int4 column arena for the sparse kernel
   prior = qsp4("prior_embedding", V, &prior_s_act);
 
   {
@@ -201,11 +277,18 @@ void OptModel::load(const char* weights_path) {
     std::string a = b + "attention.";
 
     if (KIMI_L[l]) {
+      // Kimi layer: q/k/v projections, forget gate and output gate (each a
+      // low-rank 192 -> 64 -> 192 pair), fp32 extras, output projection
       KimiArenas& L = kimi[ki];
       layer2kimi[l] = ki;
-      L.qp = qsite(a + "query_projection", D, D, true);
-      L.kp = qsite(a + "key_projection", D, D, true);
-      L.vp = qsite(a + "value_projection", D, D, true);
+      // [this entry] 16-bit packed rows instead of the 8-bit dense arenas
+      if (act16 & 8) {
+        for (int c = 0; c < 3; c++) qkv16[l][c] = rows16(a + qkv_names[c], D);
+      } else {
+        L.qp = qsite(a + "query_projection", D, D, true);
+        L.kp = qsite(a + "key_projection", D, D, true);
+        L.vp = qsite(a + "value_projection", D, D, true);
+      }
       L.fg_up = qsite(a + "forget_gate_projection.up", DH, D, true);
       L.fg_down = qsite(a + "forget_gate_projection.down", D, DH, true);
       L.og_up = qsite(a + "output_gate_projection.up", DH, D, true);
@@ -239,6 +322,7 @@ void OptModel::load(const char* weights_path) {
         const WTensor& al = wf.get(a + "log_baseline_decay_rate", DT_F32, {NH});
         for (int h = 0; h < NH; h++) L.kw.a_neg[h] = -std::exp(al.f32()[h]);
       }
+      // [this entry] output projection with a 16-bit input
       if (act16 & 2)
         cols16(a + "output_projection", D, true, &op16[l], &op_fold16[l],
                &op_s16[l], &op_k16[l]);
@@ -246,11 +330,18 @@ void OptModel::load(const char* weights_path) {
         L.op = qsite(a + "output_projection", D, D, true);
       ki++;
     } else {
+      // vanilla attention layer: q/k/v projections, output projection, and
+      // the per-head scales of the post-RoPE q/k/v quantizers
       VanArenas& L = van[vi];
       layer2van[l] = vi;
-      L.qp = qsite(a + "query_projection", D, D, true);
-      L.kp = qsite(a + "key_projection", D, D, true);
-      L.vp = qsite(a + "value_projection", D, D, true);
+      // [this entry] 16-bit variants, as in the Kimi branch
+      if (act16 & 8) {
+        for (int c = 0; c < 3; c++) qkv16[l][c] = rows16(a + qkv_names[c], D);
+      } else {
+        L.qp = qsite(a + "query_projection", D, D, true);
+        L.kp = qsite(a + "key_projection", D, D, true);
+        L.vp = qsite(a + "value_projection", D, D, true);
+      }
       if (act16 & 2)
         cols16(a + "output_projection", D, true, &op16[l], &op_fold16[l],
                &op_s16[l], &op_k16[l]);
@@ -268,7 +359,12 @@ void OptModel::load(const char* weights_path) {
       vi++;
     }
 
-    mlp[l].up = qsite(b + "mlp.up", DMLP, D, true);
+    // MLP of the layer: up (768 x 192) then down (192 x 768)
+    // [this entry] 16-bit inputs: packed rows for up, packed columns for down
+    if (act16 & 4)
+      up16[l] = rows16(b + "mlp.up", DMLP);
+    else
+      mlp[l].up = qsite(b + "mlp.up", DMLP, D, true);
     if (act16 & 1)
       cols16(b + "mlp.down", DMLP, false, &down16[l], &down_fold16[l],
              &down_s16[l], nullptr);
@@ -277,6 +373,7 @@ void OptModel::load(const char* weights_path) {
   }
   if (ki != 9 || vi != 3) die("layer pattern mismatch");
 
+  // output layer: 205 logits from the final hidden state (8-bit input)
   unembed = qsite("unembedding", V, D, true);
   stream_bytes = round64(off);
 
@@ -292,6 +389,9 @@ void OptModel::load(const char* weights_path) {
     tok_table = table;
   }
 
+  // RoPE sin / cos tables for the vanilla layers (the FX2TFWC2 weights file
+  // does not store them: its decoder, weights_io_compressed.cpp, recomputes
+  // them bit-exactly)
   {
     const WTensor& fi = wf.get("rope.inv_freq", DT_F32, {32});
     std::memcpy(inv_freq, fi.f32(), sizeof(inv_freq));

@@ -1,5 +1,28 @@
 // test_components: stream the diagnostic dump articles through the C++
 // transformer and compare every dumped intermediate component (SPEC section 5)
+//
+// What it verifies: every intermediate tensor of the NAIVE reference
+// transformer (fx2::Transformer in model.cpp / kernels.cpp): embeddings, each
+// block's input/output, attention and MLP outputs, the KDA ("kimi") layers'
+// internals, the quantized q/k/v of the vanilla-attention layers, final norm,
+// logits and probabilities. Reference = the per-article .npy dumps written by
+// the Python/PyTorch model into <data>/dumps/article<N>/.
+// Each article is run twice: teacher-forced (every block gets the reference
+// block input, so a wrong block is isolated) and chained (normal streaming).
+//
+// Where it sits: with test_e2e.cpp it establishes the naive C++ model as a
+// faithful copy of the trained model. The optimized model in opt/ (the
+// transformer byte model that cmix actually runs and feeds to its mixers) is
+// then proved against this naive model. It protects model.cpp and kernels.cpp.
+//
+// Testing: build with `make test_components` in cpp_infer/
+// (-> bin/test_components), run as
+//   bin/test_components [--data DIR] [--articles 0,4,22] [--save-logits PREFIX]
+// Pass: the final line starts with "PASS: no gross errors" and the exit code
+// is 0. A failure lists each component that broke a gate and exits 1. The
+// per-component tables are for human review.
+//
+// Unchanged from the previous winning entry.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +37,8 @@
 
 namespace {
 
+// Layer types of the 12 blocks: true = KDA ("kimi") layer, false = vanilla
+// attention layer (every fourth block). Decides which dumps exist per layer.
 constexpr bool KIMI[12] = {true, true, true,  false, true, true,
                            true, false, true, true,  true, false};
 
@@ -25,6 +50,8 @@ const std::set<std::string> CLEAN_UPSTREAM = {
     "00_kimi_beta_raw", "00_kimi_out_gate", "00_kimi_gate_in",
 };
 
+// Error statistics of one component (one dump file), accumulated over all
+// dumped positions of an article.
 struct Cmp {
   fx2::Npy ref;
   double max_abs = 0;
@@ -53,6 +80,8 @@ struct Cmp {
   }
 };
 
+// Names of all dumped components, "<layer>_<component>"; they are both the
+// .npy file names and the names the model passes to the capture callback.
 std::vector<std::string> component_names() {
   std::vector<std::string> names;
   names.push_back("00_x0");
@@ -149,6 +178,8 @@ ArticleResult run_article(fx2::Transformer& model, const fx2::TestData& td,
     return 3;
   };
 
+  // The model calls this for every named intermediate at every step; the row
+  // for position cur_t of the matching dump is compared element by element.
   long cur_t = 0;
   model.set_capture([&](const char* name, const float* d, int n) {
     auto it = comps.find(name);
@@ -358,6 +389,7 @@ int main(int argc, char** argv) {
   td.load(dir, /*with_ref_probs=*/false);
   fx2::Transformer model((dir + "/weights.bin").c_str());
 
+  // Each article: teacher-forced pass first (tight gate), then chained pass.
   bool failed = false;
   std::vector<std::string> all_failures;
   for (int a : articles) {

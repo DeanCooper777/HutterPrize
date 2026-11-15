@@ -26,6 +26,20 @@
 //
 // Compiled with -ffp-contract=off: scalar glue in THIS file has pinned
 // rounding; intended fusions are written as std::fmaf.
+//
+// Where it sits: kda.cpp is the recurrent-state ("kimi" / KDA) layer used by
+// nine of the twelve blocks of the transformer byte model that cmix runs;
+// kda_math.h holds its vector exp-family functions. This test protects
+// kda.cpp, kda.h and kda_math.h.
+//
+// Testing: build with `make -C cpp_infer/src/opt -f Makefile.kda`
+// (-> cpp_infer/bin/opt-kda/test_kda), run as
+//   test_kda [--data DIR] [--quick] [--only math|sweep|drift|dumps] [--twopass]
+// [dumps] needs the data directory with weights.bin and the article dumps.
+// Pass: the last line is "PASS" and the exit code is 0; a broken gate prints
+// its name, value and limit, and the run ends with "FAIL" and exit code 1.
+//
+// Unchanged from the previous winning entry.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

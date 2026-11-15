@@ -4,6 +4,27 @@
 // shorter than the window, and the t=1023 -> 1024 transition. Also produces
 // the real-data skip statistics: kept-count distribution and the exact-vs-skip
 // output deviation.
+//
+// Reference: the naive attention of ../kernels.h (attention_step_var /
+// attention_step_fixed), itself validated against the Python model by
+// ../test_components.cpp. The production int8-K layout (AttnKV) must match it
+// within a small relative gate (float summation order differs); the int16-K
+// and fp32-V layouts must be bitwise equal to the int8-K result.
+//
+// Where it sits: attn.cpp is the attention of the three vanilla-attention
+// layers (3, 7, 11) of the transformer byte model that cmix runs; this test
+// protects attn.cpp / attn.h.
+//
+// Testing: build (from cpp_infer/src/opt) with `make -f Makefile.attn`
+// (-> ../../bin/opt-attn/test_attn), run as
+//   test_attn [--capture FILE] [--no-real]
+// The real-data part needs the file written by capture_qkv; --no-real runs
+// only the random part. Pass: the last line starts with "PASS: optimized
+// attention matches the naive reference" and the exit code is 0; otherwise
+// "FAIL ..." lines and exit code 1. The threshold sweep at the end is
+// information only (it shows what stronger skipping would prune).
+//
+// Unchanged from the previous winning entry.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

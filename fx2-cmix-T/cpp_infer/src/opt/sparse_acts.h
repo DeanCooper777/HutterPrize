@@ -10,6 +10,13 @@
 //   kernel for dense rows.
 // This struct (embedded signed values) remains for compositions that do not
 // link qmat_sparse; both describe the same ascending nonzero index set.
+//
+// How it fits: included by glue.h for prior_quant. The model (model_opt.cpp)
+// uses prior_quant_raw + qsparse_make_idx instead, so this struct is only
+// exercised by test_glue / bench_glue.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <cstdint>

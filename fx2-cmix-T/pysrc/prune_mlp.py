@@ -1,3 +1,15 @@
+# prune_mlp.py: experiment tool that narrows the MLPs of a trained checkpoint.
+#
+# Where it fits: training side, between two training runs. It was used to test whether a
+# smaller transformer (fewer weight bytes, which count twice in the score, and less CPU time)
+# could be cut out of the trained model and repaired by a short fine-tune. The C++ side of the
+# same experiment is the build constant FX2_DMLP; the recipes take the width as A_DMLP.
+#
+# Testing: this is a testing / experiment tool only. The result was rejected (the archive grew
+# far more than the weights shrank, see docs/NEW_TRANSFORMER_PLAN.md and SUBMISSION.md); the
+# shipped model keeps the full MLP width of 768.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
 """Shrink every MLP of a checkpoint from width 768 to a smaller width (phase 2
 of docs/NEW_TRANSFORMER_PLAN.md, 2026-11-08).
 
@@ -22,6 +34,8 @@ def main() -> None:
     prefixes = sorted({m.group(1) for k in sd if (m := re.match(r"(.*mlp)\.up\.weight$", k))})
     assert prefixes, "no mlp.up.weight keys found"
     out = dict(sd)
+    # For every MLP: score the hidden units, keep the `width` best (in their original order) and
+    # slice every tensor that is indexed by hidden unit.
     for p in prefixes:
         up, down = sd[p + ".up.weight"], sd[p + ".down.weight"]
         d_mlp = up.shape[0]

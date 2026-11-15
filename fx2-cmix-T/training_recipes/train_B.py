@@ -1,3 +1,14 @@
+# train_B.py: [this entry] experiment "run B". New in this entry (derived from train_6m.py).
+#
+# Question it answered: is a smaller transformer (MLP width 384 instead of 768, about a third
+# fewer weight bytes, which count twice in the score, and less CPU time) good enough when it
+# is trained for cmix from the first step? Result: no. The archive grew far more than the
+# weights shrank, so run B was rejected and the shipped model keeps width 768
+# (docs/NEW_TRANSFORMER_PLAN.md, SUBMISSION.md). Kept as a testing / experiment tool.
+#
+# Outputs: models/B.tch (+ B.mixer.tch), an unquantized bf16 checkpoint.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.train_B
 # Run B of docs/NEW_TRANSFORMER_PLAN.md (2026-11-09): train a smaller
 # transformer from scratch with the cmix mixture loss. Derived from
 # train_6m.py (upstream stage 1, bf16 without quantization); differences:
@@ -27,6 +38,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -38,6 +50,7 @@ def main() -> None:
     assert micro_batch_tokens & (micro_batch_tokens - 1) == 0
     max_article_tokens: int | None = 2**17
 
+    # Same architecture as the 6M model except for d_mlp.
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -140,6 +153,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

@@ -1,3 +1,12 @@
+# quantize_sweep.py: learning-rate sweep helper of the previous winner. Continues QAT from
+# models/6m-q4.tch for 16 epochs at the learning rate given by --learning-rate and logs the
+# loss; it saves nothing. An experiment tool, not part of the recipe.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.quantize_sweep
+#           (plus the argument --learning-rate X)
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch
@@ -17,6 +26,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -29,6 +39,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,
@@ -153,6 +164,9 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

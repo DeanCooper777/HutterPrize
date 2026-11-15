@@ -1,3 +1,18 @@
+// weights_io.cpp - reader for the plain (uncompressed) weights container
+// "FX2TFW01" of SPEC.md section 4: a list of named tensors (int8 quantized
+// weights, bf16 scales, fp32 / int32 extras), plus the checked accessors
+// used by the model loaders.
+//
+// How it fits: the shipped weights are in the compressed FX2TFWC2 form and
+// go through weights_io_compressed.cpp; both readers produce the same
+// WeightsFile, which opt/arena_build.cpp (cmix) or model.cpp (reference)
+// turns into run-time layouts. This plain reader serves tests and
+// development.
+//
+// Testing: test_weights_compressed compares the two readers bit for bit.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #include "weights_io.h"
 
 #include <cstdarg>
@@ -62,6 +77,8 @@ struct Reader {
 
 }  // namespace
 
+// Reads the whole file into memory and parses it: magic, tensor count, then
+// per tensor: name, dtype, shape, raw little-endian data.
 WeightsFile WeightsFile::load(const char* path) {
   FILE* f = std::fopen(path, "rb");
   if (!f) die("cannot open %s", path);
@@ -112,6 +129,8 @@ WeightsFile WeightsFile::load(const char* path) {
   return wf;
 }
 
+// lookups abort with a message when a tensor is missing or has the wrong
+// dtype / shape: a mismatched weights file must never run
 const WTensor& WeightsFile::get(const std::string& name) const {
   auto it = tensors.find(name);
   if (it == tensors.end()) die("missing tensor %s", name.c_str());

@@ -18,6 +18,17 @@
 //   up); the pad elements are owned/overwritten by the callee.
 // - All pointers should be 32B-aligned (loads are issued unaligned, so this
 //   is a performance, not correctness, requirement).
+//
+// How it fits: used by model_opt.cpp (per symbol) and arena_build.cpp
+// (build_normed_embedding_table at load) of the transformer byte model.
+//
+// Testing: test_glue.cpp, bench_glue.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
+// ([this entry] where a matmul input is 16-bit, model_opt.cpp calls the plain
+// rms_norm192 here and the quantizers of act16.h instead of the fused
+// norm + 8-bit quantize functions.)
 #pragma once
 
 #include <cstdint>

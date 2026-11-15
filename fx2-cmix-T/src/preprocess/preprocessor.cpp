@@ -1,5 +1,13 @@
 // This preprocessor is adapted from paq8l, paq8hp12any and paq8px.
 
+// preprocessor.cpp: implementation of the generic cmix preprocessor (see preprocessor.h).
+// Stream format: a sequence of segments, each "type byte, 4-byte big-endian length,
+// payload". A TEXT payload starts with one more byte: 7 if the WRT dictionary transform
+// was applied, 0 if the text is stored as it is.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): WriteSegmentHeader
+// and the matching branch in DecodeByte (vocabulary-safe lengths, Windows build only).
+
 #include <vector>
 #include <cstdlib>
 #include <string.h>
@@ -9,6 +17,8 @@
 
 namespace preprocessor {
 
+// [this entry] See preprocessor.h. With the flag clear, WriteSegmentHeader writes the
+// same 5 bytes as upstream's fprintf did.
 bool g_vocab_safe_lengths = false;
 
 static void WriteSegmentHeader(FILE* out, int type, int len) {
@@ -25,12 +35,16 @@ static void WriteSegmentHeader(FILE* out, int type, int len) {
   }
 }
 
+// Printable ASCII or common white space.
 bool IsAscii(int byte) {
   if (byte >= 9 && byte <= 13) return true;
   if (byte >= 32 && byte <= 126) return true;
   return false;
 }
 
+// Feeds a DEFAULT segment header and then the dictionary's words (newlines turned into
+// spaces) to Predictor::Pretrain, bit by bit, so the context models start out knowing
+// the vocabulary. Nothing is coded; the decompressor repeats it identically.
 void Pretrain(Predictor* p, FILE* dictionary) {
   if (dictionary == NULL) return;
   fseek(dictionary, 0L, SEEK_END);
@@ -65,6 +79,9 @@ void Pretrain(Predictor* p, FILE* dictionary) {
   }
 }
 
+// Finds where the current segment type ends: returns the type of what follows and
+// leaves the file position at the boundary. TEXT starts after a run of more than 500
+// ASCII bytes containing spaces and ends when non-ASCII bytes pile up.
 Filetype detect(FILE* in, int n, Filetype type) {
   long start=ftell(in);
 
@@ -120,6 +137,10 @@ int decode_default(FILE* in) {
   return getc(in);
 }
 
+// TEXT segment: dictionary-transform into a temp file; keep the result only if it is at
+// least 50 bytes shorter. Then remap some punctuation codes ('{'..'~' <-> 'P'..'S',
+// ':'..'?' <-> 'J'..'O', 'X' <-> '`'); Dictionary's NextChar undoes this. The model's
+// character tables (e.g. context-manager.cpp) are written for the remapped codes.
 void encode_text(FILE* in, FILE* out, int len, std::string temp_path,
     FILE* dictionary) {
   if (dictionary == NULL) {
@@ -161,6 +182,7 @@ void encode_text(FILE* in, FILE* out, int len, std::string temp_path,
   remove(path.c_str());
 }
 
+// Decoder state for TEXT segments.
 Dictionary* dict = NULL;
 bool wrt_enabled = true;
 
@@ -180,6 +202,9 @@ int decode_text(FILE* in) {
 }
 
 
+// One segment of at most 2 GB. First pass: measure how much of it detect() calls TEXT.
+// If more than 95%, the whole segment is coded as a single TEXT block (the enwik9 case).
+// Otherwise it is written as DEFAULT blocks, unchanged.
 void EncodeSegment(FILE* in, FILE* out, int n, const std::string& temp_path,
     FILE* dictionary, std::vector<double>* block_stats) {
   Filetype type=DEFAULT;
@@ -231,6 +256,7 @@ void EncodeSegment(FILE* in, FILE* out, int n, const std::string& temp_path,
   }
 }
 
+// Segment lengths are 31-bit.
 const unsigned long long kMaxSegment = 0x80000000 - 1;
 
 void Encode(FILE* in, FILE* out, unsigned long long n, const std::string&
@@ -258,6 +284,8 @@ void NoPreprocess(FILE* in, FILE* out, unsigned long long n) {
   }
 }
 
+// Returns the next original byte, or -1 at the end; reads a segment header whenever the
+// current segment is exhausted.
 int DecodeByte(FILE* in, FILE* dictionary) {
   static Filetype type=DEFAULT;
   static int len=0, reset=0;

@@ -6,6 +6,16 @@
 // Shapes supported (d_out x d_in): any d_out; d_in in {64, 192, 224, 768}.
 // Activations: u8, 32B-aligned, zero-padded to m.stride (biased qa+128 or raw
 // [0,127] depending on the arena's corr convention — see qmat.h).
+//
+// How it fits: called by model_opt.cpp for every matmul with an 8-bit input
+// (see the kernel map at the top of model_opt.cpp).
+//
+// Testing: test_qmat.cpp, bench_qmat.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// the interface is unchanged. [this entry] qmat_dense.cpp gained VNNI and
+// packed-weight implementations behind it (bit-identical results; compiled
+// out of the submitted binary).
 #pragma once
 
 #include "qmat.h"

@@ -1,3 +1,12 @@
+# train_6m_v2.py: a short experimental variant of train_6m.py kept from the previous winner
+# (16 epochs, higher learning rate, learned gains on the query / key normalisation). It writes
+# models/6m-v2.tch. Not part of the recipe that produced any shipped weights; the C++
+# inference does not implement query_key_norm_gain.
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.train_6m_v2
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch
@@ -15,6 +24,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -119,6 +129,9 @@ def main() -> None:
         world_size=world_size,
     )
 
+    # Learning-rate multiplier as a function of training progress: a cosine from
+    # warmup_learning_rate_multiplier down to 1 over the first warmup_epochs, then a cosine from 1
+    # down to final_learning_rate_multiplier.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         if fraction_done < fraction_warmup:

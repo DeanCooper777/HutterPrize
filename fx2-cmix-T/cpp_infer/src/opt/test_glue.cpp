@@ -4,6 +4,27 @@
 //   model.cpp loop shapes), 10k random vectors + edge cases
 // - head: per-element divergence (tanh256/exp256 replace libm) + effect on
 //   -log p[target]
+//
+// Reference: (1) double-precision libm for the vector math functions
+// (errors measured in ulp); (2) the naive kernels of ../kernels.cpp for the
+// glue operations (RMS norm + quantize, residual updates, rope, the PPMD
+// prior path, embedding combine), which must match bit for bit; (3) the naive
+// libm head for the output head, where a small bounded difference is allowed
+// because vectorized tanh/exp replace libm.
+//
+// Where it sits: glue.cpp / vec_math.h hold everything in the transformer
+// byte model that is not a matmul, attention or KDA kernel, up to the
+// probabilities handed to cmix's mixers. vec_math.h uses true divides, not
+// reciprocal estimates, so results do not depend on the CPU vendor (see the
+// makefile's -mrecip=none note). This test protects glue.cpp, glue.h,
+// vec_math.h and sparse_acts.h.
+//
+// Testing: build (from cpp_infer/) with `make -f src/opt/Makefile.glue`
+// (-> bin/test_glue), run without arguments. Pass: the last line is
+// "ALL PASS (0 failures)" and the exit code is 0; every broken check prints
+// "FAIL <file>:<line>: ...". FTZ/DAZ must be off (printed at the start).
+//
+// Unchanged from the previous winning entry.
 #include <immintrin.h>
 
 #include <cfloat>

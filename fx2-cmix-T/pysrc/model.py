@@ -1,3 +1,32 @@
+# model.py: the PyTorch definition of the transformer byte model (training side).
+#
+# What it is: a small causal transformer that predicts the next symbol of the preprocessed
+# enwik9 stream (205-symbol vocabulary). Besides the previous tokens it receives PPMD's
+# distribution for the next token (the "prior") as an input. The shipped configuration
+# (pysrc/export_weights.py, make_reference_config) has 12 layers of width 192 and an MLP width
+# of 768; three layers out of every four use Kimi linear attention (a recurrent, constant-memory
+# attention) and the fourth uses ordinary sliding-window attention over the last 1024 tokens.
+# All large matrices are trained with fake quantization (pysrc/quantization.py): 15-level
+# weights, 256-level matmul inputs.
+#
+# Where it fits: this file is only used for training and for producing reference outputs.
+# The compressor does not run PyTorch; it runs the hand-written integer inference in
+# cpp_infer/, which re-implements exactly the forward pass below (see cpp_infer/SPEC.md) on
+# the weights exported by pysrc/export_weights.py. In the compressor the model's output
+# distribution is one input of cmix's mixers:
+# preprocess -> dictionary -> context models / PPMD / [this model] -> mixers -> SSE -> coder.
+#
+# Testing: pysrc/export_testdata.py dumps activations of this model for the C++ unit tests;
+# pysrc/kda_reference.py is a plain re-implementation of the Kimi recurrence.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1):
+#   - [this entry] Transformer.forward(..., return_logits=True) returns the logits instead of
+#     the cross-entropy, so that the cmix-aware loss (pysrc/cmix_loss.py) can be computed
+#     outside the module.
+#   - [this entry] the host copy of the sequence boundaries is handed to the fla kernels
+#     (varlen_cpu_values, cu_seqlens_cpu) and the squeezed boundary tensor is shared by all
+#     layers. Training speed only: it removes GPU synchronisation points.
+#   - The architecture and the arithmetic are unchanged.
 from fla.ops.kda import chunk_kda
 from fla.modules import FusedRMSNormGated
 from fla.modules.conv.causal_conv1d import causal_conv1d
@@ -42,6 +71,7 @@ from pysrc.attention_function import (
 from pysrc.quantization import Quantize, Quantization
 
 
+# [this entry] training-speed helper, see the header.
 def varlen_cpu_values(cu_seqlens: Tensor | None) -> Tensor | None:
     """the host copy of a varlen boundary tensor that pysrc/data.py attaches
     (as .cpu_values), or None; fla syncs to fetch it itself when it is None"""
@@ -52,12 +82,17 @@ ActivationFunctionName = Literal["gelu", "new_gelu", "relu_squared"]
 WeightInit = Literal["kaiming_uniform", "normal", "zero"]
 
 
+# Quantizers of one matrix product: for the weight matrix and for its input vector.
 @dataclass(frozen=True, slots=True)
 class MatmulQuantization:
     weight: Quantization | None
     activation: Quantization | None
 
 
+# Every architectural switch of the model. Many options are leftovers of the previous
+# winner's architecture search and are off in the shipped model; the values that matter are
+# the ones in make_reference_config (pysrc/export_weights.py), which the C++ hard-codes.
+# The *_quantization fields say which matrices are quantized and how (None = left in fp32).
 @dataclass(frozen=True, slots=True)
 class TransformerConfig:
     vocabulary_size: int
@@ -168,6 +203,7 @@ class TransformerConfig:
             assert self.query_key_norm
 
 
+# Parameter-free RMS normalisation over the last dimension (the model's only normalisation).
 def rms_norm(x: Float[Tensor, "... d"]) -> Float[Tensor, "... d"]:
     return torch.nn.functional.rms_norm(x, normalized_shape=(x.size(-1),))
 
@@ -196,12 +232,17 @@ def initialize_weight(
     return weight
 
 
+# Passed down the forward pass during scale calibration: how many calibration steps the
+# weight / activation quantizers should average over (None = not calibrating, quantize).
 @dataclass(frozen=True, slots=True)
 class InitializeScales:
     weight_steps: int | None
     activation_steps: int | None
 
 
+# A linear layer y = W x with optional fake quantization of W (per output row) and of x.
+# This is the unit the C++ "qmat" kernels implement:
+#   y[o] = (s_act * s_w[o]) * sum_i qa[i] * qw[o][i]
 class CastedLinear(Module):
     def __init__(
         self,
@@ -284,6 +325,7 @@ class CastedLinear(Module):
         return output
 
 
+# Token embedding table with optionally quantized rows.
 class CastedEmbedding(Module):
     def __init__(
         self,
@@ -331,6 +373,7 @@ class CastedEmbedding(Module):
         return embedding(x, weight.to(self.cfg.activation_dtype))
 
 
+# A small learned fp32 vector (residual / skip-connection coefficients, gains).
 class CastedConstant(Module):
     def __init__(self, value: Tensor | list[float], cfg: TransformerConfig) -> None:
         super().__init__()
@@ -351,6 +394,8 @@ class CastedConstant(Module):
         return self.value.to(self.cfg.activation_dtype)
 
 
+# Two linear layers through a narrow bottleneck (d_in -> rank -> d_out); used for the Kimi
+# forget gate and output gate.
 class LowRankCastedLinear(Module):
     def __init__(
         self,
@@ -381,6 +426,8 @@ class LowRankCastedLinear(Module):
         return x
 
 
+# Depthwise causal 1-D convolution over the last few positions followed by SiLU (the short
+# convolution Kimi linear attention applies to queries, keys and values).
 class CastedFusedConvolutionSiLU(Module):
     def __init__(
         self,
@@ -461,6 +508,9 @@ class CastedFusedConvolutionSiLU(Module):
         return output
 
 
+# Rotary position embedding tables (sin / cos of position x frequency). The compressed weights
+# file normally omits them: the decoder recomputes them bit-exactly
+# (pysrc/weights_compress.py).
 @dataclass(frozen=True, slots=True)
 class RoPEArgs:
     sines: Float[Tensor, "position d_head"]
@@ -500,6 +550,7 @@ def make_rope_args(
     return RoPEArgs(sines=sines, cosines=cosines)
 
 
+# Rotate each (even, odd) pair of query / key components by the position-dependent angle.
 def rope(
     x: Float[Tensor, "batch position n_heads d_head"], args: RoPEArgs | None
 ) -> Float[Tensor, "batch position n_heads d_head"]:
@@ -525,6 +576,9 @@ def rope(
     return y
 
 
+# Ordinary causal multi-head attention restricted to a sliding window, with RMS-normalised and
+# rotary-encoded queries and keys. Queries, keys and values are fake-quantized before the dot
+# products, so the C++ can compute the attention scores in integers.
 class Attention(Module):
     def __init__(self, cfg: TransformerConfig) -> None:
         super().__init__()
@@ -719,6 +773,10 @@ class Attention(Module):
         return y
 
 
+# Kimi linear attention (fla's chunk_kda): a gated delta-rule recurrence. Each head keeps a
+# d_head x d_head state matrix that is decayed by a learned forget gate and updated with the
+# current key / value; the output is the state applied to the query, then gated and normalised.
+# Cost and memory per token are constant, so it sees the whole article, not just a window.
 class KimiLinearAttention(Module):
     def __init__(self, cfg: TransformerConfig) -> None:
         super().__init__()
@@ -855,6 +913,7 @@ class KimiLinearAttention(Module):
                     cu_seqlens.cpu_values = cpu_values.squeeze(0).to(torch.int64)  # type: ignore[attr-defined]
                 cumulative_sequence_lengths.squeezed = cu_seqlens  # type: ignore[attr-defined]
 
+        # Projections, then the short causal convolutions, then the gates.
         queries = self.query_projection(x, initialize_scales=initialize_scales)
         keys = self.key_projection(x, initialize_scales=initialize_scales)
         values = self.value_projection(x, initialize_scales=initialize_scales)
@@ -930,6 +989,8 @@ ACTIVATION_FUNCTIONS: dict[ActivationFunctionName, Callable[[Tensor], Tensor]] =
 }
 
 
+# The feed-forward block: up (192 -> d_mlp), relu(x)^2, down (d_mlp -> 192), both quantized.
+# These two matrices hold most of the model's parameters.
 class MLP(Module):
     def __init__(self, cfg: TransformerConfig) -> None:
         super().__init__()
@@ -957,6 +1018,8 @@ class MLP(Module):
         return x
 
 
+# One layer: x += attention(rms_norm(x)); x += mlp(rms_norm(x)), preceded by a learned
+# re-injection of the token embedding into the residual stream.
 class Block(Module):
     def __init__(
         self,
@@ -1024,6 +1087,9 @@ class Block(Module):
         return x
 
 
+# The whole model: token embedding + prior embedding -> 12 blocks (with U-net style skip
+# connections from the first half of the layers to the second half) -> rms_norm -> unembedding
+# -> soft-capped logits over the 205 symbols.
 class Transformer(Module):
     def __init__(self, cfg: TransformerConfig) -> None:
         super().__init__()
@@ -1128,6 +1194,8 @@ class Transformer(Module):
                 cfg,
             )
 
+    # Everything up to the final normalised hidden state (192 values per position). The compressor's
+    # online adaptation of the output layer (src/predictor.cpp) works on this same quantity.
     def compute_last_activation(
         self,
         input_tokens: Int[Tensor, "batch position"],
@@ -1171,6 +1239,8 @@ class Transformer(Module):
         if priors is not None:
             priors = priors.to(self.cfg.activation_dtype)
 
+        # Inputs: embedding of the previous token plus a linear embedding of PPMD's distribution for
+        # the token being predicted.
         token_embeddings = self.embedding(
             input_tokens, initialize_scales=initialize_scales
         )
@@ -1238,6 +1308,8 @@ class Transformer(Module):
         )
         skip_connections = []
 
+        # Skip connections: the output of layer i (first half) is added, with a learned weight,
+        # to the input of layer n_layers - 1 - i (last in, first out).
         skip_connection_source_layers: list[int] = list(range(self.cfg.n_layers // 2))
         skip_connection_destination_layers: list[int] = list(
             range((self.cfg.n_layers + 1) // 2, self.cfg.n_layers)
@@ -1280,6 +1352,8 @@ class Transformer(Module):
 
         return x
 
+    # Output layer: quantized unembedding, then logits = cap * tanh(logits / cap). The
+    # prior_logit_mixing branch is off in the shipped model.
     def last_activation_to_logits(
         self,
         last_activation: Float[Tensor, "batch position d_model"],
@@ -1359,6 +1433,7 @@ class Transformer(Module):
             initialize_scales=initialize_scales,
         )
 
+        # [this entry] return_logits: hand the logits to the cmix-aware mixture loss.
         logits = self.last_activation_to_logits(
             activation, priors=priors, initialize_scales=initialize_scales
         )
@@ -1373,6 +1448,7 @@ class Transformer(Module):
 
         return where(loss_mask.flatten(), loss.to(torch.float32), 0.0).sum()
 
+    # The prior is embedded as probabilities (shipped) or as capped, centred log-probabilities.
     def prior_embedding_input(
         self, priors: Float[Tensor, "batch position vocabulary_size"]
     ) -> Float[Tensor, "batch position vocabulary_size"]:
@@ -1384,12 +1460,14 @@ class Transformer(Module):
         logprobs = make_mean_zero(logprobs, dim=-1)
         return logprobs
 
+    # Optional gradient checkpointing per block (trades GPU time for memory).
     def maybe_checkpoint(self, f, *args, **kwargs) -> Tensor:
         if not self.cfg.gradient_checkpointing:
             return f(*args, **kwargs)
         return checkpoint(f, *args, use_reentrant=False, **kwargs)  # type: ignore
 
 
+# Bookkeeping used by the logger: parameter counts and their storage cost in bits.
 @dataclass(frozen=True, slots=True)
 class PrecisionAndCount:
     n_parameters: int
@@ -1507,6 +1585,7 @@ def transformer_parameter_counts(model: Transformer) -> TransformerParameterCoun
     )
 
 
+# torch.compile the model and the entry points the recipes call directly.
 def compile_transformer(model: Transformer) -> Transformer:
     model = torch.compile(model)  # type: ignore
     model.compute_last_activation = torch.compile(model.compute_last_activation)

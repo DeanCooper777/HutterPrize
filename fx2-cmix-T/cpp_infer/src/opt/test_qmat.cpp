@@ -2,6 +2,30 @@
 // bit-identical to a naive scalar reference, and every fused fp32/quantize
 // epilogue must be bit-identical to the scalar single-rounding formulas
 // (which themselves mirror src/kernels.cpp + model.cpp).
+//
+// What it verifies: the quantized matrix-vector kernels (int8 activations x
+// 4-bit weights -> exact int32 dot -> one fp32 multiply, optionally followed
+// by a fused quantizer): dense (qmat_dense.cpp), sparse-column
+// (qmat_sparse.cpp) and the packed-int4 layout, in every shape the model
+// uses. Reference = scalar loops in this file, and the naive qmatvec of
+// ../kernels.cpp. Because the integer part is exact, "equal" means bitwise.
+//
+// Where it sits: these kernels are almost all of the transformer byte
+// model's arithmetic, so one wrong bit here would change a probability and
+// desynchronise compressor and decompressor. Protects qmat_dense.cpp,
+// qmat_sparse.cpp and qmat.h.
+//
+// Testing: build (from cpp_infer/src/opt) with `make` (-> ../../bin/opt/
+// test_qmat), run as `test_qmat [CASES]` (cases per shape, default 10000).
+// Pass: "ALL EXACTNESS TESTS PASSED" and exit code 0; failures print
+// "FAIL <file>:<line>: ..." and the run stops after 20 of them.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// this file is unchanged. [this entry] added AVX-VNNI / AVX512-VNNI variants
+// and a packed-arena path to qmat_dense.cpp, chosen at run time from the CPU.
+// The test calls the public entry points, so it checks whichever path the
+// machine selects; CMIX_NO_VNNI=1 and CMIX_QMAT_UNPACKED=1 select the others.
+// The submission build compiles the VNNI variants out (-DFX2_NO_VNNI).
 #include <immintrin.h>
 
 #include <cmath>

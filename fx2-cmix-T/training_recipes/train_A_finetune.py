@@ -1,3 +1,25 @@
+# train_A_finetune.py: [this entry] the cmix-aware fine-tune that produced the shipped
+# weights. New in this entry (derived from the previous winner's quantize.py).
+#
+# What it does: continues quantization-aware training of the existing 6M model, but with the
+# mixture loss of pysrc/cmix_loss.py instead of the transformer's own cross-entropy, so the
+# transformer learns to be useful to cmix's mixer rather than good on its own. Same
+# architecture, same size, same inference speed; only the weight values change.
+#
+# Inputs: models/6m-q4.tch (or A_INIT); data/ppmd-bytes.uint8, data/ppmd-probs.float16,
+#         data/article-boundaries.int32 (token stream and PPMD priors of OUR build);
+#         data/cmix-bits.float16 (cmix's per-bit predictions without the transformer).
+# Outputs: models/6m-q4-A.tch (+ .mixer.tch, the stand-in mixer, for inspection only);
+#          with CHECKPOINT_PREFIX set, a checkpoint after every epoch.
+# Next step: cooldown_A.py, then export_weights + weights_compress.
+#
+# The shipped weights were made by running this recipe twice in a row (the second run with
+# A_INIT = the first run's output) and then cooldown_A.py; see SUBMISSION.md.
+#
+# Testing: the A_* / TRAIN_* environment variables below select the experiment variants that
+# were tried (MLP width, MLP bits, mixer contexts, cross-entropy share).
+#
+# Run with: uv run torchrun --nproc_per_node $N_GPUS -m training_recipes.train_A_finetune
 # Run A of docs/NEW_TRANSFORMER_PLAN.md: fine-tune the existing quantized 6M
 # model (QAT, bf16) with the cmix mixture loss (pysrc/cmix_loss.py) on the
 # training data of OUR build. Derived from quantize.py; differences: starts
@@ -26,6 +48,7 @@ from pysrc.logger import LoggerConfig
 
 
 def main() -> None:
+    # One process per GPU (torchrun); `rank` selects this process's GPU and its share of the data.
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -44,6 +67,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,
@@ -70,6 +94,8 @@ def main() -> None:
         activation=activation_quantization,
     )
 
+    # The model. The architecture must stay identical across the three stages and equal to
+    # make_reference_config in pysrc/export_weights.py (which the C++ inference hard-codes).
     raw_model: Transformer = Transformer(
         TransformerConfig(
             vocabulary_size=205,
@@ -158,6 +184,8 @@ def main() -> None:
     warmup_learning_rate_multiplier: int = 10
     final_learning_rate_multiplier: float = 0.0
 
+    # Data: tokens and PPMD priors as in the previous winner, plus cmix's bit predictions, which
+    # is what switches the loader into mixture-loss mode.
     data = CollatedArticlesDataLoader(
         tokens_filename="data/ppmd-bytes.uint8",
         priors_filename="data/ppmd-probs.float16",
@@ -179,6 +207,8 @@ def main() -> None:
     #     save_transformer_outputs(model, data, "data/transformer-probs-6m.float16")
     #     return
 
+    # Learning rate: with warmup_epochs == epochs the multiplier follows one cosine from 10 at the
+    # start to 1 at the end, i.e. the rate falls from 10 * A_LR to A_LR over the run.
     def learning_rate_multiplier_schedule(fraction_done: float) -> float:
         fraction_warmup = warmup_epochs / epochs
         # the last batch has fraction_done == 1.0 exactly: with warmup over the
@@ -193,6 +223,7 @@ def main() -> None:
         t = (cos(s * pi) + 1) / 2
         return t + (1 - t) * final_learning_rate_multiplier
 
+    # mixture_loss is the line that makes this a cmix-aware run (see pysrc/train.py).
     training_config = TrainingConfig(
         initialize_scales_steps=init_scales,
         initialize_weight_scales_first=True,
@@ -229,6 +260,7 @@ def main() -> None:
 
     mixture = train(raw_model=raw_model, model=model, data=data, cfg=training_config)
 
+    # Rank 0 saves the fine-tuned QAT checkpoint and the stand-in mixer.
     if main_process:
         makedirs("models", exist_ok=True)
         torch.save(raw_model.state_dict(), "models/6m-q4-A.tch")

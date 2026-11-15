@@ -1,3 +1,22 @@
+// predictor.h: the Predictor class (the whole model: context models, PPMD, transformer
+// byte model, two mixer layers, SSE) and PredictorOptions, the switches runner.cpp sets
+// from the command line. Also the float16 file reader / writer used by the dump options.
+//
+// Place in the pipeline: preprocess -> dictionary -> [context models / PPMD / transformer
+// byte model -> mixers -> SSE] -> arithmetic coder -> self-extracting archive. The Encoder
+// and Decoder (coder/) call Predict() and Perceive() once per bit; preprocessor::Pretrain
+// calls Pretrain(). predictor.cpp has the overview of the data flow.
+//
+// Testing: every PredictorOptions field except transformer_weights and num_input_bytes is
+// a testing or training-data switch; an official run leaves them at their defaults.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - dyn_* members: online adaptation of the transformer's output layer (smaller archive).
+//   - neutral_transformer / save_cmix_bits: training-data dump for cmix-aware fine-tuning.
+//   - tf_threads / TfPipe (-DCMIX_PIPE only): multi-core compression for experiments.
+//   - tf_ctx_ / tf_mixer_*: optional transformer-confidence mixer (experiment, off).
+//   - prefetch_mixers_: mixer weight prefetch (speed, same output).
+
 #ifndef PREDICTOR_H
 #define PREDICTOR_H
 
@@ -42,6 +61,8 @@
 // Prints an error message to stderr and exits with a nonzero status.
 [[noreturn]] void Fail(const char* fmt, ...);
 
+// What to run and what to dump. Compressor and decompressor must use the same
+// model-affecting options, or the decoder's predictions diverge from the encoder's.
 struct PredictorOptions {
   // Run only the ppmd model. Predict() returns the ppmd's bit prediction and
   // no other model is constructed or updated.
@@ -81,6 +102,7 @@ struct PredictorOptions {
   // article-start tokens the transformer cannot predict) is appended to
   // this file, in the format of save_ppmd_probs.
   std::string save_transformer_probs;
+  // [this entry] The remaining fields are new.
   // Training data: run without the transformer (and without the lstm); the
   // byte mixer carries a uniform distribution instead.
   bool neutral_transformer = false;
@@ -130,13 +152,18 @@ class HalfFileReader {
   FILE* file_;
 };
 
+// The model. One instance codes one stream.
 class Predictor {
  public:
   Predictor(const std::vector<bool>& vocab,
       const PredictorOptions& options = PredictorOptions());
+// [this entry] Out-of-line destructor: TfPipe is only defined in predictor.cpp. It also
+// prints the pipeline's statistics.
 #ifdef CMIX_PIPE
   ~Predictor();
 #endif
+  // Predict(): P(next bit = 1). Perceive(bit): update with the coded bit; must follow each
+  // Predict(). Pretrain(bit): update the context models with dictionary text before coding.
   float Predict();
   void Perceive(int bit);
   void Pretrain(int bit);
@@ -158,6 +185,7 @@ class Predictor {
   void AccumulateTransformerLoss();
   void TransformerByteUpdate();
 
+  // The bit-level context models (fx2-cmix).
   llvm::SmallVector<Indirect<Nonstationary>, 30-7> indirect_ns_models_; // non-stationary
   llvm::SmallVector<Indirect<RunMap>, 1> indirect_r_models_; // run map
   llvm::SmallVector<Direct, 1> direct_models_;
@@ -165,11 +193,14 @@ class Predictor {
   
   std::optional<Bracket> bracket_model_;
   size_t auxiliary_size_ = 2; // 0 -> fxcm, 1 -> byte_mixer
+  // [this entry]
   // Context of the optional transformer-confidence mixer (tune.h:
   // tf_mixer_buckets > 0): the byte mixer's bit probability, bucketed.
   unsigned long long tf_ctx_ = 0;
   int tf_mixer_buckets_ = 0, tf_mixer_mode_ = 0;
   bool prefetch_mixers_ = false;
+  // Mixing: layers_[0] / mixer_0_ = first layer (23 mixers), layers_[1] / mixer_1_ = the
+  // final mixer; sse_ refines the final probability.
   SSE sse_;
   llvm::SmallVector<MixerInput,2> layers_;
   llvm::SmallVector<Mixer, 23> mixer_0_;
@@ -177,6 +208,8 @@ class Predictor {
   std::vector<unsigned int> auxiliary_;
   ContextManager manager_;
   Sigmoid sigmoid_;
+  // byte_model_ = PPMD (byte-level). byte_mixer_ = the carrier of the transformer's (or, in
+  // generic non-official use, the LSTM's) byte distribution, read out bit by bit.
   std::optional<PPMD::PPMD> byte_model_;
   std::optional<ByteMixer> byte_mixer_;
   std::vector<bool> vocab_;
@@ -208,11 +241,13 @@ class Predictor {
   // training data loader's split_article_lengths; each piece is a fresh
   // transformer context.
   unsigned long long article_tokens_ = 0;
+  // [this entry] Uniform stand-in for the transformer, and the --save-cmix-bits dump.
   bool neutral_transformer_ = false;
   std::vector<float> uniform_probs_;
   std::unique_ptr<HalfFileWriter> cmix_bits_writer_;
   float last_pred_ = 0.5f;
 
+  // [this entry] Everything from here to the end of the class is new.
   // Online adaptation of the transformer's output layer ("dynamic
   // evaluation"): an fp32 correction dyn_W_ (205 x 192) and bias dyn_b_ are
   // added to the transformer's (post-softcap) logits and trained by SGD on
@@ -248,6 +283,7 @@ class Predictor {
   // the logits / hidden state DynApply reads (the transformer's last step)
   const float* dyn_z_src_ = nullptr;
   const float* dyn_h_src_ = nullptr;
+// [this entry] Multi-core compression for experiments; not in the submitted binary.
 #ifdef CMIX_PIPE
   struct TfPipe;
   std::unique_ptr<TfPipe> pipe_;

@@ -1,3 +1,14 @@
+# requant_mlp.py: experiment tool that re-fits the MLP weight scales for fewer levels.
+#
+# Where it fits: training side, before a quantization-aware fine-tune with A_MLP_BITS < 4. A
+# scale learned for 15 levels (-7..7) is a poor start for 7 levels (-3..3), so each row's scale
+# is re-chosen to minimise the rounding error; the fine-tune then starts from there.
+#
+# Testing: this is a testing / experiment tool only. The 3-bit MLP variant was rejected (the
+# archive grew more than the weights shrank, see docs/NEW_TRANSFORMER_PLAN.md); the shipped
+# model uses 4-bit weights everywhere.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
 """Re-fit the MLP weight scales of a checkpoint for fewer quantization levels
 (variant 2c of docs/NEW_TRANSFORMER_PLAN.md, 2026-11-08).
 
@@ -21,6 +32,8 @@ def main() -> None:
     sd = torch.load(src, map_location="cpu")
     grid = torch.linspace(0.3, 1.0, 71)
     out = dict(sd)
+    # For every MLP weight matrix: try 71 candidate scales per row, keep the one with the least
+    # squared error, and report it against the error of the existing 4-bit quantization.
     for k in sorted(sd):
         m = re.match(r"(.*\.mlp\.(up|down))\.weight$", k)
         if not m:

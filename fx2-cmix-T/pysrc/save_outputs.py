@@ -1,3 +1,12 @@
+# save_outputs.py: run a trained model over the data and save its next-token probabilities.
+#
+# Where it fits: evaluation / testing only. The saved probabilities are (a) the reference the
+# C++ inference is checked against (pysrc/export_testdata.py) and (b) usable as a stand-in for
+# the transformer inside the compressor (its --load-transformer-probs test option), which lets
+# a new checkpoint be scored inside cmix before any C++ export exists.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 import numpy as np
 import torch
 from math import log
@@ -58,6 +67,7 @@ def _iter_micro_batch_probabilities(
         )
 
 
+# Whole data set, articles in file order.
 @torch.inference_mode()
 def save_transformer_outputs(
     model: Transformer,
@@ -148,6 +158,8 @@ def save_transformer_outputs(
         model.train()
 
 
+# A random subset of articles (the C++ test set), written together with the matching token and
+# boundary files.
 @torch.inference_mode()
 def save_transformer_outputs_for_article_subset(
     model: Transformer,

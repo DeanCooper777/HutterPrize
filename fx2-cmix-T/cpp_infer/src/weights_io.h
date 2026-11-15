@@ -1,4 +1,20 @@
 // weights_io: loader for cpp_infer/data/weights.bin (SPEC.md section 4)
+//
+// The in-memory form of a weights file: a map from tensor name to WTensor.
+// Two readers fill it: load (plain FX2TFW01, weights_io.cpp) and
+// load_compressed (FX2TFWC1 / FX2TFWC2, weights_io_compressed.cpp; the
+// shipped ".tfwc2" file).
+//
+// How it fits: start-up only. opt/arena_build.cpp reads the tensors through
+// this interface and builds the run-time weight stream of the transformer
+// byte model.
+//
+// Testing: test_weights_compressed.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
+// ([this entry] added a payload coding to the compressed reader; this
+// interface did not change.)
 #pragma once
 
 #include <cstddef>

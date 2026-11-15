@@ -1,4 +1,12 @@
 #!/bin/bash
+# train_A.sh: first version of the driver for the cmix-aware fine-tune ("run A") on a GPU
+# machine: install the Python environment, copy the training data to fast local disk, smoke
+# test, run fine-tune + cooldown, export. run_A_opt.sh is the later, faster driver and reuses
+# the "stage" step of this script.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Run A (docs/NEW_TRANSFORMER_PLAN.md) on a RunPod GPU pod with the network
 # volume at /workspace, after scripts/cloud/datagen.sh has filled
 # /workspace/data.
@@ -16,6 +24,7 @@ T=$W/train
 export WANDB_MODE=offline
 export UV_CACHE_DIR=$W/uv-cache
 
+# Unpack the training code, install the pinned environment, check that the data is there.
 setup() {
   mkdir -p "$T"
   # --no-same-owner: the network volume refuses chown to the Windows uid
@@ -72,6 +81,7 @@ smoke() {
   grep -E "loss|tokens" "$W/logs/smoke_A.log" | tail -20
 }
 
+# Fine-tune, cooldown, export.
 run() {
   local n=${1:-1}
   # epochs: A_EPOCHS (fine-tune) and COOLDOWN_EPOCHS, see the recipes

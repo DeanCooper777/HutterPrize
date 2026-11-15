@@ -1,3 +1,27 @@
+# data.py: training data loader for the transformer byte model.
+#
+# What it reads (all produced by the compressor itself, so that training sees exactly what the
+# model sees at compression time):
+#   tokens              uint8, the preprocessed enwik9 stream as vocabulary indices (0..204)
+#   priors              float16, one row of 205 values per token: PPMD's distribution for the
+#                       NEXT token; it is an input of the transformer
+#   article boundaries  int32 token offsets; every article is trained as its own sequence
+#   cmix bits           [this entry] float16, 8 logits per token: the probability cmix assigned
+#                       to each bit of the token WITHOUT the transformer (--no-transformer
+#                       --save-cmix-bits); the target-side input of the mixture loss
+#
+# What it yields: Batch objects, each a list of MicroBatch. A micro batch is one long row of
+# micro_batch_tokens positions holding many articles back to back, with the article boundaries
+# passed along so attention never crosses them. Articles are shuffled per epoch with a fixed
+# seed; short neighbouring articles can be merged and over-long ones are split.
+#
+# Where it fits: used by pysrc/train.py and pysrc/save_outputs.py (training / evaluation
+# only).
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1):
+#   - [this entry] cmix_bits_filename / MicroBatch.cmix_bit_logits for the cmix-aware loss.
+#   - [this entry] a host copy of the sequence boundaries travels with the device tensor,
+#     which removes a GPU synchronisation per call (training speed only).
 import numpy as np
 import torch
 from torch import Tensor, tensor, zeros
@@ -9,6 +33,8 @@ from jaxtyping import Float, Int32, Int64, Bool
 from typing import Iterable, Iterator, Sequence
 
 
+# One forward pass worth of data. Position p predicts output_tokens[p] from input_tokens[..p]
+# and priors[p]; loss_mask is False on the padding at the end of the row.
 @dataclass(frozen=True, slots=True)
 class MicroBatch:
     input_tokens: Int64[Tensor, "batch position"]
@@ -21,6 +47,8 @@ class MicroBatch:
     cmix_bit_logits: Float[Tensor, "batch position 8"] | None = None
 
 
+# One optimizer step worth of micro batches (this rank's share), plus progress counters used
+# by the learning-rate and window-size schedules.
 @dataclass(frozen=True, slots=True)
 class Batch:
     micro_batches: list[MicroBatch]
@@ -64,6 +92,8 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
     _batches_per_epoch: list[int] = field(init=False, repr=False, compare=False)
     _total_batches: int = field(init=False, repr=False, compare=False)
 
+    # Load / map the files, derive the article list (merge, split), draw the per-epoch shuffles
+    # and count the batches. The dataclass is frozen, hence the object.__setattr__ calls.
     def __post_init__(self) -> None:
         assert self.epochs >= 1
         assert self.gradient_accumulation_steps >= 1
@@ -151,6 +181,8 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             rng.permutation(n_articles) for _ in range(self.epochs)
         ]
 
+        # [this entry] cmix's bit predictions, memory-mapped; the size check guards against a dump
+        # made from a different token stream.
         cmix_bits: np.ndarray | None = None
         if self.cmix_bits_filename is not None:
             cmix_bits_bytes: int = os.path.getsize(self.cmix_bits_filename)
@@ -180,6 +212,8 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
         object.__setattr__(self, "_batches_per_epoch", batches_per_epoch)
         object.__setattr__(self, "_total_batches", total_batches)
 
+    # Greedy packing of articles (in the given order) into micro batches of at most
+    # micro_batch_tokens positions.
     def _iter_micro_batch_articles(
         self, articles: Iterable[int], drop_last: bool
     ) -> Iterator[list[int]]:
@@ -219,6 +253,8 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
                 batch = []
         # articles left in the trailing incomplete batch are dropped
 
+    # Materialise one micro batch: copy each article's tokens, priors and (optionally) cmix bits
+    # into pinned host buffers, record the boundaries, and move everything to the device.
     def _make_micro_batch(self, articles: list[int]) -> MicroBatch:
         n_positions: int = self.micro_batch_tokens
         pin: bool = self.device.type == "cuda"
@@ -295,6 +331,7 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
             else None,
         )
 
+    # The training iteration: epochs x batches, yielding only this rank's micro batches.
     def _iter_no_prefetch(self) -> Iterator[Batch]:
         batches_done: int = 0
         for epoch in range(self.epochs):
@@ -383,6 +420,7 @@ class CollatedArticlesDataLoader(Iterable[Batch]):
         return self._total_batches
 
 
+# Join consecutive articles while the joined length stays within max_merge_tokens.
 def merge_article_lengths(lengths: list[int], max_merge_tokens: int) -> list[int]:
     merged: list[int] = []
     for length in lengths:
@@ -393,6 +431,7 @@ def merge_article_lengths(lengths: list[int], max_merge_tokens: int) -> list[int
     return merged
 
 
+# Cut articles longer than max_article_tokens into pieces of at most that length.
 def split_article_lengths(
     lengths: list[int], max_article_tokens: int
 ) -> tuple[list[int], int]:
@@ -413,6 +452,8 @@ def ceil_divide(a: int, b: int) -> int:
     return -(a // -b)
 
 
+# Run the iterator on a background thread, a few items ahead, so that disk reads and batch
+# assembly overlap with GPU work.
 def prefetch(iterator: Iterator, num_prefetch: int = 2) -> Iterator:
     q: queue.Queue = queue.Queue(maxsize=num_prefetch)
     sentinel = object()

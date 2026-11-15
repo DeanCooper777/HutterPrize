@@ -1,4 +1,12 @@
 #!/bin/bash
+# linux_sub.sh: the end-to-end check of an entry on Linux: build the submission binary,
+# compress enwik9 into the self-extracting archive, run the archive in an empty directory and
+# compare its output with enwik9. Records sizes, wall times and peak memory of both programs.
+# This is the procedure whose numbers go into SUBMISSION.md.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Linux Hutter Prize entry on a CPU pod (2026-11-09): build the submission
 # exactly as upstream does (setup.sh toolchain, build_and_construct_comp.sh,
 # PGO, clang 17, AVX2 + no-recip checks, upx), compress enwik9 with

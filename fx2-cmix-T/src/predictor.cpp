@@ -1,6 +1,58 @@
+// predictor.cpp: the model. Predictor::Predict() returns P(next bit = 1) and
+// Predictor::Perceive(bit) updates every component with the bit that was coded. The
+// arithmetic Encoder / Decoder (coder/) call the pair once per bit, so compressor and
+// decompressor run exactly the same computation and stay in step.
+//
+// Place in the pipeline:
+//   preprocess -> dictionary -> [context models / PPMD / transformer byte model -> mixers
+//   -> SSE] -> arithmetic coder -> self-extracting archive      ([...] = this file)
+//
+// Per bit:
+//   bracket, fxcm, direct, match and indirect models, the PPMD bit and the byte mixer bit
+//   -> layer 0: 23 mixers, each choosing its weight set by a different context
+//   -> layer 1: one final mixer over the 23 outputs plus fxcm's and the byte mixer's bits
+//   -> SSE -> probability for the coder.
+// Per byte (after its 8th bit): PPMD produces a distribution over the next byte; the
+// transformer is stepped on (the byte just coded, PPMD's distribution) and produces its
+// own distribution over the next byte.
+//
+// How the transformer reaches the mixers: its 205-way distribution is loaded into the
+// "byte mixer" (ByteMixer::SetProbs; in upstream cmix that object ran an LSTM). A
+// ByteModel turns a byte distribution into bit predictions: as the 8 bits of the byte are
+// coded it halves the candidate range of byte values, and the bit probability is the mass
+// of the upper half divided by the mass of the range. That bit probability
+// (byte_mixer_output) is
+//   - an input of every layer-0 mixer,
+//   - a direct input of the final mixer,
+//   - half of auxiliary_context_, which selects the weight set of one layer-0 mixer,
+//   - passed to fxcm's internal mixers through the globals lstmpr / lstmex.
+// [this entry] The online-adapted copy of the distribution (dyn_*) goes through a second
+// ByteMixer (dyn_mixer_) and enters layer 0 and the final mixer as one more input each.
+//
+// Testing: PredictorOptions (predictor.h) carries the dump / replay switches set by
+// runner.cpp's long options; tune::Get (tune.h, CMIX_TUNE file) overrides the constants
+// read here (dyn_*, lr<layer>_<index>, input_eps, ppmd_mb, tf_mixer_*, l1_ctx,
+// prefetch_mixers, attn_f32); -DCMIX_PROFILE adds per-section timing (prof.h).
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - Online adaptation of the transformer's output layer (DynApply / DynLearn): a
+//     correction matrix on the final hidden state, trained by SGD on every token as it
+//     becomes known, used as an additional mixer input. Smaller archive for a few percent
+//     more time.
+//   - Retuned constants: final mixer learning rate and mixer input clipping epsilon.
+//   - Prefetch of the next bit's mixer weight rows (speed, output unchanged).
+//   - CMIX_OFFICIAL build: no LSTM code; streams coded without transformer weights (the
+//     embedded dictionary and article order) get a uniform byte-mixer input instead.
+//   - neutral_transformer / save_cmix_bits: dump cmix's bit predictions without the
+//     transformer (training data for the cmix-aware fine-tuning of the transformer).
+//   - CMIX_PIPE: multi-thread compress-only pipeline for experiments (TfPipe).
+//   - tune::Get for every experimental constant; PROF_* timing marks.
+
 #include "predictor.h"
 #include "prof.h"
 #include "tune.h"
+// [this entry] Profiling builds only: count transformer steps and print the transformer
+// kernels' time breakdown at exit.
 #ifdef CMIX_PROFILE
 namespace {
 long g_tf_steps = 0;
@@ -9,6 +61,7 @@ struct TfProfRegistrar { TfProfRegistrar() { atexit(TfProfReport); } } g_tf_prof
 }
 #endif
 #include <vector>
+// [this entry] Threading headers, needed only by the experimental multi-core pipeline.
 #ifdef CMIX_PIPE
 #include <atomic>
 #include <chrono>
@@ -29,6 +82,7 @@ struct TfProfRegistrar { TfProfRegistrar() { atexit(TfProfReport); } } g_tf_prof
 #include <immintrin.h>
 #endif
 
+// Fatal error: message to stderr, exit status 1.
 void Fail(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -41,8 +95,13 @@ void Fail(const char* fmt, ...) {
 
 namespace {
 
+// float32 <-> float16 conversion. Distributions cross the PPMD -> transformer -> byte
+// mixer boundaries rounded to float16, exactly as the offline training pipeline stored
+// them, so that the transformer sees at inference what it saw in training.
 const size_t kHalfBufferSize = 1 << 22;  // 4M halfs = 8MB per buffer
 
+// Scalar float32 -> float16, round to nearest even. Used for the elements the 8-wide
+// F16C loop in FloatsToHalves does not cover.
 uint16_t FloatToHalf(float f) {
   uint32_t x;
   memcpy(&x, &f, 4);
@@ -99,6 +158,7 @@ float HalfToFloat(uint16_t h) {
   return f;
 }
 
+// Bulk conversions: F16C instructions for groups of 8, the scalar code for the rest.
 void FloatsToHalves(const float* src, uint16_t* dst, size_t n) {
   size_t i = 0;
 #ifdef __F16C__
@@ -139,6 +199,8 @@ const unsigned long long kMaxArticleTokens = 1ULL << 17;
 
 }  // namespace
 
+// HalfFileWriter / HalfFileReader: buffered float16 files for the --save-* / --load-*
+// options (training data and offline evaluation). Not used in an official run.
 HalfFileWriter::HalfFileWriter(const std::string& path) : path_(path),
     buffer_(kHalfBufferSize) {
   file_ = fopen(path.c_str(), "wb");
@@ -207,6 +269,9 @@ void HalfFileReader::Read(float* values, size_t n) {
   available_ -= n;
 }
 
+// [this entry] Everything from here to "#endif  // CMIX_PIPE" is new. It is compiled only
+// with -DCMIX_PIPE and is never part of the submitted binary: the contest allows one core,
+// and the decompressor could not use it anyway. It only makes experiments faster.
 #ifdef CMIX_PIPE
 // ---------------------------------------------------------------------------
 // Multi-thread compression (PredictorOptions::tf_threads).
@@ -229,6 +294,12 @@ void HalfFileReader::Read(float* values, size_t n) {
 // inputs as in the single-thread path, so the output is byte-identical.
 // The decompressor cannot do this (it learns each token only by decoding).
 // ---------------------------------------------------------------------------
+// State of the pipeline. Token i of the stream owns slot i % cap of three rings:
+//   prior  the PPMD distribution that follows token i (transformer input, coder input);
+//   rec    the transformer's record for token i: kRec = 608 floats = output distribution
+//          (205, padded to 208), logits (205, padded to 208), final hidden state (192);
+//   bytes  the byte itself, to verify that the coder codes what the look-ahead read.
+// W is the look-ahead in tokens; cap = W + 16 slots.
 struct Predictor::TfPipe {
   static constexpr int kV = 205, kRec = 608;  // probs @0, logits @208, hidden @416
   struct Piece {
@@ -260,6 +331,7 @@ struct Predictor::TfPipe {
   double wait_seconds = 0;
   unsigned long long waits = 0;
 
+  // Hands the piece being collected to the worker threads.
   void Enqueue() {
     Piece* p = open.get();
     pieces.push_back(std::move(open));
@@ -270,6 +342,8 @@ struct Predictor::TfPipe {
     cv.notify_one();
   }
 
+  // Worker thread: take the next piece, run a private transformer instance over it from a
+  // fresh context, and publish each token's record (done = number of finished tokens).
   void Work(fx2::opt::TransformerOpt* tf) {
     uint16_t half[208];
     for (;;) {
@@ -299,6 +373,7 @@ struct Predictor::TfPipe {
     }
   }
 
+  // Stop and join the workers.
   ~TfPipe() {
     {
       std::lock_guard<std::mutex> lk(mu);
@@ -311,6 +386,7 @@ struct Predictor::TfPipe {
   }
 };
 
+// Reports how long the coder had to wait for the transformer workers.
 Predictor::~Predictor() {
   if (pipe_) {
     fprintf(stderr, "\ntf pipeline: %zu threads, coder waited %.1f s in %llu "
@@ -318,6 +394,8 @@ Predictor::~Predictor() {
   }
 }
 
+// Sets up the rings, one transformer instance per worker (sharing the weights) and the
+// worker threads.
 void Predictor::PipeStart(const PredictorOptions& options) {
   if (vocab_size_ != TfPipe::kV) Fail("tf pipeline: vocabulary is not 205");
   pipe_.reset(new TfPipe());
@@ -445,6 +523,10 @@ void Predictor::PipeFetch() {
 }
 #endif  // CMIX_PIPE
 
+// Builds the whole model. `vocab` marks the byte values present in the stream (from the
+// stream header); the byte-level models work on indices into that set.
+// The order in which models are added fixes the order of the mixer inputs, so it is part
+// of the format: it must be identical in compressor and decompressor.
 Predictor::Predictor(const std::vector<bool>& vocab,
     const PredictorOptions& options) : manager_(),
     sigmoid_(100001), vocab_(vocab), ppmd_only_(options.ppmd_only),
@@ -478,6 +560,10 @@ Predictor::Predictor(const std::vector<bool>& vocab,
     // The loss of the loaded distributions is the transformer's loss.
     print_transformer_loss_ = true;
   }
+  // [this entry] Neutral transformer slot: the byte mixer carries a uniform distribution, so
+  // its bit output says nothing beyond which byte values exist, and the rest of cmix runs
+  // as usual. Used (a) for the training-data dump of "cmix without the transformer" and (b) in
+  // the official build for streams that have no transformer weights.
   neutral_transformer_ = options.neutral_transformer;
 #ifdef CMIX_OFFICIAL
   // Official build: no lstm. Without transformer weights (the embedded dictionary and article
@@ -486,9 +572,13 @@ Predictor::Predictor(const std::vector<bool>& vocab,
   if (options.transformer_weights.empty()) neutral_transformer_ = true;
 #endif
   if (neutral_transformer_) uniform_probs_.assign(vocab_size_, 1.0f);
+  // [this entry] --save-cmix-bits: file of the final per-bit predictions (see Perceive).
   if (!options.save_cmix_bits.empty()) {
     cmix_bits_writer_.reset(new HalfFileWriter(options.save_cmix_bits));
   }
+  // The pretrained transformer byte model. It needs the exact vocabulary it was trained
+  // on. [this entry] attn_f32 (tune key, default 0) selects the attention variant
+  // AttnKind::KVF32 instead of the default KVI8; experiment only.
   if (!options.transformer_weights.empty() && !ppmd_only_ &&
       !transformer_probs_reader_ && !neutral_transformer_) {
     if (vocab_size_ != 205) {
@@ -501,7 +591,18 @@ Predictor::Predictor(const std::vector<bool>& vocab,
     half_scratch_.resize(vocab_size_);
     transformer_probs_.resize(vocab_size_);
     print_transformer_loss_ = true;
-    dyn_lr_ = tune::Get("dyn_lr", 3e-4);
+    // [this entry] Online adaptation of the output layer ("dynamic evaluation"); see
+    // DynApply / DynLearn. Shipped values are the defaults:
+    //   dyn_lr    SGD rate of the correction matrix dyn_W_ (0 disables it);
+    //   dyn_blr   SGD rate of the bias correction dyn_b_ (0: no bias correction);
+    //   dyn_decay weight decay per step of dyn_W_ and dyn_b_ (0: none);
+    //   dyn_mode  1: the adapted distribution is an ADDITIONAL mixer input (dyn_mixer_) and the
+    //             transformer's own distribution stays; 0: it replaces the transformer's;
+    //   dyn_l1    1: the adapted bit prediction is also a direct input of the final mixer;
+    //   dyn_fx    1: fxcm is given the adapted prediction instead of the original (off);
+    //   dyn2_lr / dyn2_layers: a second, experimental correction driven by the sparse MLP
+    //             activations of selected layers (off: dyn2_lr = 0).
+    dyn_lr_ = tune::Get("dyn_lr", 1.2e-3);
     dyn_blr_ = tune::Get("dyn_blr", 0);
     dyn_decay_ = tune::Get("dyn_decay", 0);
     dyn_mode_ = (int)tune::Get("dyn_mode", 1);
@@ -515,6 +616,9 @@ Predictor::Predictor(const std::vector<bool>& vocab,
       dyn2_row_.reserve(12 * 768);
       dyn2_f_.reserve(12 * 768);
     }
+    // All corrections start at zero, so the first adapted prediction equals the
+    // transformer's own. kDynPad (208) rounds the vocabulary up to a multiple of 8 for the
+    // AVX loops.
     if (dyn_lr_ != 0 || dyn_blr_ != 0 || dyn2_lr_ != 0) {
       dyn_g_.assign(kDynPad, 0.0f);
       dyn_W_.assign((size_t)vocab_size_ * kDynHidden, 0.0f);
@@ -534,6 +638,7 @@ Predictor::Predictor(const std::vector<bool>& vocab,
   for (unsigned int i = 0; i < vocab_size_; ++i) {
     byte_to_index_[vocab_bytes_[i]] = i;
   }
+// [this entry] Experimental multi-core pipeline (only when CMIX_TF_THREADS is set).
 #ifdef CMIX_PIPE
   if (options.tf_threads > 0 && transformer_ && !ppmd_only_ &&
       !transformer_only_) {
@@ -544,10 +649,12 @@ Predictor::Predictor(const std::vector<bool>& vocab,
   // 0xFF is not a vocabulary index, so the window cannot match the
   // separator before 15 real tokens have been seen.
   memset(separator_window_, 0xFF, sizeof(separator_window_));
+  // Extraction modes: only the PPMD (and the transformer it feeds) exist.
   if (ppmd_only_ || transformer_only_) {
     AddPPMD();
     return;
   }
+  // The full model. The order of these calls is the order of the layer-0 mixer inputs.
   AddBracket();
   // With load_transformer_probs the ppmd is not run: its mixer input is a
   // constant and the transformer's distributions come from the file.
@@ -560,6 +667,7 @@ Predictor::Predictor(const std::vector<bool>& vocab,
   auxiliary_size_ = 2;
 }
 
+// Number of layer-0 mixer inputs. Must count exactly what Predict() sets, in any order.
 unsigned long long Predictor::GetNumModels() {
   unsigned long long num = 0;
 
@@ -573,10 +681,15 @@ unsigned long long Predictor::GetNumModels() {
   num += 1;  // ppmd byte model (a constant input with
              // --load-transformer-probs)
   num += byte_mixer_->NumOutputs();
+  // [this entry] one more input: the online-adapted transformer prediction
   if (dyn_mixer_) num += dyn_mixer_->NumOutputs();
   return num;
 }
 
+// Adds one mixer to layer 0 or 1. `context` is a reference to a value kept up to date
+// elsewhere; at every bit the mixer uses the weight set that value selects.
+// [this entry] The learning rate can be overridden by the tune key lr<layer>_<index>
+// (e.g. lr1_0 = the final mixer); the value passed in is the shipped one.
 void Predictor::AddMixer(int layer, const unsigned long long& context,
     float learning_rate) {
   learning_rate = tune::Get("lr" + std::to_string(layer) + "_" +
@@ -593,6 +706,7 @@ void Predictor::AddMixer(int layer, const unsigned long long& context,
   }
 }
 
+// Bracket model, plus a direct and an indirect model on the bracket context.
 void Predictor::AddBracket() {
   bracket_model_.emplace(manager_.bit_context_, 200, 10, 100000, vocab_);
   const Context& context = manager_.AddBracketContext(manager_.bit_context_, 256, 15);
@@ -602,6 +716,11 @@ void Predictor::AddBracket() {
       manager_.bit_context_, 300, manager_.shared_map_);
 }
 
+// PPMD: order 25 byte-level model, heap size parameter 14000 MB (tune key ppmd_mb). It
+// is both a mixer input (its bit prediction) and the transformer's side input (its byte
+// distribution).
+// [this entry] In the CMIX_PIPE pipeline the PPMD reads its bytes from ppmd_byte_, because
+// it runs ahead of the coder; otherwise from the coder's current byte (bit_context_).
 void Predictor::AddPPMD() {
 #ifdef CMIX_PIPE
   if (pipe_) {
@@ -612,6 +731,8 @@ void Predictor::AddPPMD() {
   byte_model_.emplace(25, (int)tune::Get("ppmd_mb", 14000), manager_.bit_context_, vocab_);
 }
 
+// Word-level models: indirect models over combinations of the word hashes in
+// manager_.words_ (current and recent words), and match models keyed by word contexts.
 void Predictor::AddWord() {
   float delta = 200;
   std::vector<std::vector<unsigned int>> model_params = {
@@ -649,6 +770,8 @@ void Predictor::AddWord() {
   }
 }
 
+// Match models: predict the bit that followed the most recent occurrence of the current
+// context (pairs below are the parameters of the context hash).
 void Predictor::AddMatch() {
   float delta = 0.5;
   int limit = 200;
@@ -669,6 +792,9 @@ void Predictor::AddMatch() {
   }
 }
 
+// Two-step indirect models: the context of each is itself a lookup result, namely what
+// followed the current hashed context the last time it occurred (ind1..ind5, maintained
+// by ContextManager::UpdateWords).
 void Predictor::AddDoubleIndirect() {
   float delta = 400;
   indirect_ns_models_.emplace_back(manager_.nonstationary_, manager_.ind1,  manager_.bit_context_, delta, manager_.shared_map_);
@@ -676,14 +802,19 @@ void Predictor::AddDoubleIndirect() {
   indirect_ns_models_.emplace_back(manager_.nonstationary_, manager_.ind3,  manager_.bit_context_, delta, manager_.shared_map_);
   indirect_ns_models_.emplace_back(manager_.nonstationary_, manager_.ind5,  manager_.bit_context_, delta, manager_.shared_map_);
 }
+// Probability -> 12-bit integer in 1..4095, the scale fxcm uses internally.
 unsigned int Discretize(float p) {
   return 1 + 4094 * p;
 }
+// Creates the byte mixer(s), the two mixer layers and their inputs. Called last, when
+// the number of model outputs is known.
 void Predictor::AddMixers() {
   unsigned int vocab_size = 0;
   for (unsigned int i = 0; i < vocab_.size(); ++i) {
     if (vocab_[i]) ++vocab_size;
   }
+  // [this entry] CMIX_OFFICIAL: the Lstm class is not referenced at all, which keeps its
+  // code out of the submission binary; the byte mixer is a pure carrier there.
   // With the transformer the lstm is never run: the byte mixer only carries
   // the externally set distribution, so the lstm (and its memory) is not
   // allocated. Nothing after this point draws from rand(), so skipping the
@@ -695,11 +826,16 @@ void Predictor::AddMixers() {
       vocab_size, (transformer_ || neutral_transformer_) ? nullptr :
       new Lstm(vocab_size, vocab_size, 200, 1, 128, 0.03, 10));
 #endif
+  // [this entry] A second byte mixer that carries the online-adapted distribution. It is a
+  // separate mixer input, so the mixers themselves learn how far to trust the adaptation.
   if (!dyn_W_.empty() && dyn_mode_ == 1) {
     dyn_mixer_.emplace(1, manager_.bit_context_, vocab_, vocab_size, nullptr);
     dyn_scratch_.assign(vocab_size, 1.0f);
   }
 
+  // The input vectors of the two mixer layers. Inputs are stretched (logit) probabilities,
+  // clipped to [eps, 1 - eps] first. [this entry] eps is 5e-5 (upstream 1e-4), found by
+  // search; tune key input_eps.
   for (int i = 0; i < 2; ++i) {
     layers_.emplace_back(sigmoid_,
         tune::Get("input_eps", 5.0e-5));
@@ -709,6 +845,8 @@ void Predictor::AddMixers() {
   std::cout << "num models " << input_size << "\n";
   layers_[0].SetNumModels(input_size);
 
+  // Layer 0: 23 mixers over the same inputs, each with its own context (ContextManager
+  // maintains them) and learning rate.
   AddMixer(0, manager_.mx9, 0.005); 
   AddMixer(0, manager_.mx10, 0.0005); 
   AddMixer(0, manager_.mx11, 0.005); 
@@ -732,26 +870,42 @@ void Predictor::AddMixers() {
   AddMixer(0, manager_.mx16, 0.005);
   AddMixer(0, manager_.mx14, 0.005);
   AddMixer(0, manager_.mx15, 0.005);
+  // [this entry] Experiment, off by default (tf_mixer_buckets = 0): one more layer-0 mixer
+  // whose context is the bucketed transformer bit probability (see the end of Perceive).
   tf_mixer_buckets_ = (int)tune::Get("tf_mixer_buckets", 0);
   tf_mixer_mode_ = (int)tune::Get("tf_mixer_mode", 0);
   if (tf_mixer_buckets_ > 0 && tune::Get("tf_mixer_l0", 1)) {
     AddMixer(0, tf_ctx_, tune::Get("tf_mixer_lr", 0.002));
   }
 
+  // Layer 1 inputs: the layer-0 outputs, then fxcm's last output and the byte mixer bit
+  // (auxiliary_size_ = 2) [this entry] and, with dyn_l1, the adapted prediction.
   input_size = mixer_0_.size() + auxiliary_size_ + (dyn_mixer_ && dyn_l1_ ? 1 : 0);
   layers_[1].SetNumModels(input_size);
 
+  // The final mixer: a single weight set (zero_context_).
+  // [this entry] Learning rate 0.00015 (upstream 0.0003), found by search.
   // l1_ctx 1: the final mixer selects its weights by the transformer
   // confidence context (needs tf_mixer_buckets > 0)
   AddMixer(1, tune::Get("l1_ctx", 0) ? tf_ctx_ : manager_.zero_context_, 0.00015);
 
   layers_[0].SetExtraInputSize(mixer_0_.size());
+  // [this entry] Speed: prefetch each mixer's next weight row at the end of Perceive
+  // (output unchanged). CheckAllUsed aborts on a misspelt name in the CMIX_TUNE file.
   prefetch_mixers_ = tune::Get("prefetch_mixers", 1) != 0;
   tune::CheckAllUsed();
 
 }
+// Globals read by fxcm (models/fxcmv1.cpp), named after the LSTM they once came from:
+// lstmpr = the byte mixer's bit prediction on fxcm's 12-bit scale, lstmex = the most
+// probable byte among those still possible. byte_mixer_output = the same bit prediction
+// as a float, computed at the end of Perceive for the next Predict.
 int lstmpr=0, lstmex=0;
 float byte_mixer_output=0.0f;
+// P(next bit = 1). Collects every model's output into layers_[0] (in the order fixed by
+// the constructor), runs the layer-0 mixers, the final mixer and the SSE stage.
+// [this entry] PROF_BEGIN / PROF_MARK are timing marks that compile to nothing unless
+// -DCMIX_PROFILE is given.
 float Predictor::Predict() {
   if (ppmd_only_ || transformer_only_) {
     float p = byte_model_->Predict()[0];
@@ -814,17 +968,24 @@ float Predictor::Predict() {
       byte_model_ ? byte_model_->Predict()[0] : 0.5f);
   PROF_MARK(ppmd_pred);
 
+  // The transformer's (byte mixer's) bit prediction. If the byte distribution leaves only
+  // one possible value for this bit (exactly 0 or 1), that certainty overrides the mix.
   float byte_mixer_override = -1;
 
   if (byte_mixer_output == 0 || byte_mixer_output == 1) byte_mixer_override = byte_mixer_output;
   layers_[0].SetInput(input_index++, byte_mixer_output);
   auto byte_mixer_index = input_index - 1;
+  // [this entry] the online-adapted transformer prediction, next to the original
   if (dyn_mixer_) layers_[0].SetInput(input_index++, dyn_output_);
 
+  // Context for one layer-0 mixer: the average of fxcm's and the byte mixer's
+  // probabilities, in 16 steps.
   float auxiliary_average = Sigmoid::Logistic(layers_[0].Inputs()[fxcm_model_index]) + Sigmoid::Logistic(layers_[0].Inputs()[byte_mixer_index]);
   auxiliary_average /= auxiliary_size_;
   manager_.auxiliary_context_ =auxiliary_average * 15;
 
+  // Layer 0. Each output goes to the final mixer and into layers_[0]'s extra-input vector
+  // (see Mixer for how the extra inputs are used).
   for (unsigned int i = 0; i < mixer_0_.size(); ++i) {
     float p = mixer_0_[i].Mix();
     layers_[0].SetExtraInput(i, p);
@@ -833,19 +994,24 @@ float Predictor::Predict() {
   PROF_MARK(mixer0_mix);
   layers_[1].SetStretchedInput(mixer_0_.size(), layers_[0].Inputs()[fxcm_model_index]);
   layers_[1].SetStretchedInput(mixer_0_.size() + 1, layers_[0].Inputs()[byte_mixer_index]);
+  // [this entry] the adapted prediction also goes straight to the final mixer
   if (dyn_mixer_ && dyn_l1_)
     layers_[1].SetStretchedInput(mixer_0_.size() + 2, layers_[0].Inputs()[byte_mixer_index + 1]);
 
+  // Final mixer, then SSE (secondary estimation: refines p from what happened after
+  // similar predictions).
   float p = Sigmoid::Logistic(mixer_1_[0].Mix());
   PROF_MARK(mixer1_mix);
   p = sse_.Predict(p);
   PROF_MARK(sse_pred);
+  // [this entry] last_pred_ remembers the returned probability for --save-cmix-bits.
   if (byte_mixer_override >= 0) {
     return last_pred_ = byte_mixer_override;
   }
   return last_pred_ = p;
 }
 
+// --save-ppmd-probs: append the PPMD's byte distribution (vocabulary order, float16).
 void Predictor::WritePpmdProbs() {
   const std::valarray<float>& p = byte_model_->BytePredict();
   for (unsigned int i = 0; i < vocab_size_; ++i) {
@@ -854,6 +1020,7 @@ void Predictor::WritePpmdProbs() {
   ppmd_probs_writer_->Write(probs_scratch_.data(), vocab_size_);
 }
 
+// --load-transformer-probs: the byte distribution comes from a file, not the transformer.
 void Predictor::LoadTransformerProbs() {
   transformer_probs_reader_->Read(probs_scratch_.data(), vocab_size_);
   for (unsigned int i = 0; i < vocab_size_; ++i) {
@@ -896,6 +1063,8 @@ void Predictor::TransformerByteUpdate() {
     Fail("transformer: byte 0x%02x is not in the vocabulary",
         manager_.bit_context_);
   }
+  // [this entry] The token just coded is the target of the adapted prediction made one
+  // step ago: take the SGD step now, before the next prediction.
   if (dyn_valid_) DynLearn(token);
   memmove(separator_window_, separator_window_ + 1,
       sizeof(separator_window_) - 1);
@@ -912,6 +1081,9 @@ void Predictor::TransformerByteUpdate() {
     article_tokens_ = 0;
     dyn_valid_ = false;
   } else {
+// [this entry] CMIX_PIPE: a worker thread computed this step already; fetch its record.
+// Otherwise step the transformer here. Either way dyn_z_src_ / dyn_h_src_ point at the
+// step's logits and final hidden state, the inputs of the online adaptation.
 #ifdef CMIX_PIPE
     if (pipe_) {
       PipeFetch();
@@ -927,6 +1099,7 @@ void Predictor::TransformerByteUpdate() {
 #ifdef CMIX_PROFILE
     ++g_tf_steps;
 #endif
+    // [this entry] Compute the adapted distribution dyn_q_ for the next token.
     if (!dyn_W_.empty()) DynApply();  // mode 0: replaces transformer_probs_
     FloatsToHalves(transformer_probs_.data(), half_scratch_.data(),
         vocab_size_);
@@ -941,6 +1114,9 @@ void Predictor::TransformerByteUpdate() {
   // With --transformer-only there is no byte mixer: probs_scratch_ is the
   // final destination of the distribution (and what the loss is measured on).
   if (byte_mixer_) byte_mixer_->SetProbs(probs_scratch_.data());
+  // [this entry] Load the second byte mixer. Unlike the main path the adapted distribution
+  // is not rounded to float16 (it never existed in the offline pipeline); only the same
+  // lower bound is applied.
   if (dyn_mixer_) {
     // the adapted distribution, or (no transformer step) the same as above
     const float* src = dyn_valid_ ? dyn_q_.data() : probs_scratch_.data();
@@ -950,6 +1126,15 @@ void Predictor::TransformerByteUpdate() {
   }
 }
 
+// [this entry] Online adaptation, prediction half. With h = the transformer's final
+// hidden state (192 floats) and z = its logits (205) for the step just made:
+//   zz = z + dyn_b_ + dyn_W_ * h,   dyn_q_ = softmax(zz).
+// dyn_W_ is 205 x 192 fp32, zero at the start, and persists across articles: it learns
+// what the frozen transformer keeps getting wrong on this file. The same loop first
+// applies the SGD step DynLearn left pending (W_i = (1 - decay) * W_i + s_i * h_prev).
+// Compressor and decompressor must get identical floats, so every sum has a fixed
+// order (4 accumulators, fixed horizontal reduction), FMA is used explicitly, and exp
+// comes from our own polynomial (fx2::exp256_ps), not from the C library.
 // Adds the learned correction to the transformer's last logits and replaces
 // transformer_probs_ with the softmax of the result.
 void Predictor::DynApply() {
@@ -990,6 +1175,9 @@ void Predictor::DynApply() {
     r = _mm_add_ss(r, _mm_movehdup_ps(r));
     zz[i] = z[i] + b[i] + _mm_cvtss_f32(r);
   }
+  // Experimental second correction (dyn2_lr; off in the shipped configuration): one
+  // 208-vector per MLP unit of the selected layers, added in proportion to the unit's
+  // quantized activation.
   if (!dyn2_W_.empty()) {
     dyn2_row_.clear();
     dyn2_f_.clear();
@@ -1031,6 +1219,8 @@ void Predictor::DynApply() {
   r = _mm_add_ss(r, _mm_movehdup_ps(r));
   const float inv = 1.0f / _mm_cvtss_f32(r);
   for (int i = 0; i < n; ++i) q[i] *= inv;
+  // dyn_mode 0 only: overwrite the transformer's own output. In the shipped mode 1 it is
+  // left alone and dyn_q_ is used through dyn_mixer_.
   if (dyn_mode_ == 0) {
     for (int i = 0; i < n; ++i) transformer_probs_[i] = q[i];
   }
@@ -1038,6 +1228,9 @@ void Predictor::DynApply() {
   dyn_valid_ = true;
 }
 
+// [this entry] Online adaptation, learning half. The gradient of the cross-entropy with
+// respect to the logits is g = q - onehot(token); hence dW = g * h^T. Only the scale
+// factors s_i = -dyn_lr * g_i and the hidden state (swapped into dyn_hp_) are stored.
 // One SGD step on -ln q(token) for the prediction DynApply made last. The
 // bias is updated here; the update of W is deferred to the next DynApply,
 // which applies it in the same pass as its dot products (bit-identical: the
@@ -1097,7 +1290,10 @@ void Predictor::AccumulateTransformerLoss() {
   }
 }
 
+// Updates everything with the coded bit. After the 8th bit of a byte it also runs the
+// byte-level work: context updates, PPMD byte update, transformer step.
 void Predictor::Perceive(int bit) {
+  // Extraction modes (--ppmd-only / --transformer-only): no other model exists.
   if (ppmd_only_ || transformer_only_) {
     byte_model_->Perceive(bit);
     // Mirrors how ContextManager::UpdateContexts maintains bit_context_,
@@ -1116,6 +1312,9 @@ void Predictor::Perceive(int bit) {
     }
     return;
   }
+  // [this entry] --save-cmix-bits: write the logit of the prediction this bit was coded
+  // with (clamped away from 0 and 1). With --no-transformer this is "what cmix thinks
+  // without the transformer", the fixed partner in the mixture loss used for fine-tuning.
   if (cmix_bits_writer_) {
     float q = last_pred_;
     if (q < 1e-6f) q = 1e-6f;
@@ -1163,11 +1362,14 @@ void Predictor::Perceive(int bit) {
   sse_.Perceive(bit);
   PROF_MARK(sse_perc);
 
+  // bit_context_ holds a leading 1 followed by the bits of the current byte seen so far; a
+  // value >= 128 means this bit completes the byte.
   bool byte_update = false;
   if (manager_.bit_context_ >= 128) byte_update = true;
 
   manager_.UpdateContexts(bit);
   PROF_MARK(ctx_update);
+  // ---- byte boundary: byte-level updates ----
   if (byte_update) {
     if (print_transformer_loss_) AccumulateTransformerLoss();
     bracket_model_->ByteUpdate();
@@ -1187,6 +1389,10 @@ void Predictor::Perceive(int bit) {
     }
 
     PROF_MARK(models_byteupd);
+    // PPMD byte update, then the byte-level predictor that fills the byte mixer:
+    //   transformer (the entry's normal path), a uniform distribution ([this entry] neutral
+    //   slot), or upstream's LSTM fed with the PPMD distribution (generic -c/-d of the
+    //   non-official build).
     if (byte_model_) {
 #ifdef CMIX_PIPE
       if (pipe_) PipeAdvance();
@@ -1218,16 +1424,22 @@ void Predictor::Perceive(int bit) {
     }
     PROF_MARK(transformer);
   }
+  // Byte-mixer bit prediction for the NEXT bit, computed here because fxcm (lstmpr /
+  // lstmex) needs it before its own update below.
   byte_mixer_output = byte_mixer_->Predict()[0];
   if (dyn_mixer_) dyn_output_ = dyn_mixer_->Predict()[0];
+  // [this entry] dyn_fx (off by default) would give fxcm the adapted prediction instead.
   lstmpr=Discretize(dyn_fx_ && dyn_mixer_ ? dyn_output_ : byte_mixer_output);
   lstmex=dyn_fx_ && dyn_mixer_ ? dyn_mixer_->ex : byte_mixer_->ex;
   PROF_MARK(bytemixer_pred);
   fxcm_model_->Perceive(bit);
   PROF_MARK(fxcm_update);
+  // [this entry] Speed: all contexts for the next bit are final now, so ask the cache for
+  // each layer-0 mixer's next weight row before Predict needs it. Output unchanged.
   if (prefetch_mixers_) {
     for (auto& mixer : mixer_0_) mixer.Prefetch();
   }
+  // [this entry] Context of the optional transformer-confidence mixer (off by default).
   if (tf_mixer_buckets_ > 0) {
     int b = (int)(byte_mixer_output * tf_mixer_buckets_);
     if (b >= tf_mixer_buckets_) b = tf_mixer_buckets_ - 1;
@@ -1247,6 +1459,8 @@ void Predictor::Perceive(int bit) {
   if (byte_update)manager_.bit_context_ = 1;
 }
 
+// Pretraining step (dictionary text, before the first real byte): predict-and-update of
+// the context models only; no PPMD, no transformer, no mixers, nothing is coded.
 void Predictor::Pretrain(int bit) {
   bracket_model_->Predict();
   fxcm_model_->Predict();

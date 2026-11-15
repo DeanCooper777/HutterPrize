@@ -1,3 +1,10 @@
+// interval-hash.h: context = hash of the recent bytes after each byte is mapped to a small
+// class number (the `map` table: 256 entries, byte -> class).
+//
+// Inherited from cmix. Compiled, but not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #ifndef INTERVAL_HASH_H
 #define INTERVAL_HASH_H
 

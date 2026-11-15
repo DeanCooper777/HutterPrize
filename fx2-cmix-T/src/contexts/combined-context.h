@@ -1,3 +1,9 @@
+// combined-context.h: context = two other contexts packed into one number.
+//
+// Inherited from cmix. Compiled, but not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #ifndef COMBINED_CONTEXT_H
 #define COMBINED_CONTEXT_H
 

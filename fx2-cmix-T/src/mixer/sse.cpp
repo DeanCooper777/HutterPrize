@@ -1,6 +1,25 @@
 // This SSE code was written by Eugene Shelwien.
 // https://encode.ru/threads/2515-mod_ppmd
 
+
+// sse.cpp: the final probability refinement stage (SSE, also called APM), see sse.h.
+//
+// The probability from the final mixer goes through two interpolating SSE tables with
+// different contexts (s6, s7); two small mixers (x1, x2) blend the input and the two table
+// outputs. The contexts are built from the quantized input probability, the bits of the
+// current byte, the previous byte, and one flag per earlier byte. Everything is 15-bit fixed
+// point. Predictor::Predict calls SSE::Predict on the output of the final mixer;
+// Predictor::Perceive calls SSE::Perceive (src/predictor.cpp).
+// How it fits: preprocess -> dictionary -> context models / PPMD / transformer byte model
+// -> mixers -> [SSE] -> arithmetic coder -> self-extracting archive.
+//
+// Testing: tune keys sse_* (the constants below); experiments only.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+//   - The 16 tuning constants (M_f0C ... M_x2wr) are read through tune::Get, so they could be
+//     searched without rebuilding. The defaults are the previous entry's values, and the
+//     official build (CMIX_OFFICIAL) gets exactly those; the output is unchanged.
+
 #include "sse.h"
 #include "../tune.h"
 
@@ -12,6 +31,8 @@ typedef unsigned short word;
 typedef unsigned int uint;
 typedef unsigned char byte;
 
+// What SSE_Pred leaves behind for SSE_Update: the prediction (P), the interpolation weight
+// (sw) and the pair of table nodes used (C1).
 struct SSEi_updstr {
   int P;
   int sw;
@@ -19,6 +40,10 @@ struct SSEi_updstr {
   word *T;
 };
 
+// One SSE table row: SSEQuant nodes spread over the input probability range. SSE_Pred
+// interpolates between the two nodes around the input; SSE_Update moves the prediction
+// towards the coded bit with rate wr0 and writes it back to both nodes. Node values are
+// stored with an offset of 8192.
 template<int SSEQuant=7, int SCALElog=15, int InitFlag=0>
 struct SSEi {
 
@@ -80,6 +105,8 @@ double log2( double a ) { return M_LOG2E*log(a); }
 
 double exp2( double a ) { return exp( a/M_LOG2E ); }
 
+// st = stretch, sq = squash (its inverse), here in base 2. st_i / sq_i are the fixed-point
+// versions that fill the lookup tables t_st and t_sq below.
 double st( double p ) { return log2((1-p)/p); }
 
 double sq( double p ) { return 1.0/(1.0+exp2(p)); }
@@ -136,6 +163,8 @@ uint Init_ST_SQ( void ) {
 uint unused_0 = Init_ST_SQ();
 
 
+// Scale a value around the midpoint by C / 8192 (C > 8192 pushes it away from the middle,
+// C < 8192 pulls it in), clipped to the valid range.
 uint Extrap( int p1, int C ) {
   p1 = (((p1-hSCALE)*C) >> 13) + hSCALE;
   if( p1<1 ) p1=1;
@@ -152,6 +181,8 @@ uint WExtrap( int _p1, int C ) {
   return _p1+hSCALE;
 }
 
+// Two-input mixer with a single weight: output = s1 + w * (s0 - s1). Update moves w to
+// reduce the error of the mixed prediction pm.
 struct Mixer {
   int w;
 
@@ -179,6 +210,8 @@ struct Mixer {
   }
 };
 
+// Lookup tables that reduce the partial byte j (1..255) to fewer classes for the context of
+// mixer x1 (79 classes) and of table s7 (255 classes).
 static const byte M_mx1mask0[256]={ 0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,31,32,32,33,33,34,34,35,35,36,36,37,37,38,38,39,39,40,40,41,41,42,42,43,43,44,44,45,45,46,46,47,47,47,47,48,48,48,48,49,49,49,49,50,50,50,50,51,51,51,51,52,52,52,52,53,53,53,53,54,54,54,54,55,55,55,55,56,56,56,56,57,57,57,57,58,58,58,58,59,59,59,59,60,60,60,60,61,61,61,61,62,62,62,62,63,63,63,63,63,63,63,63,64,64,64,64,64,64,64,64,65,65,65,65,65,65,65,65,66,66,66,66,66,66,66,66,67,67,67,67,67,67,67,67,68,68,68,68,68,68,68,68,69,69,69,69,69,69,69,69,70,70,70,70,70,70,70,70,71,71,71,71,71,71,71,71,72,72,72,72,72,72,72,72,73,73,73,73,73,73,73,73,74,74,74,74,74,74,74,74,75,75,75,75,75,75,75,75,76,76,76,76,76,76,76,76,77,77,77,77,77,77,77,77,78,78,78,78,78,78,78,78 };
 
 
@@ -186,6 +219,10 @@ static const byte M_mx1mask0[256]={ 0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,1
 static const byte M_sm7mask0[256]={ 0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254 };
 
 
+// [this entry] Tuning constants, each readable as a tune key. M_f*C and M_sm*C1: Extrap
+// factors; M_sm6wr*, M_sm7wrB: update rates of the SSE tables; M_sm*mw: table
+// initialization; M_x*W0: initial mixer weights; M_x*wr: mixer learning rates. The defaults
+// are the previous entry's constants (they were `static const int`).
 static int M_f0C = (int)tune::Get("sse_f0C", 10240+0);
 static int M_f1C = (int)tune::Get("sse_f1C", 7935+0);
 static int M_f2C = (int)tune::Get("sse_f2C", 9592+0);
@@ -203,11 +240,15 @@ static int M_sm7C1 = (int)tune::Get("sse_sm7C1", 8202+0);
 static int M_x2W0 = (int)tune::Get("sse_x2W0", 2560+1);
 static int M_x2wr = (int)tune::Get("sse_x2wr", 8320+0);
 
+// Number of contexts of each mixer and each SSE table (the product of the ranges of the
+// context parts combined in M_Estimate).
 static const int M_mix1_Volume = 1* 4* (1<<8)* (1<<3)* 79;
 static const int M_mix2_Volume = 1* 3* (1<<1)* (1<<8)* 256;
 static const int M_sm6x_Volume = 1* 3* (1<<7)* (1<<8)* 256;
 static const int M_sm7x_Volume = 1* 3* (1<<5)* (1<<8)* 255;
 
+// All state of the stage. M_j: the bits of the current byte with a leading 1; M_pc: the
+// previous byte; M_ffl: history of one flag per byte (was the byte >= 0x40).
 struct M_T {
 
   SSEi_updstr su6,su7;
@@ -241,6 +282,9 @@ struct M_T {
 
 struct M_T1 : M_T {
 
+// Refine p (15-bit; see SSE::Predict for its sense). First the four context indices are
+// built, then: p1 = table s6 of p; s2 = mixer x1 of stretched p and p1; p2 = table s7 of
+// p; result = mixer x2 of s2 and stretched p2.
 uint M_Estimate( uint p ) {
   uint p0,p1,s0,s1,s2;
   uint p2,s4,s5;
@@ -289,6 +333,7 @@ uint M_Estimate( uint p ) {
   return mix2_p;
 }
 
+// Train the two tables and the two mixers on the coded bit and advance the byte context.
 void M_Update( uint bit ) {
   s6[sm6x].SSE_Update( bit, M_sm6wrA*128+M_sm6wrB, su6 );
   x1[mix1].Update( bit, mix1_s0,mix1_s1, M_x1wr, mix1_p );
@@ -318,6 +363,8 @@ SSE::~SSE() {
   delete sse_;
 }
 
+// input and result are probabilities of a 1 bit; the SSE code works on 15-bit probabilities
+// of a 0 bit in 1..32767, hence the two (1 - x) conversions.
 float SSE::Predict(float input) {
   int discrete = 1 + (1 - input) * 32766;
   int estimate = sse_->M_Estimate(discrete);

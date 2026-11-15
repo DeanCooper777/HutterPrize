@@ -1,3 +1,7 @@
+// lstm.hpp: implementation of Lstm (see lstm.h). Included at the end of lstm.h.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "lstm.h"
 
 #include <numeric>
@@ -75,6 +79,8 @@ inline void Lstm::LoadFromDisk(const std::string& path) {
   is.close();
 }
 */
+// Copy the external input (the byte distribution of the other byte models) into the first
+// input_size_ entries of every layer's input vector for this time step.
 inline void Lstm::SetInput(const std::valarray<float>& input) {
   for (unsigned int i = 0; i < layers_.size(); ++i) {
     std::copy(begin(input), begin(input) + input_size_,
@@ -82,6 +88,9 @@ inline void Lstm::SetInput(const std::valarray<float>& input) {
   }
 }
 
+// Learn the symbol that was just coded, then predict the next one. At the start of each
+// horizon (epoch_ == 0) the layers are trained by backpropagation through all time steps of
+// the horizon that just ended; the output layer is trained at every step.
 inline std::valarray<float>& Lstm::Perceive(unsigned int input) {
   int last_epoch = epoch_ - 1;
   if (last_epoch == -1) last_epoch = horizon_ - 1;
@@ -121,6 +130,8 @@ inline std::valarray<float>& Lstm::Perceive(unsigned int input) {
   return Predict(input);
 }
 
+// Forward pass: run the layers (each also gets the hidden state of the layer below), then
+// the output layer and a softmax. Returns the distribution over the output symbols.
 inline std::valarray<float>& Lstm::Predict(unsigned int input) {
   for (unsigned int i = 0; i < layers_.size(); ++i) {
     auto start = begin(hidden_) + i * num_cells_;

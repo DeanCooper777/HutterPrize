@@ -4,6 +4,17 @@
 // "dep" numbers are dependent-chain (each call's input depends on the
 // previous call's output — the realistic serial critical-path cost);
 // "tput" numbers let independent iterations overlap.
+//
+// Where it sits: speed tool for vec_math.h and glue.cpp (the non-matmul
+// parts of the transformer byte model: norms, quantizers, residual updates,
+// rope, prior path, output head). Not a correctness test (test_glue.cpp is)
+// and not part of cmix.
+//
+// Testing: build (from cpp_infer/) with `make -f src/opt/Makefile.glue`
+// (-> bin/bench_glue), run without arguments. Linux only. No pass/fail: it
+// prints cycles per element / per call and an estimate of the per-token cost.
+//
+// Unchanged from the previous winning entry.
 #include "../../bench/bench_common.h"
 
 #include <cstdint>

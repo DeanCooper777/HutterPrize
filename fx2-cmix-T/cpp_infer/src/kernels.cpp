@@ -1,3 +1,17 @@
+// kernels.cpp - the plain reference kernels behind the naive model
+// (model.cpp): rms norm, 8-bit activation quantizer, exact int8 dot product
+// and matrix x vector, Kimi causal conv / state recurrence / gated norm,
+// RoPE, sliding-window attention. Written for clarity; the contracts are in
+// kernels.h, the math in SPEC.md and KIMI_SEMANTICS.md.
+//
+// How it fits: reference only. The cmix binary links the optimized kernels
+// of opt/ instead; those are tested against the functions in this file.
+//
+// Testing: exercised through test_components / test_e2e, and used as the
+// reference by opt/test_qmat, test_attn, test_kda, test_glue, test_xcheck.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #include "kernels.h"
 
 #include <immintrin.h>
@@ -29,6 +43,8 @@ inline int32_t hsum256_i32(__m256i v) {
 
 }  // namespace
 
+// One accumulator, 8 lanes, fused multiply-add: the optimized code repeats
+// exactly this order so that its norms agree bit for bit.
 float sum_squares(const float* x, int n) {
   int i = 0;
   __m256 acc = _mm256_setzero_ps();
@@ -91,6 +107,7 @@ void quantize_i8(const float* x, int n, int n_pad, float scale, int8_t* q) {
   for (; i < n_pad; i++) q[i] = 0;
 }
 
+// sign-extend to int16, vpmaddwd into int32: exact for any int8 inputs
 int32_t dot_i8(const int8_t* a, const int8_t* b, int n) {
   __m256i acc = _mm256_setzero_si256();
   for (int i = 0; i < n; i += 16) {
@@ -103,6 +120,8 @@ int32_t dot_i8(const int8_t* a, const int8_t* b, int n) {
   return hsum256_i32(acc);
 }
 
+// the quantized linear layer: one exact integer dot and one fp32 multiply
+// per output row
 void qmatvec(const int8_t* w, int stride, const float* fold, int d_out,
              const int8_t* qx, float* y) {
   for (int o = 0; o < d_out; o++)

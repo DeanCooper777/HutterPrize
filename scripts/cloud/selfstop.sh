@@ -1,4 +1,10 @@
 #!/bin/bash
+# selfstop.sh: watch a run's log and stop the rented machine when the run has finished, so an
+# unattended job does not keep billing. Every launch script here starts it.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Stop this pod once a run's log has its final "exit" line, so a finished
 # pod does not sit idle and bill. Start it detached on the pod:
 #   nohup setsid bash /workspace/scripts/selfstop.sh /workspace/logs/runA.txt \

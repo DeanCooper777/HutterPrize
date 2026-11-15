@@ -1,3 +1,16 @@
+# export_testdata.py: writes the reference data that the C++ transformer inference
+# (cpp_infer/) is tested against.
+#
+# Where it fits: testing only. The compressor's transformer is a hand-written integer
+# re-implementation of pysrc/model.py; it has to reproduce the trained model, so this script
+# runs the PyTorch model on a fixed subset of articles and stores the inputs, the expected
+# output probabilities, the expected loss and per-component intermediate activations. The C++
+# tests in cpp_infer/ compare against these files.
+#
+# Testing: run on a GPU machine that has the training data; not needed to build the entry.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 """export the C++ inference test dataset to cpp_infer/data/ per
 cpp_infer/SPEC.md section 5
 
@@ -73,6 +86,7 @@ def bf16_value(scale: Tensor) -> float:
     return float(scale.detach().to(torch.bfloat16).to(torch.float32).item())
 
 
+# Collects named intermediate tensors through forward hooks, for a window of positions.
 class Capture:
     """forward hooks that slice the captured tensor to the dumped article's
     positions on the position axis (dim 1) and move it to cpu fp32 immediately"""
@@ -110,6 +124,7 @@ class Capture:
         self.handles = []
 
 
+# Attach hooks to every component whose output the C++ component tests check.
 def register_dump_hooks(model: Transformer, capture: Capture) -> None:
     kimi = model.cfg.kimi_linear
     assert kimi is not None
@@ -217,6 +232,7 @@ def register_dump_hooks(model: Transformer, capture: Capture) -> None:
     )
 
 
+# Range statistics of the activations (how close they come to the quantizers' clamp limits).
 class MicroBatchStats:
     """diagnostic statistics over the valid (non padding) positions of one
     micro batch: per-layer fraction of zero ints in the quantization of the mlp
@@ -287,6 +303,7 @@ class MicroBatchStats:
         self.handles = []
 
 
+# Dump all intermediates of one diagnostic article as .npy files plus a meta.json.
 def dump_article(
     model: Transformer,
     data: CollatedArticlesDataLoader,

@@ -1,3 +1,12 @@
+# save_outputs.py (recipe): load the final checkpoint models/6m-q4-fp32.tch and write the
+# model's probabilities for a fixed random subset of 1024 articles, plus the matching token
+# and boundary files, into data/.
+#
+# Testing: these files are the reference the C++ inference tests are built from
+# (pysrc/export_testdata.py). Single GPU, no training.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 import torch
 
 from pysrc.model import Transformer, TransformerConfig, MatmulQuantization
@@ -13,6 +22,7 @@ def main() -> None:
 
     quantization_block_size: int | None = None
 
+    # Quantizers: 15-level weights (-7..7, one scale per row), 256-level matmul inputs.
     weight_quantization = Quantization(
         buckets=15,
         block_size=quantization_block_size,

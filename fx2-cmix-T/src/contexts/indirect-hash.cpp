@@ -1,3 +1,7 @@
+// indirect-hash.cpp: IndirectHash, see indirect-hash.h. Not instantiated by this entry.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): unchanged.
+
 #include "indirect-hash.h"
 
 IndirectHash::IndirectHash(const unsigned int& bit_context, unsigned int order1,
@@ -10,6 +14,8 @@ IndirectHash::IndirectHash(const unsigned int& bit_context, unsigned int order1,
   hashes_.resize(size1_, 0);
 }
 
+// Store the updated history under the old first-level hash, move the first-level hash on by
+// one byte, and load the history stored under the new hash.
 void IndirectHash::Update() {
   hashes_[context1_] = (context_ * (1 << hash_size2_) + byte_) % size_;
   context1_ = (context1_ * (1 << hash_size1_) + byte_) % size1_;

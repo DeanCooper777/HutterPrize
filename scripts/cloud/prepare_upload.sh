@@ -1,4 +1,13 @@
 #!/bin/bash
+# prepare_upload.sh: assemble what the data-generation machine needs (datagen.sh): the
+# compressor sources, the preprocessed stream with hashes, the article boundaries, and
+# reference outputs of the local build on a prefix of the stream. The reference outputs let
+# datagen.sh check that the Linux build produces the same PPMD priors as the build the stream
+# came from.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Assemble runs/upload/ for the cloud data pod (scripts/cloud/datagen.sh).
 # Runs on Windows (Git Bash) with the build/cmix_dump.exe of the current source.
 set -euo pipefail

@@ -1,3 +1,14 @@
+# split_experiment.py: an experiment that asks whether enwik-style data compresses better when
+# it is first dealt out, block by block, into two files that are then compressed separately.
+#
+# Testing: an experiment tool only; nothing here is part of the entry. It searches block
+# schedules, writes the two halves, checks that they join back to the original, compresses
+# whole / A / B with a development build of the compressor and reports the sizes. The entry
+# compresses enwik9 as one stream.
+# Inputs: a test file (default data/enwik6), a compressor build under build/, the dictionary
+# and the weights file. Outputs: files and logs under runs/.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
 """Block-interleave split experiment.
 
 Split scheme (as proposed): the file is cut into consecutive blocks
@@ -38,6 +49,8 @@ WEIGHTS = os.path.join(ROOT, "fx2-cmix-T", "models", "6m-q4-fp32.tfwc2")
 
 
 # ---------------------------------------------------------------- split / join
+# The split is fully described by the schedule; these three functions cut the data into
+# blocks, deal them out alternately, and reverse the process.
 def block_bounds(schedule, n):
     """schedule: [(N1,J1), ..., (None,Jk)] -> list of (start, end, piece)."""
     out, pos, k = [], 0, 0
@@ -72,6 +85,7 @@ def join(a, b, schedule, n):
     return bytes(out)
 
 
+# Size of the side information: the schedule coded as variable-length integers.
 def varint(x):
     out = bytearray()
     while True:
@@ -94,6 +108,8 @@ def fmt(schedule):
 
 
 # ---------------------------------------------------------------- scoring
+# Cheap proxies for "A and B are statistically different": Jensen-Shannon divergence of the
+# byte-pair histograms, and lzma(A) + lzma(B) - lzma(whole).
 def bigram_hist(buf):
     x = np.frombuffer(buf, dtype=np.uint8).astype(np.int64)
     return np.bincount(x[:-1] * 256 + x[1:], minlength=65536).astype(np.float64)
@@ -110,6 +126,8 @@ def lz(buf):
     return len(lzma.compress(buf, preset=6))
 
 
+# Enumerate one- and two-level schedules over a geometric grid of block sizes, drop the
+# unbalanced ones, rank by divergence, then score the best with the lzma proxy.
 def search(data, min_frac=0.3, top=8):
     n = len(data)
     sizes = sorted({int(16 * 1.5 ** i) for i in range(40) if 16 * 1.5 ** i <= n // 2})
@@ -147,6 +165,7 @@ def search(data, min_frac=0.3, top=8):
 
 
 # ---------------------------------------------------------------- cmix
+# One fresh compressor run; returns (compressed size, seconds).
 def cmix(path, out, mode, log):
     args = [EXE]
     if mode == "transformer":

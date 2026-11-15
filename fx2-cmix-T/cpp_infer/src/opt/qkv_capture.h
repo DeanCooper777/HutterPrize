@@ -1,6 +1,13 @@
 // Loader for the real-data q/k/v capture written by capture_qkv.cpp
 // (data/attn_qkv_article22.bin): per vanilla layer (3/7/11), the post-rope
 // int8 q/k/v ints of every captured position + the static per-head scales.
+//
+// How it fits: test / benchmark input only (test_attn, bench_attn), so the
+// attention kernels are measured on real queries, keys and values. Not part
+// of the cmix binary.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <cstdint>

@@ -1,10 +1,52 @@
+// self_extract.h: how the compressor package (comp9, built as run/cmix) and the
+// self-extracting archive (archive9) carry their payload, and the code that unpacks it.
+// Both files are an ordinary executable with data appended; the last 16 bytes of the file
+// are a HeaderInfo trailer that gives the sizes of the appended sections, so the sections
+// are located by counting back from the end of the file.
+//
+// comp9 = run/cmix, sections in file order (assembled by build_and_construct_comp.sh):
+//   1. the executable (packed);       size = file size - (2) - (3) - (4) - 16
+//   2. the WRT dictionary, cmix-compressed with plain -c;   dict_size bytes
+//   3. the article order, cmix-compressed with plain -c;    new_article_order_size bytes
+//   4. the transformer weights file, stored as it is;       tf_weights_size bytes
+//   5. HeaderInfo trailer; decomp_input_size = 0.           16 bytes
+//
+// archive9, sections in file order (assembled by the -e branch of main() in runner.cpp):
+//   1. the same executable, byte for byte (section 1 of comp9);
+//   2. the compressed dictionary (section 2 of comp9);      dict_size bytes
+//   3. the transformer weights (section 4 of comp9);        tf_weights_size bytes
+//   4. the cmix-coded enwik9 stream (the OUT file of -e);   decomp_input_size bytes
+//   5. HeaderInfo trailer: comp9's trailer with decomp_input_size filled in. Its
+//      new_article_order_size field still holds comp9's value, but archive9 has no
+//      article-order section and the decompressor does not use the field (it restores
+//      the article order by sorting on <id>).                16 bytes
+//
+// The executable, the dictionary and the weights are therefore paid for twice in the
+// score S = size(comp9) + size(archive9); that is why this entry shrinks the binary
+// (CMIX_OFFICIAL, custom packer) and the weights file (new weight coder).
+//
+// The trailer is four 32-bit ints in the machine's byte order (little endian on x86-64),
+// so every section must be smaller than 2 GB.
+//
+// Place in the pipeline: the last stage (self-extracting archive). selfextract_comp() is
+// the first step of "cmix -e"; selfextract_decomp() is the first step of running archive9.
+// Both call the executable itself as a subprocess ("-d") to decompress the small embedded
+// tables with the cmix model.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1): the executable names
+// and the subprocess prefix are macros so that the Windows development build works
+// (cmix.exe / archive9.exe). The layout itself is unchanged.
+
 #ifndef SELF_EXTRACT_H 
 #define SELF_EXTRACT_H 
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <malloc.h>
 
+// [this entry] Portability (Windows development build). The file must be started from its
+// own directory under exactly this name, because it re-opens itself by name.
 // Executable names. On Windows the self-extracting files must carry an .exe
 // extension to be runnable, and subprocesses go through cmd.exe.
 #ifdef _WIN32
@@ -109,6 +151,8 @@ void VerifyDictionary(const char* path) {
   }
 }
 
+// The 16-byte trailer at the very end of comp9 and archive9 (see the top of this file).
+// All sizes in bytes.
 struct HeaderInfo {
   int dict_size;
   int new_article_order_size;
@@ -118,6 +162,8 @@ struct HeaderInfo {
   int tf_weights_size;
 };
 
+// Raw read / write of a trailer as a 16-byte file (header.dat, test.dat,
+// header4archive.dat).
 void write(const std::string& file_name, HeaderInfo& data) {
   FILE *out = fopen(file_name.c_str() , "wb" );
   fwrite(&data , 1 , sizeof(HeaderInfo) , out );
@@ -136,6 +182,12 @@ void read(const std::string& file_name, HeaderInfo& data) {
 // 2) dictionary (get's it in compressed form and decompresses it)
 // 3) new order of articles (get's it in compressed form and decompresses it)
 // 4) transformer weights (compressed FX2TFWC2 file, used as extracted)
+// Files written into the working directory:
+//   test.dat                 a copy of the trailer (reused when archive9 is assembled)
+//   .decomp_bin              section 1, the executable; becomes the head of archive9
+//   .dict.comp               section 2;  decompressed to .dict (and verified)
+//   .new_article_order.comp  section 3;  decompressed to .new_article_order
+//   .tfweights               section 4, loaded directly by the transformer
 int selfextract_comp() {
   HeaderInfo header;
 
@@ -161,11 +213,29 @@ int selfextract_comp() {
   //Remove dictionary if present
   remove(".dict");
   
+  // Everything in front of the appended sections is the executable.
   size_t decmpressor_binary_size = fsize - header.dict_size - header.new_article_order_size - header.tf_weights_size - sizeof(HeaderInfo);
 
 // produce actual decompressor binary
+  // [this entry] Decompressor form of the packed executable. In comp9's trailer the field
+  // decomp_input_size is otherwise unused (0); the build stores there the "cut": the number of
+  // leading bytes of the packed executable that the decompressor needs. The packer codes the
+  // compress-only functions last (packer/pk.cpp, "hole"), so the decompressor is this same file
+  // cut short, with two header fields changed: byte 9 of the ELF header (padding) is set to 1,
+  // which tells the unpacking stub to stop before the hole, and the file size of its one
+  // program header (p_filesz, 8 bytes at offset 96: the stub's ELF header is followed directly
+  // by a single program header, packer/stub.ld) is set to the new length, because the kernel
+  // refuses to load a segment that claims more bytes than the file has. 0 (or a value that is
+  // not smaller than the executable): the whole executable is copied, as in the previous entry.
+  size_t decomp_copy_size = decmpressor_binary_size;
+  if (header.decomp_input_size > 128 && (size_t)header.decomp_input_size < decmpressor_binary_size) {
+    decomp_copy_size = header.decomp_input_size;
+    p1[9] = 1;
+    uint64_t filesz = decomp_copy_size;
+    memcpy(p1 + 96, &filesz, 8);
+  }
   fo = fopen(".decomp_bin", "wb");
-  fwrite(p1, decmpressor_binary_size, 1, fo);
+  fwrite(p1, decomp_copy_size, 1, fo);
   fclose(fo);
 
 // produce dictionary and decompress it
@@ -201,6 +271,11 @@ int selfextract_comp() {
 // 2) dictionary (get's it in compressed form and decompresses it)
 // 3) transformer weights (compressed FX2TFWC2 file, used as extracted)
 // 4) the cmix-compressed enwik9 payload
+// Files written into the working directory:
+//   test.dat             a copy of the trailer
+//   .dict.comp_decomp    section 2;  decompressed to .dict (and verified)
+//   .tfweights           section 3, loaded directly by the transformer
+//   .ready4cmix_decomp   section 4, the coded enwik9 stream
 int selfextract_decomp() {
   HeaderInfo header;
   FILE *f = NULL, *fo = NULL;
@@ -222,6 +297,8 @@ int selfextract_decomp() {
   //Remove dictionary if present
   remove(".dict");
   
+  // The executable is what precedes the three appended sections. new_article_order_size is
+  // not subtracted: archive9 has no article-order section.
   size_t decmpressor_binary_size = fsize - header.dict_size - header.tf_weights_size - header.decomp_input_size - sizeof(HeaderInfo);
 
   fo = fopen(".dict.comp_decomp", "wb");

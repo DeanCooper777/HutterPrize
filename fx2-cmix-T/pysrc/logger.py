@@ -1,3 +1,13 @@
+# logger.py: training metrics (loss, running averages, throughput, learning rates) to stdout,
+# a JSON-lines file and / or Weights & Biases.
+#
+# Where it fits: training side only; pysrc/train.py calls train_step() once per optimizer
+# step. Under multi-GPU training every rank calls it so that the loss can be averaged across
+# ranks, but only rank 0 writes anything. With the cmix-aware loss the logged "loss" is the
+# mixture loss per token, not the transformer's own cross-entropy.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): Unchanged from the
+# previous winning entry.
 import json
 from os.path import isfile
 from pathlib import Path
@@ -35,6 +45,7 @@ class LoggerConfig:
     running_average_momentum: float = 0.99
 
 
+# One per process. Keeps the running-average and per-epoch loss state.
 @dataclass(slots=True)
 class Logger:
     model: Transformer
@@ -216,6 +227,8 @@ class Logger:
         print()
 
 
+# Rough throughput estimate: 6 (training) or 2 (inference) floating-point operations per
+# active parameter per token, in teraflops.
 def mfu_teraflops(
     n_active_parameters: int, n_tokens: int, training: bool, duration_seconds: float
 ) -> float:

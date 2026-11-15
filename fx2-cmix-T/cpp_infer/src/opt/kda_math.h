@@ -16,6 +16,14 @@
 //                src/kernels.cpp sum_squares/hsum256 (one accumulator, 8
 //                sequential fmas, the same shuffle tree), so l2norm and
 //                gated-norm statistics match the naive path bit-for-bit.
+//
+// How it fits: included by kda.cpp, and by model_opt.cpp for hsum256v (the
+// beta projection's dot product).
+//
+// Testing: test_kda.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include <immintrin.h>

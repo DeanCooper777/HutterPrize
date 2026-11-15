@@ -12,6 +12,16 @@
 // vpmaddubsw(act_pair_u8, interleaved_s8): 384 MACs per 12 madd-pipe ops.
 // 16-bit accumulators (12 ymm = 192 rows) are widened into an int32[192]
 // buffer every 18 pairs (18 * 2 * 127 * 7 = 32004 < 32767: no saturation).
+//
+// How it fits: model_opt.cpp calls qsparse_make_idx + qsparse4_f32 /
+// qsparse4_dense_f32 for the prior embedding on every symbol, and
+// qsparse4_add / qsparse4_dense_add for mlp.down on the 8-bit path only
+// (CMIX_ACT16 bit 1 clear; by default mlp.down runs in act16.cpp).
+//
+// Testing: test_qmat.cpp, bench_qmat.cpp.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// Unchanged from the previous winning entry.
 #pragma once
 
 #include "qmat.h"

@@ -1,4 +1,11 @@
 #!/bin/bash
+# run_B.sh: the three training stages plus export for experiment "run B" (a smaller
+# transformer trained from scratch with the mixture loss). Rejected: see
+# docs/NEW_TRANSFORMER_PLAN.md. Output: RUN_DIR/models/6m-q4-fp32-A.tfwc2 and checkpoints.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Run B of docs/NEW_TRANSFORMER_PLAN.md (2026-11-09): a model with MLP width
 # B_DMLP (default 384) trained from scratch with the cmix mixture loss on all
 # GPUs of this pod, in three stages like upstream, then export.

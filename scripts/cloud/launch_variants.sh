@@ -1,4 +1,12 @@
 #!/bin/bash
+# launch_variants.sh: run several variants of the cmix-aware fine-tune (run_A_opt.sh with
+# different environment settings) one after another on one GPU machine, then stop the machine.
+# This is how the mixer-context, cross-entropy-weight, MLP-width and MLP-bits variants listed
+# in SUBMISSION.md ("Experiments that did not make it") were trained.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Run one or more run-A variants one after another on this GPU pod, then
 # stop the pod (selfstop.sh). Each spec is "DIR A_EPOCHS COOLDOWN_EPOCHS
 # [VAR=value ...]" (2026-11-08):

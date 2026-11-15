@@ -1,5 +1,27 @@
 // test_e2e: stream all 1024 test articles, compute the loss two ways, compare
 // with ref_loss.txt and with the reference probability file (SPEC section 6)
+//
+// What it verifies: the NAIVE reference transformer (fx2::Transformer in
+// model.cpp / kernels.cpp) reproduces the Python/PyTorch model. Reference =
+// the files written by the Python side into the data directory: ref_loss.txt
+// (fp32 loss sum / count / mean over the test set) and test_ref_probs.f16
+// (the 205-way probability row for every position).
+//
+// Where it sits: the first link of the validation chain. This naive model is
+// the oracle for the optimized model in opt/ (opt/test_e2e_opt.cpp repeats
+// this test on it, opt/test_xcheck.cpp compares the two directly), and the
+// optimized model is the transformer byte model that cmix feeds to its mixers.
+// So this test protects model.cpp / kernels.cpp, and through them the
+// correctness claim of opt/model_opt.cpp.
+//
+// Testing: build with `make test_e2e` in cpp_infer/ (-> bin/test_e2e), run as
+//   bin/test_e2e [--data DIR] [--articles N] [--lowprob-skip [THR]]
+// Pass (full run only): "VERDICT: PASS ..." and exit code 0, i.e. the mean
+// loss is within 0.1% of the reference (0.01% is the target). A subset run
+// (--articles N) prints the statistics but gives no verdict. --lowprob-skip
+// turns on the approximate attention mode and is only for experiments.
+//
+// Unchanged from the previous winning entry.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -138,6 +160,9 @@ int main(int argc, char** argv) {
   std::printf("loss (b, sanity, from probs):    sum %.6f  mean %.10f\n",
               loss_probs, mean_probs);
 
+  // The reference loss covers the whole test set, so only a full run can be
+  // judged. The exit code follows the 0.1% budget; the probability comparison
+  // is reported for information and does not affect it.
   bool full_run = (n_articles == td.n_articles);
   if (full_run) {
     if (count != ref_count)

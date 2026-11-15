@@ -12,6 +12,25 @@
 //      ids+masks recorded for PV.
 //   4. PV over kept rows only: int8 V row -> vpmovsxbd + vcvtdq2ps + fmadd
 //      into 8 fp32 accumulators; (sv/den) folded into one final multiply.
+//
+// In plain terms: for each of the 3 heads, (1) score every stored key
+// against the query (exact integer dot products), (2) turn the scores into
+// softmax weights, (3) output the weighted sum of the stored values.
+//
+// How it fits: the attention mechanism of the three vanilla layers (3, 7,
+// 11) of the transformer byte model; called once per such layer per symbol
+// from model_opt.cpp (van_layer), between the q/k/v projections and the
+// output projection. cmix uses the int8-V cache (AttnKV) unless the tune key
+// attn_f32 is set.
+//
+// Testing: test_attn (against the naive kernels.cpp attention; the three KV
+// layouts must agree bitwise), bench_attn; -DATTN_PROFILE adds per-phase
+// tick counters.
+//
+// Changes from the previous winning entry (fx2-cmix-transformer-v1):
+// - [this entry] the score / exp scratch buffers become thread_local in
+//   -DCMIX_PIPE builds (several model instances stepping on different
+//   threads; experiments only). The submitted build is unchanged here.
 #include "attn.h"
 
 #include <immintrin.h>
@@ -43,6 +62,7 @@ inline uint64_t prof_rd() {
 #define PROF_ADD(i, a, b) (void)0
 #endif
 
+// [this entry] ATTN_SCRATCH
 // scratch (single-threaded; see attn.h). Builds with -DCMIX_PIPE step
 // several model instances on different threads, so there it is per thread.
 #ifdef CMIX_PIPE
@@ -53,6 +73,7 @@ inline uint64_t prof_rd() {
 alignas(64) ATTN_SCRATCH float g_sc[ATTN_WIN + 32];  // scores, padded with -inf
 alignas(64) ATTN_SCRATCH float g_eb[ATTN_WIN + 32];  // exp values (+0.0 = excluded lane)
 
+// horizontal sum / max of the 8 lanes
 inline float hsum8(__m256 v) {
   __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
   lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
@@ -391,6 +412,7 @@ inline void pv_dense(const float* v, const float* eb, int n, float rfac,
   pv_dense_f32(v, eb, n, rfac, out64);
 }
 
+// sparse PV: only the rows whose softmax weight is nonzero
 template <typename VT>
 __attribute__((noinline)) void pv_sparse(const VT* vh, const float* eb, int n,
                                          float rfac, float* out64) {
@@ -419,6 +441,7 @@ __attribute__((noinline)) void pv_sparse(const VT* vh, const float* eb, int n,
     _mm256_store_ps(out64 + t * 8, _mm256_mul_ps(acc[t], vf));
 }
 
+// chooses dense or sparse PV by the fraction of kept positions
 template <typename VT>
 inline void pv_pass(const VT* vh, const float* eb, int n, int kept, float rfac,
                     float* out64) {
@@ -431,6 +454,9 @@ inline void pv_pass(const VT* vh, const float* eb, int n, int kept, float rfac,
 // ---------------------------------------------------------------------------
 // full step
 // ---------------------------------------------------------------------------
+// One attention step for all 3 heads: widen the query, score, softmax, PV.
+// den = softmax denominator; sv3[h] / den is the single factor applied to the
+// accumulated value rows.
 template <typename KV, bool FIXED>
 inline void attn_impl(const KV& kv, const int8_t* q192, const float* coef3,
                       const float* sv3, int n, float* out192, float thr_in,
@@ -485,6 +511,7 @@ inline void kt_insert_head(int16_t* dst_pair0, const int8_t* k64) {
 // ---------------------------------------------------------------------------
 // public entry points
 // ---------------------------------------------------------------------------
+// store the current position's quantized key and value in ring slot `slot`
 void attn_kv_insert(AttnKV& kv, int slot, const int8_t* k192,
                     const int8_t* v192) {
   const int b = slot >> 4, l = slot & 15;
@@ -518,6 +545,7 @@ void attn_kv_insert(AttnKVF32& kv, int slot, const int8_t* k192,
   }
 }
 
+// window not yet full: n valid slots
 void attn_step_var(const AttnKV& kv, const int8_t* q192, const float* coef3,
                    const float* sv3, int n, float* out192, float skip_threshold,
                    int* kept3) {
@@ -537,6 +565,7 @@ void attn_step_var(const AttnKVF32& kv, const int8_t* q192, const float* coef3,
                               kept3);
 }
 
+// window full: all 1024 slots
 void attn_step_fixed(const AttnKV& kv, const int8_t* q192, const float* coef3,
                      const float* sv3, float* out192, float skip_threshold,
                      int* kept3) {
