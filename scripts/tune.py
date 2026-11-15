@@ -2,7 +2,7 @@
 # learning-rate decay schedule, SSE constants, the online-adaptation rate, ...).
 #
 # How it works: the development build reads overrides "name value" from the file named by the
-# environment variable CMIX_TUNE (fx2-cmix-T/src/tune.h, tune::Get(name, default)). This
+# environment variable CMIX_TUNE (cmix-T-dwc/src/tune.h, tune::Get(name, default)). This
 # script writes such a file, runs a compress-only job on a test prefix, and records the
 # compressed size; results are cached by (file, executable hash, parameters).
 #
@@ -12,7 +12,7 @@
 # reporting, and it may lag behind the source; the defaults in the C++ are authoritative.
 #
 # Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
-"""Parameter tuning harness for fx2-cmix-T (runtime overrides via CMIX_TUNE).
+"""Parameter tuning harness for cmix-T-dwc (runtime overrides via CMIX_TUNE).
 
 Each evaluation compresses a test file with build/cmix_tune.exe (compress
 only) using a parameter file, and the score is the compressed size. Runs are
@@ -49,8 +49,8 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DICT = os.path.join(ROOT, "fx2-cmix-T", "dictionary", "english.dic")
-WEIGHTS = os.path.join(ROOT, "fx2-cmix-T", "models", "6m-q4-fp32.tfwc2")
+DICT = os.path.join(ROOT, "cmix-T-dwc", "dictionary", "english.dic")
+WEIGHTS = os.path.join(ROOT, "cmix-T-dwc", "models", "6m-q4-fp32.tfwc2")
 WORK = os.path.join(ROOT, "runs", "tune")
 CACHE = os.path.join(WORK, "cache.json")
 LOG = os.path.join(ROOT, "tune_results.csv")

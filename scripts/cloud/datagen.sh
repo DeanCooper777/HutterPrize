@@ -3,7 +3,7 @@
 # Where it fits: first step of retraining. The compressor's test options dump (a) the token
 # stream and PPMD's distribution for every token (inputs of the transformer) and (b) cmix's
 # per-bit predictions made without the transformer (the target-side input of the cmix-aware
-# mixture loss, fx2-cmix-T/pysrc/cmix_loss.py). fx2-cmix-T/pysrc/data.py reads these files.
+# mixture loss, cmix-T-dwc/pysrc/cmix_loss.py). cmix-T-dwc/pysrc/data.py reads these files.
 # Inputs and outputs are listed below.
 #
 # Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
@@ -49,7 +49,7 @@ build() {
   fi
   rm -rf "$LOCAL/src" && mkdir -p "$LOCAL/src"
   tar xzf "$U/src.tar.gz" -C "$LOCAL/src"
-  cd "$LOCAL/src/fx2-cmix-T"
+  cd "$LOCAL/src/cmix-T-dwc"
   make CC=$CLANG CFLAGS_DEFINES="-DSEED=923 -DUPDATE_LIMIT=3000" cmix
   cp cmix "$LOCAL/cmix"
   [ -f "$U/stream.bin" ] || gunzip -k "$U/stream.bin.gz"

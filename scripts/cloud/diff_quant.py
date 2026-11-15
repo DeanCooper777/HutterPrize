@@ -1,5 +1,5 @@
 # diff_quant.py: debugging aid for the fused fake quantization
-# (fx2-cmix-T/pysrc/quantization.py). Runs one real training micro batch and compares, call by
+# (cmix-T-dwc/pysrc/quantization.py). Runs one real training micro batch and compares, call by
 # call, the fused implementation with the eager reference of the previous winner. This is how
 # the rounding difference described at _COMPILE_OPTIONS in quantization.py was located.
 # Output: a report on stdout.

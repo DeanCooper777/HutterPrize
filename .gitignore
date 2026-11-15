@@ -29,17 +29,17 @@
 __pycache__/
 *.pyc
 .venv/
-fx2-cmix-T/data/
+cmix-T-dwc/data/
 wandb/
 
 # Intermediate checkpoints (the .tfwc2 weights and the final checkpoints are kept)
-fx2-cmix-T/models/*-Aold*.tch
-fx2-cmix-T/models/*-Aopt*.tch
-fx2-cmix-T/models/*.mixer.tch
+cmix-T-dwc/models/*-Aold*.tch
+cmix-T-dwc/models/*-Aopt*.tch
+cmix-T-dwc/models/*.mixer.tch
 
 # Runtime temporaries
 *.cmix.temp
 ppm*.temp
 
 # Run B progress-bar logs (huge)
-fx2-cmix-T/models/runB/*.log
+cmix-T-dwc/models/runB/*.log

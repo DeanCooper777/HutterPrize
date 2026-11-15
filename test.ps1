@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Round-trip test of fx2-cmix-T on the enwik test files.
+  Round-trip test of cmix-T-dwc on the enwik test files.
 
 .DESCRIPTION
   For each requested size, compresses data\enwikN with build\cmix_orig.exe,
@@ -52,7 +52,7 @@
 # match the input". With -SkipDecompress nothing is verified (Verified is
 # empty); only size and time are recorded.
 #
-# Protects: everything under fx2-cmix-T\src and cpp_infer that takes part in
+# Protects: everything under cmix-T-dwc\src and cpp_infer that takes part in
 # coding. Any change that makes compressor and decompressor disagree shows up
 # here as a failed round trip.
 
@@ -65,7 +65,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Root    = $PSScriptRoot
-$Src     = Join-Path $Root 'fx2-cmix-T'
+$Src     = Join-Path $Root 'cmix-T-dwc'
 $Exe     = Join-Path $Root 'build\cmix_orig.exe'
 $Dict    = Join-Path $Src 'dictionary\english.dic'
 $Weights = Join-Path $Src 'models\6m-q4-fp32.tfwc2'

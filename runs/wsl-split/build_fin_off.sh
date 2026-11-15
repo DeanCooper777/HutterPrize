@@ -3,8 +3,8 @@
 # symbol sizes for packer / layout work.  Output in /root/b_fin.
 P=/mnt/c/Dean/Projects/HutterPrize
 B=/root/b_fin; rm -rf $B; mkdir -p $B
-cd $P && tar cf - --exclude=fx2-cmix-T/models/runB --exclude='*.tch' --exclude=fx2-cmix-T/.venv --exclude='*.o' --exclude=fx2-cmix-T/run --exclude=fx2-cmix-T/pgo_data fx2-cmix-T | tar xf - -C $B
-cd $B/fx2-cmix-T; chmod +x build_and_construct_comp.sh
+cd $P && tar cf - --exclude=cmix-T-dwc/models/runB --exclude='*.tch' --exclude=cmix-T-dwc/.venv --exclude='*.o' --exclude=cmix-T-dwc/run --exclude=cmix-T-dwc/pgo_data cmix-T-dwc | tar xf - -C $B
+cd $B/cmix-T-dwc; chmod +x build_and_construct_comp.sh
 md5sum models/6m-q4-fp32.tfwc2
 export OFFICIAL=1 PACK_STUB_REGEN=${PACK_STUB_REGEN:-0}
 

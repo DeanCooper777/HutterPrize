@@ -1,4 +1,4 @@
-cd /tmp && S=/mnt/c/Dean/Projects/HutterPrize/fx2-cmix-T/packer/pkdec.c
+cd /tmp && S=/mnt/c/Dean/Projects/HutterPrize/cmix-T-dwc/packer/pkdec.c
 F="-w -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pic -mcmodel=small -fno-builtin -fno-ident"
 t() { n=$1; shift; "$@" -c $S -o st.o 2>/dev/null && printf "%-44s %s\n" "$n" "$(size st.o | tail -1 | awk '{print $1+$2}')" || echo "$n: failed"; }
 t "clang-17 -Oz" clang-17 -Oz $F

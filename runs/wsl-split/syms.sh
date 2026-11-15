@@ -1,6 +1,6 @@
 #!/bin/bash
 # Unstripped PGO+LTO link of the submission binary, then a size report.
-rm -rf /root/symb; cp -r /root/build/fx2-cmix-T /root/symb; cd /root/symb
+rm -rf /root/symb; cp -r /root/build/cmix-T-dwc /root/symb; cd /root/symb
 sed -i 's/ -s -o cmix/ -Wl,-Map=cmix.map -o cmix/' makefile
 make CFLAGS_DEFINES="-DSEED=923 -DUPDATE_LIMIT=3000" prof_use -j > make.log 2>&1 || { tail -5 make.log; exit 1; }
 ls -la cmix; size cmix

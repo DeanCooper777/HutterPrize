@@ -10,7 +10,10 @@
 set -euo pipefail
 
 sudo apt-get update
-sudo apt-get install upx-ucl make -y
+# [this entry] binutils (objdump for the instruction-set checks; ld, as, readelf, nm, strip for the
+# link and the packer), python3 (packer/enc_only.py) and gcc (compiles the unpacking stub when it
+# is regenerated; optional) are needed by build_and_construct_comp.sh. upx-ucl only for PACKER=upx.
+sudo apt-get install upx-ucl make binutils python3 gcc -y
 
 # clang++-17, llvm-profdata-17 and the other LLVM 17 tools
 wget https://apt.llvm.org/llvm.sh

@@ -2,7 +2,7 @@
 # Runs the stripped packed executable and the original side by side.
 P=/mnt/c/Dean/Projects/HutterPrize; rm -rf /root/pk; mkdir -p /root/pk/a /root/pk/b; cd /root/pk
 cp $P/packer/cmix_packed a/cmix; cp $P/packer/cmix_st2.elf b/cmix; chmod +x a/cmix b/cmix
-D=$P/fx2-cmix-T/dictionary/english.dic; head -c 20000 $P/data/enwik6 > in.txt
+D=$P/cmix-T-dwc/dictionary/english.dic; head -c 20000 $P/data/enwik6 > in.txt
 for d in a b; do cd /root/pk/$d
   ./cmix > noargs.txt 2>&1; echo "$d noargs rc $? md5 $(md5sum < noargs.txt | cut -c1-10)"
   s=$(date +%s.%N); ./cmix -c $D ../in.txt out.cmix > log.txt 2>&1; rc=$?; e=$(date +%s.%N)

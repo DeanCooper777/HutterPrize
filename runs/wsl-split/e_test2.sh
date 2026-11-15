@@ -5,7 +5,7 @@
 #  2. assemble an archive9 from .decomp_bin + dictionary + weights + the coded bytes written so far
 #     + trailer, run it until it has started decoding, then stop it.
 # One cmix at a time (memory).
-P=/mnt/c/Dean/Projects/HutterPrize; B=/root/b_fin/fx2-cmix-T/run; R=/root/etest2; rm -rf $R; mkdir -p $R/c $R/d; cd $R/c
+P=/mnt/c/Dean/Projects/HutterPrize; B=/root/b_fin/cmix-T-dwc/run; R=/root/etest2; rm -rf $R; mkdir -p $R/c $R/d; cd $R/c
 cp $B/cmix . ; ln -s $P/enwik9 enwik9
 ( ./cmix -e enwik9 enwik9.comp > log.txt 2>&1 & echo $! > pid )
 for i in $(seq 1 150); do sleep 10; [ -s progress.log ] && break; kill -0 $(cat pid) 2>/dev/null || break; done
@@ -26,7 +26,7 @@ dic = open(".dict.comp", "rb").read(); w = open(".tfweights", "rb").read()
 open("../d/archive9", "wb").write(d + dic + w + pay + struct.pack("<4i", len(dic), t[1], len(pay), len(w)))
 print("test archive9:", len(d) + len(dic) + len(w) + len(pay) + 16, "bytes, payload", len(pay))
 EOF
-md5sum .dict $P/fx2-cmix-T/dictionary/english.dic | cut -c1-12 | tr '\n' ' '; echo
+md5sum .dict $P/cmix-T-dwc/dictionary/english.dic | cut -c1-12 | tr '\n' ' '; echo
 cd $R/d; chmod +x archive9; rm -f $R/c/*.temp $R/c/ppm* 2>/dev/null
 ( ./archive9 > log.txt 2>&1 & echo $! > pid )
 for i in $(seq 1 150); do sleep 10; [ -s progress.log ] && break; kill -0 $(cat pid) 2>/dev/null || break; done

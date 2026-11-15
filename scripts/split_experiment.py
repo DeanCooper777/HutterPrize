@@ -44,8 +44,8 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build", "cmix_orig.exe")
-DICT = os.path.join(ROOT, "fx2-cmix-T", "dictionary", "english.dic")
-WEIGHTS = os.path.join(ROOT, "fx2-cmix-T", "models", "6m-q4-fp32.tfwc2")
+DICT = os.path.join(ROOT, "cmix-T-dwc", "dictionary", "english.dic")
+WEIGHTS = os.path.join(ROOT, "cmix-T-dwc", "models", "6m-q4-fp32.tfwc2")
 
 
 # ---------------------------------------------------------------- split / join

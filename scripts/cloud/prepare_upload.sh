@@ -19,7 +19,7 @@ mkdir -p "$O/ref"
 
 # sources (only what the Linux makefile needs)
 tar czf "$O/src.tar.gz" -C "$R" \
-    fx2-cmix-T/makefile fx2-cmix-T/src fx2-cmix-T/cpp_infer/src
+    cmix-T-dwc/makefile cmix-T-dwc/src cmix-T-dwc/cpp_infer/src
 
 # the coded stream, its hash, and the token hash under the output's name
 gzip -1 -c "$T/stream.bin" > "$O/stream.bin.gz"

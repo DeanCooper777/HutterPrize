@@ -1,5 +1,5 @@
 # standin_mixer.py: offline check of the idea behind the cmix-aware training loss
-# (fx2-cmix-T/pysrc/cmix_loss.py), done with numpy on enwik6 before any GPU time was spent.
+# (cmix-T-dwc/pysrc/cmix_loss.py), done with numpy on enwik6 before any GPU time was spent.
 #
 # Question: if cmix's own per-bit predictions made WITHOUT the transformer and the
 # transformer's byte distribution (turned into per-bit predictions) are combined by a tiny

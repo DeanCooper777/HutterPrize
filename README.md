@@ -1,27 +1,102 @@
-# Hutter Prize – fx2-cmix-T on Windows
+# cmix-T-dwc: a Hutter Prize entry
 
-Local build and test bench for the current Hutter Prize record holder
-(<http://prize.hutter1.net/>):
+**cmix-T-dwc** compresses enwik9 (the first 10^9 bytes of the English Wikipedia, the file of the
+[Hutter Prize](http://prize.hutter1.net/)) to **99,395,679 bytes** in total (compressor +
+self-extracting archive), **1.025% below the current record**.
 
 | | |
 |---|---|
-| Program | **fx2-cmix-T** (fx2-cmix with the LSTM replaced by a 6M-parameter quantized transformer) |
-| Author | Vladimir Ivanov, 24 Jul 2026 – 11th prize winner |
-| Record | 100,424,672 bytes total (compressor + archive), ratio 9.96, ~10 GB RAM, ~50 h |
-| Source | <https://github.com/astOwOlfo/fx2-cmix-transformer-v1> (cloned into `fx2-cmix-T/`, commit `83f2603`) |
+| Program | **cmix-T-dwc** |
+| Authors | Dean W. Cooper, Claude Code AI |
+| Total size S = comp9 + archive9 | 3,264,852 + 96,130,827 = **99,395,679 bytes** |
+| Previous record | 100,424,672 bytes: fx2-cmix-T (Vladimir Ivanov, 24 Jul 2026, 11th prize winner) |
+| Platform | Linux x86-64 (AVX2), one core, under 10 GB RAM |
+| Status | sizes measured; the end-to-end compress / decompress / md5 run of the official build is in progress (see `cmix-T-dwc/SUBMISSION.md`) |
+| License | GPL-3.0 (`LICENSE`) |
+
+## What it is
+
+cmix-T-dwc is built on **fx2-cmix-T**, the current record holder: fx2-cmix by Kaido Orav and Byron
+Knoll (the cmix family of context-mixing compressors) with its LSTM replaced by a 6M-parameter
+quantized transformer (<https://github.com/astOwOlfo/fx2-cmix-transformer-v1>, imported at commit
+`83f2603`). The model architecture, the preprocessing and the cmix models are theirs and unchanged.
+What this entry adds:
+
+1. **The transformer is retrained to complement cmix.** It is fine-tuned on the loss of cmix's
+   mixed prediction instead of its own cross-entropy, so it spends its capacity where the other
+   models are weak. Same size, different weights. Most of the gain.
+2. **16-bit activations** at the four most sensitive matmul inputs (the weights stay 4-bit), with
+   exact integer kernels.
+3. **Online adaptation** of the transformer's output layer during compression and decompression.
+4. **A better coder for the weight file.**
+5. **Retuned mixer constants.**
+6. **A smaller executable**, which counts twice: a minimal official build, our own context-mixing
+   executable packer instead of UPX, and a decompressor copy without the compress-only code.
+7. **Speed and memory work** with bit-identical output, to stay inside the contest limits.
+
+`cmix-T-dwc/SUBMISSION.md` is the full write-up: results of every full-length run, how each gain
+was measured, how to reproduce the build and the weights, and the experiments that did not make it.
+Every source file has a header that says what it does and how it differs from the previous winning
+entry; our changes are tagged `[this entry]` in the code.
 
 ## Layout
 
 ```
-enwik9                  contest file (1,000,000,000 bytes, md5 e206c3450ac99950df65bf70ef61a12d)
-data/enwik4..enwik8     first 10^N bytes of enwik9 (scripts/split_enwik9.py)
-fx2-cmix-T/             upstream source, branch `windows-port` holds the port (git diff master)
-tools/llvm/             portable LLVM/clang 22.1.8 (not checked in; see below)
-build.ps1               build: PGO -> build\cmix_orig.exe -> build\run\cmix.exe
-test.ps1                round-trip test + results.csv
-runs/                   per-run working directories
-reference/archive9      official archive (release asset), used to read the official vocabulary
+cmix-T-dwc/             the entry: source, weights, packer, build scripts, write-up
+  SUBMISSION.md         write-up of the entry (start here)
+  writeup.md, README.md the previous winner's own documents (fx2-cmix-T)
+  src/                  cmix: preprocessing, context models, PPMD, mixers, coder, self-extractor
+  cpp_infer/            transformer inference (kernels, tests, benches)
+  pysrc/, training_recipes/   transformer training (PyTorch)
+  packer/               executable packer: model (pk.cpp), decoder (pkdec.c), assembly stub
+  asm/                  the whole program as x86-64 assembly (the build goes through it)
+  models/               transformer weights (6m-q4-fp32.tfwc2 is the shipped file)
+  build_and_construct_comp.sh, makefile   Linux build
+pod/                    snapshot of the scripts, results log and patched training source that ran
+                        on the cloud volume (see pod/README.md)
+scripts/                tuning and split-evaluation tools; scripts/cloud/ = cloud run scripts
+runs/                   helper scripts and logs of local runs (runs/wsl-split: WSL build and tests)
+docs/                   training notes
+build.ps1, test.ps1     Windows development build and round-trip test
+enwik9, data/, tools/, reference/   inputs and tools, not checked in (see below)
 ```
+
+`scripts/cloud/linux_sub*.sh`, `full_pipe_*.sh` and `make_fin.sh` are kept as they ran: they unpack
+source tarballs made before the rename, in which the source directory is still called
+`fx2-cmix-T/`. The same holds for everything under `pod/`.
+
+## Build and run (Linux)
+
+Ubuntu 24.04 or later, clang 17:
+
+```bash
+cd cmix-T-dwc
+./setup.sh                                  # clang 17, make, binutils, python3
+OFFICIAL=1 ./build_and_construct_comp.sh    # -> run/cmix  (= comp9, 3,264,852 bytes)
+
+mkdir c9 && cd c9 && cp ../run/cmix . && cp /path/to/enwik9 .
+./cmix -e enwik9 enwik9.comp                # about 1.5 days on one core; writes ./archive9
+
+mkdir ../d9 && cd ../d9 && cp ../c9/archive9 .
+./archive9                                  # about 1.5 days; writes enwik9_uncompressed
+md5sum enwik9_uncompressed                  # e206c3450ac99950df65bf70ef61a12d
+```
+
+Without `OFFICIAL=1` the script builds the test binary, which has the evaluation modes used during
+development (`-n`, `--raw-stream`, `--transformer FILE`, tuning via `CMIX_TUNE`, ...).
+`FROM_ASM=asm ./build_and_construct_comp.sh` rebuilds the identical binary from the assembly in
+`asm/` without compiling any C++. Under WSL2 the same commands work; `runs/wsl-split/` has the
+helper scripts we used (`build_fin_off.sh`, `verify_official.sh`).
+
+Archives are **not portable between builds**: a different compiler or C library rounds floats
+differently, so an archive must be decompressed by the build that made it. Within one build the
+output is identical on Intel and AMD CPUs (the build script enforces AVX2-only code and exact
+divisions).
+
+# Windows development build
+
+The rest of this file describes the Windows build used for development (profiling, tuning, small
+tests). It is not the submission.
 
 ## Prerequisites
 
@@ -52,6 +127,9 @@ Outputs:
 
 ## Testing on smaller files
 
+The numbers in this section and the next were measured early in the project, with the previous
+winner's weights; they describe the tools, not the entry's results.
+
 ```powershell
 python scripts\split_enwik9.py   # data\enwik4..enwik8 (already done)
 .\test.ps1                       # enwik5 + enwik6, transformer + dictionary
@@ -78,7 +156,7 @@ directory.
 `src/readalike_prepr/misc.h` splits at fixed line numbers and the article reorder table lists every
 article. Partial files therefore go through the generic `-c` mode with the same dictionary, PPMD,
 fx2 models and transformer, just without article reordering and the phda9 transform:
-`cmix_orig.exe --transformer fx2-cmix-T\models\6m-q4-fp32.tfwc2 -c english.dic <in> <out>`.
+`cmix_orig.exe --transformer cmix-T-dwc\models\6m-q4-fp32.tfwc2 -c english.dic <in> <out>`.
 enwik4 is too small to store a vocabulary (cmix then uses all 256 byte values), so it falls back
 to the LSTM.
 
@@ -160,7 +238,7 @@ transformer ~64% (matmuls 51%, attention 27%, KDA 19% of it), fxcm ~15%, layer-0
 Attention is bound by its int8->fp32 V conversions (PV) and K loads (QK); KDA is near upstream's
 estimated floor.
 
-## Windows port (branch `windows-port` in fx2-cmix-T)
+## Windows port
 
 * `src/win_compat.h` (force-included): `fseeko/ftello` -> `_fseeki64/_ftelli64`, `S_ISDIR`, `fmemopen`.
 * `ppmd.cpp`: the PPMD heap is disk-backed as upstream's Linux build (needed for the contest's
@@ -190,6 +268,5 @@ estimated floor.
   `-fno-exceptions`, no UPX, 64 MB stack. Flags that affect results (`-ffp-model=fast`,
   `-mrecip=none`, x86-64-v3, SEED=923, UPDATE_LIMIT=3000) are kept.
 
-Archives are self-consistent but **not bit-compatible** with the Linux reference build: a
-different compiler and libm give different float rounding. For an official-equivalent build use
-Ubuntu 20.04 + clang-17 (`setup.sh` and `build_and_construct_comp.sh` upstream, e.g. under WSL2).
+Archives are self-consistent but **not bit-compatible** with the Linux build: a different
+compiler and libm give different float rounding. The submission is the Linux build above.

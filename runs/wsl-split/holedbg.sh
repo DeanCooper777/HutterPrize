@@ -4,7 +4,7 @@
 P=/mnt/c/Dean/Projects/HutterPrize; T=/root/hd; rm -rf $T; mkdir -p $T; cd $T
 IN=$1; HL=$2; HH=$3; SYM=$4
 { head -c $HL $IN; head -c $((HH - HL)) /dev/zero; tail -c +$((HH + 1)) $IN; } > z.elf; chmod +x z.elf
-D=$P/fx2-cmix-T/dictionary/english.dic; head -c 20000 $P/data/enwik6 > in.txt
+D=$P/cmix-T-dwc/dictionary/english.dic; head -c 20000 $P/data/enwik6 > in.txt
 $IN -c $D in.txt o.cmix > /dev/null 2>&1
 ./z.elf -d $D o.cmix back > z.log 2>&1; echo "zeroed-hole ELF -d rc $?"; cmp back in.txt && echo "zeroed-hole ELF decodes OK"
 if command -v gdb > /dev/null; then

@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-  Windows build of fx2-cmix-T (Hutter Prize record holder, Jul 2026).
+  Windows development build of cmix-T-dwc (built on fx2-cmix-T, the Hutter Prize record holder of Jul 2026).
 
 .DESCRIPTION
-  Mirrors fx2-cmix-T/makefile + build_and_construct_comp.sh using a portable
+  Mirrors cmix-T-dwc/makefile + build_and_construct_comp.sh using a portable
   LLVM clang (tools\llvm) against the MSVC headers/libs:
 
     1. (optional) PGO instrumented build, trained on prof_input/input
@@ -22,7 +22,7 @@
 # build.ps1 -- Windows development build. New in this entry.
 #
 # Where it fits: the Hutter Prize submission is the Linux build made by
-# fx2-cmix-T/makefile + fx2-cmix-T/build_and_construct_comp.sh. This script
+# cmix-T-dwc/makefile + cmix-T-dwc/build_and_construct_comp.sh. This script
 # repeats the same steps with a portable clang on Windows so the code can be
 # developed, tuned and round-trip tested (test.ps1) on a Windows laptop. Its
 # binaries are never submitted.
@@ -63,7 +63,7 @@ param(
 $ErrorActionPreference = 'Continue'   # PS 5.1 turns native stderr into errors under 'Stop'; exit codes are checked explicitly
 
 $Root   = $PSScriptRoot
-$Src    = Join-Path $Root 'fx2-cmix-T'
+$Src    = Join-Path $Root 'cmix-T-dwc'
 $Llvm   = Join-Path $Root 'tools\llvm\bin'
 $Clang  = Join-Path $Llvm 'clang++.exe'
 $Prof   = Join-Path $Llvm 'llvm-profdata.exe'

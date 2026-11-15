@@ -1,4 +1,4 @@
-# bench_loader.py: time the training data loader (fx2-cmix-T/pysrc/data.py) without the model.
+# bench_loader.py: time the training data loader (cmix-T-dwc/pysrc/data.py) without the model.
 # Used to find out whether training was limited by disk reads rather than by the GPU.
 # Inputs: the training data under data/. Output: seconds per batch on stdout.
 #
