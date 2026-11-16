@@ -1,0 +1,23 @@
+{
+ "name": "pa16_s35",
+ "data": "/root/slices/A16",
+ "layers": 8,
+ "d_model": 160,
+ "heads": 4,
+ "d_mlp": 320,
+ "window": 1024,
+ "params": 2304604,
+ "patch": 1,
+ "trunk_steps": 9508535,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15990385,
+ "tf_bits": 34376383.75910273,
+ "cmix_bits": 35927024.79896886,
+ "mix_bits": 27930672.798701786,
+ "tf_bpc": 2.1498158899302755,
+ "cmix_bpc": 2.2467892298383596,
+ "mix_bpc": 1.746716717496282,
+ "train_seconds": 10779.882668972015
+}

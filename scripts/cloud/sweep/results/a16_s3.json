@@ -1,0 +1,21 @@
+{
+ "name": "a16_s3",
+ "data": "/root/slices/A16",
+ "layers": 8,
+ "d_model": 128,
+ "heads": 4,
+ "d_mlp": 256,
+ "window": 1024,
+ "params": 1238892,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15990385,
+ "tf_bits": 34941960.41334888,
+ "cmix_bits": 35927024.79896886,
+ "mix_bits": 30078964.269177545,
+ "tf_bpc": 2.1851856858574004,
+ "cmix_bpc": 2.2467892298383596,
+ "mix_bpc": 1.8810656697244965,
+ "train_seconds": 16301.204850435257
+}

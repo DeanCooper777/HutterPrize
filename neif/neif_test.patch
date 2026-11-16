@@ -1,0 +1,1474 @@
+diff --git a/src/bit_head.cpp b/src/bit_head.cpp
+index 037601d..720621e 100644
+--- a/src/bit_head.cpp
++++ b/src/bit_head.cpp
+@@ -943,6 +943,18 @@ void Shutdown() {
+   g_init_done = false;
+ }
+ 
++#ifdef NEIF_TEST
++// Chunk evaluation: the weight set for a run whose first corrected bit lies
++// behind the metadata block (text set 1, or text set 2 from page 143,227 of
++// the order on), as Adjust() would have chosen it on the way.  Called before
++// the first Adjust(), so the window is empty and the state is zero.
++void NeifSyncSlot() {
++  Head& s = g_head;
++  const int soll = tf_gate::ctx.pages >= (unsigned int)143227 ? 2 : 1;
++  while (s.slot < soll) s.NextSlot();
++}
++#endif
++
+ __attribute__((noinline))
+ unsigned int Adjust(unsigned int base_p, const float* stage1, int n_stage1,
+                     float m1raw, int override_active) {
+diff --git a/src/coder/encoder.cpp b/src/coder/encoder.cpp
+index c729966..686b595 100644
+--- a/src/coder/encoder.cpp
++++ b/src/coder/encoder.cpp
+@@ -1,5 +1,8 @@
+ #include "../invariants.h"
+ #include "encoder.h"
++#ifdef NEIF_TEST
++#include "../neif_test.h"   // chunk evaluation: bit costs
++#endif
+ __attribute__((cold)) Encoder::Encoder(FILE* os, Predictor* p) : os_(os), x1_(0),
+     x2_(0xffffffff), p_(p) {
+   // Register the per-byte channel BEFORE Init(): Init() builds the
+@@ -42,22 +45,44 @@ void Encoder::Encode(int bit) {
+       && !bit_head::MetaOff()
+       && !p_->AdepthSkipped()
+       ) {
++#ifdef NEIF_TEST
++    neif_test::T(11);   // profile mark: BITLSTM
++#endif
+     p = bit_head::Adjust(p, p_->bitl_stage1_, p_->bitl_n_stage1_,
+                           p_->bitl_m1raw_, p_->bitl_override_);
+     bb_bitl = p_->bitl_override_ ? 0 : 1;
+   }
++#ifdef NEIF_TEST
++  neif_test::T(12);   // profile mark: floor stage, end stages
++  // chunk evaluation: the same call sequence as below, with the final 32-bit
++  // probability kept in a variable so that its cost can be summed
++  const uint32_t neif_p32 = p_->SemCorrect(floor_.P32(p,
++      p_->bitl_override_,
++      p_->AdepthSkipped() ? 1 : 0,
++      bb_bitl, p_->bb_z_, p_->bitl_m1raw_, bit_head::MetaOff() ? 1 : 0,
++      (31 - __builtin_clz(p_->BbBitCtx() | 1u)) & 7));
++  neif_test::Cost(neif_p32, bit);
++  const unsigned int xmid = floor_stage::Mid(x1_, x2_, neif_p32);
++#else
+   const unsigned int xmid = floor_stage::Mid(x1_, x2_, p_->SemCorrect(floor_.P32(p,
+       p_->bitl_override_,
+       p_->AdepthSkipped() ? 1 : 0,
+       bb_bitl, p_->bb_z_, p_->bitl_m1raw_, bit_head::MetaOff() ? 1 : 0,
+       (31 - __builtin_clz(p_->BbBitCtx() | 1u)) & 7)));
++#endif
+   if (bit) {
+     x2_ = xmid;
+   } else {
+     x1_ = xmid + 1;
+   }
+   floor_.Update(bit);
++#ifdef NEIF_TEST
++  neif_test::T(13);   // profile mark: end stages learn
++#endif
+   p_->SemLearn(bit);
++#ifdef NEIF_TEST
++  neif_test::T(11);   // profile mark: BITLSTM
++#endif
+   if (bit_head::Enabled()
+       && !bit_head::AuxOff()
+       && !bit_head::MetaOff()
+diff --git a/src/models/ppmd.cpp b/src/models/ppmd.cpp
+index d2789b7..75f254a 100644
+--- a/src/models/ppmd.cpp
++++ b/src/models/ppmd.cpp
+@@ -17,6 +17,9 @@
+ #include "../ppmd_order_table.h"
+ 
+ #include "../ppmd_prewarm.h"
++#ifdef NEIF_TEST
++#include "../neif_test.h"   // chunk evaluation: pipeline stages
++#endif
+ 
+ #include <cstring>
+ #include <malloc.h>
+@@ -1551,6 +1554,11 @@ void processSymbol2_T( CTX_PARAM(q), int ) {
+   }
+ 
+ void ppmd_PrepareByte( void ) {
++#ifdef NEIF_TEST
++    // pipeline: a stage without the PPMd model takes the result of this byte
++    // (sqp, trF, trT) from the queue; PPMD::ByteUpdate() goes on from there
++    if( !neif_test::OwnPpmd() ) { neif_test::PpmdGet( sqp, trF, trT ); return; }
++#endif
+     ppmd_page::dyn_tick();
+     if( ppmd_page::V.z_versatz | ppmd_page::V.z_basis ) {
+       const unsigned long long g = ppmd_page::V.z_grenze << 12;
+@@ -1584,6 +1592,9 @@ void ppmd_PrepareByte( void ) {
+ }
+ 
+ void ppmd_UpdateByte( uint c ) {
++#ifdef NEIF_TEST
++  if( !neif_test::OwnPpmd() ) return;   // pipeline: the model lives in another stage
++#endif
+   const int lt_f0 = OrderFall;
+   pPPMC  MinContext = MaxContext;
+   if( MinContext->NumStats ) {
+@@ -1657,6 +1668,27 @@ __attribute__((cold)) PPMD::~PPMD() {
+ }
+ 
+ __attribute__((noinline, cold)) void PPMD::Waermen() { ppmd_model_->DictcodeFutter( 2 ); }
++#ifdef NEIF_TEST
++// Chunk evaluation: the two restarts ByteUpdate() takes at the next model byte
++// once their latch is set (each runs once; both are no-ops otherwise).
++void PPMD::NeifSync() {
++  ppmd_model_->MetaSchnitt(counter_);
++  ppmd_model_->ZeileSchnitt();
++}
++// Pipeline, behind ByteUpdate(): the result of this byte goes to the next
++// stage, or is compared with the one that came from the stage in front.
++// Pipeline, right after the fork in a stage without the PPMd model: the two
++// restarts of ByteUpdate() count as taken, so no latch (the metadata block
++// reader and the runner set them in every stage) starts the model here; its
++// heap is shared memory and belongs to the stage that runs it.
++void PPMD::NeifDisown() {
++  ppmd_model_->MetaGetan = true;
++  ppmd_model_->ZeileGetan = true;
++}
++void PPMD::NeifRow() {
++  neif_test::PpmdRow(ppmd_model_->sqp, ppmd_model_->trF, ppmd_model_->trT, &probs_[0]);
++}
++#endif
+ 
+ std::valarray<float>& PPMD::Predict() {
+   const unsigned int total = tree_total_[tree_context_];
+diff --git a/src/models/ppmd.h b/src/models/ppmd.h
+index 80329b6..fe13aee 100644
+--- a/src/models/ppmd.h
++++ b/src/models/ppmd.h
+@@ -20,6 +20,11 @@ class PPMD : public ByteModel {
+   void Perceive(int bit);
+   void ByteUpdate();
+   void Waermen();
++#ifdef NEIF_TEST
++  void NeifSync();   // chunk evaluation: the pending restarts (src/predictor.cpp NeifSkipSync)
++  void NeifRow();    // pipeline: send or check the result of this byte (src/neif_test.h)
++  void NeifDisown(); // pipeline: this process no longer runs the model
++#endif
+  private:
+   const unsigned int& byte_;
+   std::unique_ptr<ppmd_Model> ppmd_model_;
+diff --git a/src/models/ppmd_page.cpp b/src/models/ppmd_page.cpp
+index f871007..9b24ee1 100644
+--- a/src/models/ppmd_page.cpp
++++ b/src/models/ppmd_page.cpp
+@@ -220,6 +220,33 @@ __attribute__((noinline)) static int ZweiZahlen(const char* b, unsigned long lon
+   *c = (unsigned long long)strtol(e1, &e2, 10);
+   return e2 == e1 ? 1 : 2;
+ }
++#ifdef NEIF_TEST
++// Pipeline (src/neif_test.h): the pool is sized from the resident memory of
++// the process, and after the fork most of that memory belongs to the coder
++// stage.  The stage with the PPMd model reads its own statm and adds the
++// private resident memory of the coder stage (the statm opened before the
++// fork), so that the stages together stay under the clamp as one process does.
++// The pool size does not change the model output.
++static int neif_peer_fd = -1;
++void neif_fork_child(void) {
++  if (V.statmfd < 0) return;
++  neif_peer_fd = V.statmfd;
++  V.statmfd = open("/proc/self/statm", O_RDONLY|O_CLOEXEC);
++  if (V.statmfd < 0) V.dyn_aus = 1;
++}
++// noinline, a plain call in dyn_pruefe(): its PGO profile entry stays
++__attribute__((noinline)) static unsigned long long neif_peer_kib(void) {
++  if (neif_peer_fd < 0) return 0;
++  char b[128];
++  const ssize_t n = pread(neif_peer_fd, b, sizeof(b)-1, 0);
++  if (n <= 0) return 0;
++  b[n] = 0;
++  char* e = b;
++  const long ges = strtol(e, &e, 10), res = strtol(e, &e, 10), shr = strtol(e, &e, 10);
++  (void)ges;
++  return res > shr ? (unsigned long long)(res - shr) * 4ULL : 0ULL;
++}
++#endif
+ // Choose the pool size: how much room does the rest of the process (fremd_kib)
+ // leave under the upper bound minus the safety margin (deckel)?
+ static void dyn_pruefe(void) {
+@@ -231,7 +258,11 @@ static void dyn_pruefe(void) {
+   b[n] = 0;
+   unsigned long long ges = 0, res = 0;
+   if (ZweiZahlen(b, &ges, &res) != 2) return;
++#ifdef NEIF_TEST
++  const unsigned long long rss_kib = res * 4ULL + neif_peer_kib();
++#else
+   const unsigned long long rss_kib = res * 4ULL;
++#endif
+   if (rss_kib > V.dyn_rss_spitze_kib) V.dyn_rss_spitze_kib = rss_kib;
+   const unsigned long long eigen_kib = ((V.rahmen + SPIEGEL) * SEITE) >> 10;
+   const unsigned long long fremd_kib =
+diff --git a/src/neif_test.h b/src/neif_test.h
+new file mode 100644
+index 0000000..6a4c78a
+--- /dev/null
++++ b/src/neif_test.h
+@@ -0,0 +1,282 @@
++// NEIF_TEST: state of the chunk ("split") evaluation mode.  NOT part of the
++// entry: this header is included only under `#ifdef NEIF_TEST`, and a build
++// without that macro is byte-identical to the published comp9.
++//
++// The mode (`cmix -t STREAM OUT`, src/runner.cpp NeifTestMain) codes the coder
++// stream of a `-e enwik9` run from a page boundary in the middle of the
++// stream:
++//   * bytes [0, warm_from): a structure-only pass.  Every automaton that reads
++//     the stream (metadata block reader, text start, author/census/alias
++//     injections, grammar automaton, the transformer's prompt, gate and
++//     link-context automata, redirect and alias tables) sees every byte and
++//     every injected byte exactly as in a real run; no model is run and
++//     nothing is coded (g_skip).
++//   * bytes [warm_from, end): the complete predictor and the arithmetic coder,
++//     starting from cold models; the cost in bits of every coded bit is taken
++//     from the 32-bit probability handed to the interval split and summed
++//     for [warm_from, end) and for [start, end) (g_count).
++#ifndef NEIF_TEST_H_
++#define NEIF_TEST_H_
++#ifdef NEIF_TEST
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <signal.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <immintrin.h>
++#include <atomic>
++
++namespace neif_test {
++
++inline bool g_on = false;         // -t mode is running
++inline bool g_skip = false;       // structure-only pass: no model step, nothing coded
++inline bool g_count = false;      // the stream byte being coded lies in [start, end)
++inline bool g_hash_on = false;    // structure events of this byte enter g_hash
++inline unsigned long long g_start = 0, g_end = 0;
++inline unsigned long long g_warm_target = 0;   // skip at least up to here, then to the next page start
++inline long long g_warm_from = -1;             // first byte the model ran on
++inline double g_bits_all = 0.0, g_bits_kept = 0.0;        // sum of -log2 P(coded bit)
++inline unsigned long long g_n_all = 0, g_n_kept = 0;      // coded bits
++inline unsigned long long g_zw_mismatch = 0;   // forced byte != stream byte (must stay 0)
++inline unsigned long long g_tf_rows = 0;       // transformer rows fed in the hashed range
++inline uint64_t g_hash = 1469598103934665603ull;          // FNV-1a over structure events
++
++// one structure event (a value that must not depend on any model state)
++inline void H(unsigned int v) {
++  if (!g_hash_on) return;
++  g_hash = (g_hash ^ (uint64_t)(v & 0xffffu)) * 1099511628211ull;
++}
++
++// cost of one coded bit; p32 = P(bit == 1) in units of 2^-32, exactly the
++// value floor_stage::Mid() splits the interval with.  noinline: as a plain
++// call it adds no branch to Encoder::Encode(), whose control flow must stay
++// the one of the entry for the profile-guided build (a changed flow voids the
++// profile of that function, and the test build then no longer computes the
++// same bits as comp9)
++__attribute__((noinline)) inline void Cost(uint32_t p32, int bit) {
++  const double p1 = (double)p32 * (1.0 / 4294967296.0);
++  const double c = -log2(bit ? p1 : 1.0 - p1);
++  g_bits_all += c;
++  ++g_n_all;
++  if (g_count) { g_bits_kept += c; ++g_n_kept; }
++}
++
++// ---- profile (NEIF_PROF=1): where the time of the model bytes goes ----------
++// T(k) is called where section k begins (the marks in Predictor::Predict(),
++// Predictor::Perceive(), Encoder::Encode() and Compress()); the time since the
++// last mark goes to the section that mark began.  A plain call of a noinline
++// function: no branch in the caller, so the caller keeps its PGO profile entry.
++constexpr int kProfN = 16;
++inline const char* const kProfName[kProfN] = {
++    "coder, runner, stream automata", "predict: fxcm first half, selectors, cache readout",
++    "predict: model outputs to layer-0 row", "predict: mixers, SSE",
++    "perceive: cmix models", "perceive: mixer and SSE update",
++    "perceive: adaptive depth, contexts, byte updates", "PPMd byte update",
++    "transformer driver and network", "transformer slots, path state", "fxcm perceive",
++    "BITLSTM", "floor stage, end stages", "end stages learn", "semantic cache byte start",
++    "pipeline: waiting for the queue"};
++inline bool g_prof = false;
++inline unsigned long long g_prof_t[kProfN] = {0}, g_prof_last = 0;
++inline int g_prof_cur = 0;
++__attribute__((noinline)) inline void T(int k) {
++  if (!g_prof) return;
++  const unsigned long long t = __builtin_ia32_rdtsc();
++  g_prof_t[g_prof_cur] += t - g_prof_last;
++  g_prof_last = t;
++  g_prof_cur = k;
++}
++inline void ProfReset() {
++  for (int k = 0; k < kProfN; ++k) g_prof_t[k] = 0;
++  g_prof_last = __builtin_ia32_rdtsc();
++  g_prof_cur = 0;
++}
++// the table, scaled so that the sections add up to `seconds`
++inline void ProfPrint(FILE* f, const char* who, double seconds) {
++  if (!g_prof) return;
++  T(0);
++  unsigned long long sum = 0;
++  for (int k = 0; k < kProfN; ++k) sum += g_prof_t[k];
++  if (!sum) return;
++  for (int k = 0; k < kProfN; ++k)
++    if (g_prof_t[k])
++      fprintf(f, "neif_prof %s %5.1f%% %8.1f s  %s\n", who, 100.0 * (double)g_prof_t[k] / (double)sum,
++              seconds * (double)g_prof_t[k] / (double)sum, kProfName[k]);
++}
++
++// ---- pipeline (NEIF_PIPE=N, mode -t only; compression only) ----------------
++// In compression every byte is known in advance, so a component whose state
++// depends on the stream bytes alone can run ahead of the coder.  The run is
++// cut into stages, one PROCESS each (fork() at the first byte the model runs
++// on, src/runner.cpp NeifPipeStart): every stage walks the same byte loop of
++// Compress() with all stream automata, runs only the components it owns and
++// hands their results to the next stage through a bounded queue in shared
++// memory.  Processes, not threads: the automata and many models keep their
++// state in globals, and after a fork every stage has its own copy of all of
++// them, so no stage can read a value another stage is writing.
++//   N = 2:  [PPMd, transformer]                       -> [cmix models, mixers, coder]
++//   N >= 3: [PPMd, transformer layers below g_tf_split] -> [layers from g_tf_split on,
++//           output heads, fast weights]               -> [cmix models, mixers, coder]
++// The coder stage does everything that reads the coder's own probabilities
++// (fxcm reads the cost of the last byte, the mixers, SSE, BITLSTM, the floor
++// and end stages, the semantic cache), so it cannot be cut the same way; it is
++// about 40 % of the time of one process in page text, which bounds the gain.
++// Floating point: a stage is a forked copy of the process, with the same
++// rounding mode, MXCSR and tables; every value is computed by the code that
++// computes it in one process (the PPMd row twice, see 'P').
++// What crosses a queue (records, in stream order; a tag guards the order):
++//   'P'  per model byte: the PPMd result (symbol masses and the two bit-tree
++//        arrays, integers) and the normalised float row.  The receiving stage
++//        normalises the integers with its own code and stops if its row is not
++//        bit-identical to the sender's.
++//   'A'  per transformer row: the depth-mix state behind layer g_tf_split - 1.
++//   'F'  per driver step: the transformer row, the fast-weight row, the hidden
++//        vector and the key of the semantic cache.
++enum { kOwnPpmd = 1, kOwnTfLo = 2, kOwnTfHi = 4, kOwnMix = 8, kOwnAll = 15 };
++inline int g_own = kOwnAll;   // the components this process runs (all: no pipeline)
++inline int g_tf_split = 8;    // first transformer layer of the second stage (N >= 3; NEIF_PIPE_SPLIT)
++inline bool OwnPpmd() { return (g_own & kOwnPpmd) != 0; }
++inline bool OwnTf() { return (g_own & (kOwnTfLo | kOwnTfHi)) != 0; }
++inline bool Front() { return (g_own & kOwnMix) == 0; }   // a stage in front of the coder
++
++struct Ring {   // single writer, single reader; positions count bytes and never wrap
++  std::atomic<unsigned long long> w;
++  char pad0[56];
++  std::atomic<unsigned long long> r;
++  char pad1[56];
++  unsigned long long cap;   // bytes of d (a power of two)
++  unsigned char d[64];
++};
++struct Ctl {   // one per run, shared by all stages
++  std::atomic<int> dict_done;   // the first stage has written ./.dict (end of slot 1)
++  // written by a front stage when it has passed the last byte
++  std::atomic<int> done[4];
++  double cpu_s[4], wall_s[4];
++  long hwm_kb[4], pss_kb[4];
++};
++inline Ring* g_in = nullptr;    // from the stage in front
++inline Ring* g_out = nullptr;   // to the next stage
++inline Ctl* g_ctl = nullptr;
++inline int g_stage = 0;         // index of this stage (0 = first)
++inline int g_kids[4] = {0, 0, 0, 0};   // coder stage: the pids of the front stages
++inline unsigned long long g_waits = 0; // times this stage found a queue empty or full
++inline unsigned long long g_pos = 0;   // stream byte this stage works on (for messages)
++// entries [0], [1]) of the allocation registry (page_registry.h) that a front
++// stage keeps: the tables of the transformer's match models, the transformer
++inline unsigned int g_reg_match[2] = {0, 0}, g_reg_tf[2] = {0, 0};
++
++[[noreturn]] inline void PipeFail(const char* what) {
++  fprintf(stderr, "\nneif_pipe: stage %d: %s\n", g_stage, what);
++  fflush(stderr);
++  if (!Front())
++    for (int k = 0; k < 4; ++k) if (g_kids[k] > 0) kill(g_kids[k], SIGKILL);
++  _exit(3);
++}
++// one round of waiting (n = 0 at the first): spin for `spin` time-stamp
++// ticks, then sleep in short naps, so a waiting stage costs little CPU time
++// (the slowest stage sets the speed and never waits; a nap that ends late
++// only lets the queue fill a little).  The coder stage looks after its
++// children.
++inline void PipeWait(unsigned& n, unsigned long long spin) {
++  static unsigned long long t0 = 0;
++  if (n == 0) t0 = __builtin_ia32_rdtsc();
++  ++n;
++  if (__builtin_ia32_rdtsc() - t0 < spin) { _mm_pause(); return; }
++  usleep(50);
++  if ((n & 1023u) != 0 || Front()) return;
++  for (int k = 0; k < 4; ++k) {
++    int st = 0;
++    if (g_kids[k] > 0 && waitpid(g_kids[k], &st, WNOHANG) == g_kids[k]) {
++      if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !g_ctl->done[k].load()) PipeFail("a front stage ended early");
++      g_kids[k] = 0;
++    }
++  }
++}
++inline Ring* RingNew(unsigned long long cap) {
++  void* p = mmap(nullptr, sizeof(Ring) + cap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++  if (p == MAP_FAILED) return nullptr;
++  Ring* q = (Ring*)p;   // zero pages: w = r = 0
++  q->cap = cap;
++  return q;
++}
++inline void RingCopy(Ring* q, unsigned long long pos, void* dst, const void* src, size_t n) {
++  const unsigned long long o = pos & (q->cap - 1);
++  const size_t a = (size_t)(q->cap - o) < n ? (size_t)(q->cap - o) : n;
++  if (src) { memcpy(q->d + o, src, a); memcpy(q->d, (const char*)src + a, n - a); }
++  else { memcpy(dst, q->d + o, a); memcpy((char*)dst + a, q->d, n - a); }
++}
++// one record: 8 bytes (tag, length), then the payload
++__attribute__((noinline)) inline void Put(int tag, const void* p, size_t n) {
++  Ring* q = g_out;
++  const unsigned long long w = q->w.load(std::memory_order_relaxed);
++  if (w + 8 + n - q->r.load(std::memory_order_acquire) > q->cap) {
++    const int sec = g_prof_cur;
++    T(15);
++    ++g_waits;
++    unsigned k = 0;
++    // full: this stage is far ahead; it naps until half of the queue is free
++    while (w + 8 + n - q->r.load(std::memory_order_acquire) > q->cap / 2) PipeWait(k, 0);
++    T(sec);
++  }
++  const unsigned int h[2] = {(unsigned int)tag, (unsigned int)n};
++  RingCopy(q, w, nullptr, h, 8);
++  RingCopy(q, w + 8, nullptr, p, n);
++  q->w.store(w + 8 + n, std::memory_order_release);
++}
++__attribute__((noinline)) inline void Get(int tag, void* p, size_t n) {
++  Ring* q = g_in;
++  const unsigned long long r = q->r.load(std::memory_order_relaxed);
++  if (q->w.load(std::memory_order_acquire) - r < 8 + n) {
++    const int sec = g_prof_cur;
++    T(15);
++    ++g_waits;
++    unsigned k = 0;
++    // empty: the stage in front is the slower one; a short spin (about 20 us), then naps
++    while (q->w.load(std::memory_order_acquire) - r < 8 + n) PipeWait(k, 60000ull);
++    T(sec);
++  }
++  unsigned int h[2];
++  RingCopy(q, r, h, nullptr, 8);
++  if (h[0] != (unsigned int)tag || h[1] != (unsigned int)n) {
++    fprintf(stderr, "\nneif_pipe: stage %d at stream byte %llu wants record '%c' of %llu B, the queue has '%c' of %u B\n",
++            g_stage, g_pos, tag, (unsigned long long)n, (int)(h[0] & 127u), h[1]);
++    PipeFail("the stages are out of step");
++  }
++  RingCopy(q, r + 8, p, nullptr, n);
++  q->r.store(r + 8 + n, std::memory_order_release);
++}
++
++// 'P': the PPMd result of one model byte
++struct PpmdRec { unsigned int sqp[256], trF[256], trT[256]; float row[256]; };
++inline PpmdRec g_ppmd_rec;
++// a stage without the PPMd model, in place of the model step (ppmd_PrepareByte)
++__attribute__((noinline)) inline void PpmdGet(unsigned int* sqp, unsigned int* trF, unsigned int* trT) {
++  Get('P', &g_ppmd_rec, sizeof g_ppmd_rec);
++  memcpy(sqp, g_ppmd_rec.sqp, sizeof g_ppmd_rec.sqp);
++  memcpy(trF, g_ppmd_rec.trF, sizeof g_ppmd_rec.trF);
++  memcpy(trT, g_ppmd_rec.trT, sizeof g_ppmd_rec.trT);
++}
++// every stage, behind PPMD::ByteUpdate(): the owner sends its result, the
++// others compare the row they normalised themselves and pass the record on
++__attribute__((noinline)) inline void PpmdRow(const unsigned int* sqp, const unsigned int* trF,
++                                              const unsigned int* trT, const float* row) {
++  if (g_own == kOwnAll) return;
++  if (OwnPpmd()) {
++    memcpy(g_ppmd_rec.sqp, sqp, sizeof g_ppmd_rec.sqp);
++    memcpy(g_ppmd_rec.trF, trF, sizeof g_ppmd_rec.trF);
++    memcpy(g_ppmd_rec.trT, trT, sizeof g_ppmd_rec.trT);
++    memcpy(g_ppmd_rec.row, row, sizeof g_ppmd_rec.row);
++  } else if (memcmp(g_ppmd_rec.row, row, sizeof g_ppmd_rec.row) != 0) {
++    PipeFail("the PPMd row of this stage differs from the row of the stage in front");
++  }
++  if (g_out) Put('P', &g_ppmd_rec, sizeof g_ppmd_rec);
++}
++
++}  // namespace neif_test
++
++#endif  // NEIF_TEST
++#endif  // NEIF_TEST_H_
+diff --git a/src/predictor.cpp b/src/predictor.cpp
+index e2af0ed..827f6a4 100644
+--- a/src/predictor.cpp
++++ b/src/predictor.cpp
+@@ -1,5 +1,8 @@
+ #include "meld.h"
+ #include "predictor.h"
++#ifdef NEIF_TEST
++#include "neif_test.h"   // chunk evaluation: profile marks, pipeline
++#endif
+ #include "attributes.h"
+ #include "cold_size.h"
+ #include "invariants.h"
+@@ -140,6 +143,9 @@ COLD_SIZE_ATTR  void Predictor::AddMatch() {
+ 
+   // The longest of these matches feeds the transformer's match channel.
+   tf1_match_base_ = match_models_.size();
++#ifdef NEIF_TEST
++  neif_test::g_reg_match[0] = pageregistry::T().n;   // pipeline: the tables of these models
++#endif
+   for (const auto& params : model_params) {
+     const Context& context = manager_.AddContextHashContext(manager_.bit_context_,params[0], params[1]);
+     match_models_.emplace_back(manager_.history_, context.GetContext(),
+@@ -147,6 +153,9 @@ COLD_SIZE_ATTR  void Predictor::AddMatch() {
+         &(manager_.longest_match_));
+   }
+   tf1_match_count_ = match_models_.size() - tf1_match_base_;
++#ifdef NEIF_TEST
++  neif_test::g_reg_match[1] = pageregistry::T().n;
++#endif
+ }
+ 
+  void Predictor::AddGrammarMatch() {
+@@ -172,8 +181,14 @@ unsigned int Discretize(float p) {
+   // slot (Tf1Slot) and takes the place the byte LSTM had in the mixer
+   // rows.
+   if (transformer::Running()) {
++#ifdef NEIF_TEST
++    neif_test::g_reg_tf[0] = pageregistry::T().n;   // pipeline: the areas of the transformer
++#endif
+     tf1_engine_.reset(
+         new transformer::Tf1Engine(vocab_, transformer::WeightsPath()));
++#ifdef NEIF_TEST
++    neif_test::g_reg_tf[1] = pageregistry::T().n;
++#endif
+     bitl_hid_ = tf1_engine_->LastHidden();
+     bitl_n_hid_ = bitl_hid_ ? tf1_engine_->HiddenSize() : 0;
+     bitl_n_tf_ = 4;
+@@ -452,11 +467,17 @@ __attribute__((noinline)) void Predictor::EndLearn(int bit) {
+   mixer_1_[mix_select::kIa].E2ESetErr(e);
+ }
+  float Predictor::Predict() {
++#ifdef NEIF_TEST
++  neif_test::T(1);   // profile mark: fxcm first half, selectors, cache readout
++#endif
+   fxcm_model_.PredictHalf();
+   Lx1TfConf();   // lx1_agree selector: transformer favourite class
+   manager_.UpdateTf1Gate();   // gate zone as mixer context
+   KtxSelect();   // contexts of the add rows
+   SemPredBit();
++#ifdef NEIF_TEST
++  neif_test::T(2);   // profile mark: the layer-0 row from the model outputs
++#endif
+   unsigned int input_index = 0;
+   auto bracket_model_output = bracket_model_->Predict()[0];
+   layers_[0].SetInput(input_index++, bracket_model_output);
+@@ -585,6 +606,9 @@ __attribute__((noinline)) void Predictor::EndLearn(int bit) {
+   // their own, so its PGO profile entry stays valid.
+   FwSetInput(input_index++);
+   SemSetInput(input_index++);
++#ifdef NEIF_TEST
++  neif_test::T(3);   // profile mark: mixers, SSE, end of Predict()
++#endif
+   const bool chr_skip_mix = (byte_mixer_override >= 0);
+   float p;
+   if (chr_skip_mix) {
+@@ -647,6 +671,9 @@ __attribute__((noinline)) void Predictor::EndLearn(int bit) {
+   if (byte_mixer_override >= 0) p = byte_mixer_override;
+   bitl_override_ = (byte_mixer_override >= 0) ? 1 : 0;
+   last_p16_ = (unsigned int)(1 + 65534 * p);
++#ifdef NEIF_TEST
++  neif_test::T(0);   // profile mark: coder, runner
++#endif
+   return p;
+ }
+ 
+@@ -1666,6 +1693,9 @@ void Predictor::E2EGrad(int bit) {
+ }
+ 
+  void Predictor::Perceive(int bit) {
++#ifdef NEIF_TEST
++  neif_test::T(4);   // profile mark: the cmix models learn the bit
++#endif
+   word_label::Perceive(wordlbl_, bit);
+   pagectx::surprise.AddBit(last_p16_, bit, manager_.bit_context_ >= 128);
+   bracket_model_->Perceive(bit);
+@@ -1688,6 +1718,9 @@ void Predictor::E2EGrad(int bit) {
+   tf1_slot_->Perceive(bit);
+   FwPerceive(bit);
+ 
++#ifdef NEIF_TEST
++  neif_test::T(5);   // profile mark: mixer and SSE update
++#endif
+   if (char_rate::Forced(manager_.bit_context_)) {
+     sse_.PerceiveContextOnly(bit);
+     for (auto& mixer: mixer_0_) mixer.PerceiveSkip();
+@@ -1708,6 +1741,9 @@ void Predictor::E2EGrad(int bit) {
+ 
+   sse_.Perceive(bit);
+   }
++#ifdef NEIF_TEST
++  neif_test::T(6);   // profile mark: adaptive depth, contexts, byte updates of the cmix models
++#endif
+   if (!char_rate::Forced(manager_.bit_context_)) {
+     adaptive_depth::TrainStep(adepth_, bit);
+     ++adepth_.coded;
+@@ -1741,7 +1777,16 @@ void Predictor::E2EGrad(int bit) {
+       indirect_r_models_[i].ByteUpdate();
+     }
+     grammar_match_->ByteUpdate();
++#ifdef NEIF_TEST
++    neif_test::T(7);   // profile mark: PPMd
++#endif
+     byte_model_->ByteUpdate();
++#ifdef NEIF_TEST
++    byte_model_->NeifRow();   // pipeline: the PPMd result of this byte, sent or checked
++#endif
++#ifdef NEIF_TEST
++    neif_test::T(8);   // profile mark: transformer driver and network
++#endif
+     if (tf1_prior_writer_) {
+       const std::valarray<float>& tf1_pp = byte_model_->BytePredict();
+       for (int i = 0; i < transformer::kSetSize; ++i) {
+@@ -1762,6 +1807,9 @@ void Predictor::E2EGrad(int bit) {
+     const float* tf1_row = tf1_engine_
+         ? tf1_engine_->Step(byte_model_->BytePredict(), manager_.bit_context_)
+         : nullptr;
++#ifdef NEIF_TEST
++    neif_test::T(9);   // profile mark: slots, path state
++#endif
+     if (tf1_row && transformer::Active()) {
+       if (tf1_engine_->GateMasked()
+           || alias_prompt::Laeuft()   // alias rows are being fed
+@@ -1783,8 +1831,14 @@ void Predictor::E2EGrad(int bit) {
+   tf1_slot_output = tf1_slot_->Predict()[0];
+   FwPredictBit();
+   MlPath(byte_update);   // path state of the next bit (selector of the add rows)
++#ifdef NEIF_TEST
++  neif_test::T(10);   // profile mark: fxcm
++#endif
+   fxcm_model_.Perceive(bit);
+   if (byte_update)manager_.bit_context_ = 1;
++#ifdef NEIF_TEST
++  neif_test::T(0);   // profile mark: coder, runner
++#endif
+ }
+ 
+  void Predictor::ObserveKnownBit(int bit) {
+@@ -1796,6 +1850,104 @@ void Predictor::ObserveTfOnlyByte(unsigned int byte) {
+   if (tf1_engine_) tf1_engine_->Step(byte_model_->BytePredict(), byte);
+ }
+ 
++#ifdef NEIF_TEST
++namespace bit_head { void NeifSyncSlot(); }
++// Chunk evaluation, structure-only pass.  Of all that Perceive() does at a
++// byte boundary only the transformer driver is called: its Step() runs the
++// automata that read the stream (redirect and alias tables, rule view, link
++// context, prompt, gate; the page count), and with neif_test::g_skip set it
++// leaves out the network step (Tf1Engine::Impl::Feed).  No cmix model, mixer
++// or cache sees the byte.
++void Predictor::NeifSkipByte(unsigned int byte) {
++  if (tf1_engine_) tf1_engine_->Step(byte_model_->BytePredict(), byte);
++}
++// The PPMd model restarts once at the end of the metadata block and once at
++// the end of the census line (latches of ppmd_meta.h, read in its
++// ByteUpdate()).  The skipped bytes never reach ByteUpdate(), so the restarts
++// are taken here, right behind the byte that set the latch: the warm-up of the
++// dictionary article (PpmdWaermen) then falls behind them as in a real run.
++void Predictor::NeifSkipSync() { byte_model_->NeifSync(); }
++// BITLSTM chooses its weight set from the bits it corrected (a bit of the
++// metadata block seen, then one outside it; then the page count).  A run that
++// starts behind the metadata block never sees the first condition: set the
++// weight set of the position.
++void Predictor::NeifSkipEnd() { bit_head::NeifSyncSlot(); }
++
++// ---- pipeline (src/neif_test.h) ---------------------------------------------
++// Before the fork: the tables of the semantic cache.  SemInit() runs at the
++// first stream byte of the model and makes room for them in the PPMd page
++// pool; after the fork the pool belongs to the PPMd stage, so it runs here,
++// at the same place of the stream.
++void Predictor::NeifPipePrepare() {
++  if (!sem_.key) SemInit();
++}
++// A front stage: one model byte (coded, forced or injected).  Of what
++// Perceive() does for the eight bits and at the byte boundary, the part that
++// PPMd and the transformer read: the contexts and the history (context
++// manager), the match models whose longest match is the transformer's match
++// channel, PPMd, the transformer driver and the fast-weight target marks.
++// None of it reads the mixers, the coder or any other model.
++void Predictor::NeifFrontByte(unsigned int byte) {
++  const bool lo = (neif_test::g_own & neif_test::kOwnTfLo) != 0;   // this stage embeds the rows
++  for (int j = 7; j >= 0; --j) {
++    const int bit = (int)((byte >> j) & 1u);
++    if (lo)
++      for (unsigned int q = 0; q < tf1_match_count_; ++q) match_models_[tf1_match_base_ + q].Perceive(bit);
++    manager_.UpdateContexts(bit);
++  }
++  if (lo)
++    for (unsigned int q = 0; q < tf1_match_count_; ++q) match_models_[tf1_match_base_ + q].ByteUpdate();
++  byte_model_->ByteUpdate();
++  byte_model_->NeifRow();
++  if (lo && tf1_engine_ && tf1_match_count_ > 0) {   // as in Perceive()
++    unsigned int best = tf1_match_base_;
++    unsigned char best_len = match_models_[tf1_match_base_].MatchLength();
++    for (unsigned int q = 1; q < tf1_match_count_; ++q) {
++      const unsigned char l = match_models_[tf1_match_base_ + q].MatchLength();
++      if (l > best_len) { best_len = l; best = tf1_match_base_ + q; }
++    }
++    tf1_engine_->SetMatch(match_models_[best].MatchByte(), (int)best_len);
++  }
++  const float* tf1_row = tf1_engine_
++      ? tf1_engine_->Step(byte_model_->BytePredict(), manager_.bit_context_)
++      : nullptr;
++  if (tf1_engine_) {
++    // the target marks of the fast weights, as FwSetNeutral/FwSetRow/FwSetOff set them
++    if (tf1_row && transformer::Active() && !tf1_engine_->GateMasked()
++        && !alias_prompt::Laeuft() && !timestamp_skip::Laeuft()) tf1_engine_->FwRow();
++    else tf1_engine_->FwNeutral();
++  }
++  manager_.bit_context_ = 1;
++}
++// A front stage, right after the fork: the large tables it never reads go back
++// to the kernel (the pages stay with the coder stage, which then owns them
++// alone and writes them without a copy).  Kept: the history, the tables of
++// the transformer's match models, the areas of the transformer; PPMd has its
++// own heap.  MADV_DONTNEED leaves the mapping: a dropped page reads as zero.
++static void NeifDrop(const void* p, size_t n) {
++  const unsigned long a = ((unsigned long)p + 4095UL) & ~4095UL, b = ((unsigned long)p + n) & ~4095UL;
++  if (b > a) madvise((void*)a, b - a, MADV_DONTNEED);
++}
++void Predictor::NeifFrontDrop() {
++  const pageregistry::Table& t = pageregistry::T();
++  const unsigned long hist = (unsigned long)manager_.history_.data();
++  for (unsigned int i = 0; i < t.n; ++i) {
++    if (i >= neif_test::g_reg_match[0] && i < neif_test::g_reg_match[1]) continue;
++    if (i >= neif_test::g_reg_tf[0] && i < neif_test::g_reg_tf[1]) continue;
++    if (hist >= t.a[i] && hist < t.b[i]) continue;
++    NeifDrop((const void*)t.a[i], t.b[i] - t.a[i]);
++  }
++  if (sem_.key) {
++    using namespace semantic_cache;
++    NeifDrop(sem_.key, (size_t)kN * kKB);
++    NeifDrop(sem_.val, (size_t)kN);
++    NeifDrop(sem_.slot, ((size_t)kL << kB) * kM * sizeof(Slot));
++    NeifDrop(sem_.epos, (size_t)kN * 4);
++    NeifDrop(sem_.hist, (size_t)kHist);
++  }
++}
++#endif
++
+ void Predictor::Pretrain(int bit) {
+   bracket_model_->Predict();
+   fxcm_model_.PredictHalf();
+diff --git a/src/predictor.h b/src/predictor.h
+index 4baa604..f467c3f 100644
+--- a/src/predictor.h
++++ b/src/predictor.h
+@@ -80,6 +80,17 @@ class Predictor {
+   void SemLearn(int bit);
+   // the semantic-cache columns of the BITLSTM row (Predict(), every bit)
+   void SemAppend();
++#ifdef NEIF_TEST
++  // chunk evaluation (src/neif_test.h): the structure-only pass
++  void NeifSkipByte(unsigned int byte);   // one stream or injected byte: automata only
++  void NeifSkipSync();                    // the PPMd restarts of the block ends
++  void NeifSkipEnd();                     // before the first byte the model runs on
++  // pipeline (src/neif_test.h)
++  void NeifPipePrepare();                 // before the fork
++  void NeifFrontByte(unsigned int byte);  // a front stage: one model byte
++  void NeifFrontDrop();                   // a front stage: the tables of the coder stage go
++  void NeifPpmdDisown() { byte_model_->NeifDisown(); }   // a stage without the PPMd model
++#endif
+ 
+  private:
+   void SemInit();
+diff --git a/src/runner.cpp b/src/runner.cpp
+index 4f9ee4a..7a79890 100644
+--- a/src/runner.cpp
++++ b/src/runner.cpp
+@@ -97,6 +97,14 @@ static bool census_block_active = false;
+ 
+ #include "no_args.h"
+ 
++#ifdef NEIF_TEST
++// Chunk ("split") evaluation mode `-t`, see src/neif_test.h.  Everything of it
++// in this file stands under this macro; without it the file is the entry's.
++#include "neif_test.h"
++#include <sys/resource.h>
++static double neif_t_model = 0;   // wall clock at the first byte the model ran on
++#endif
++
+ 
+ #include <malloc.h>
+ #ifndef AUX_BUILD
+@@ -220,6 +228,20 @@ static inline bool TimestampProgressInert() {
+ // model observes their bits, none is coded.  One function for both
+ // directions, so the hooks below need no coder object.
+ __attribute__((noinline)) static void ObserveKnownBytes(Predictor* p, const unsigned char* b, int n) {
++#ifdef NEIF_TEST
++  // structure events: the injected bytes; in the structure-only pass they go
++  // to the automata of the transformer driver alone (no model observes them)
++  for (int k = 0; k < n; ++k) neif_test::H(0x100u | b[k]);
++  if (neif_test::g_skip) {
++    for (int k = 0; k < n; ++k) p->NeifSkipByte(b[k]);
++    return;
++  }
++  // a front stage of the pipeline: the models of that stage observe them
++  if (neif_test::Front()) {
++    for (int k = 0; k < n; ++k) p->NeifFrontByte(b[k]);
++    return;
++  }
++#endif
+   invariants::g_injected_byte = 1;
+   for (int k = 0; k < n; ++k)
+     for (int bit = 7; bit >= 0; --bit) p->ObserveKnownBit((b[k] >> bit) & 1);
+@@ -273,8 +295,22 @@ namespace fxcmv1 { int DictNachladen(); }
+ __attribute__((noinline)) static void DictArticleSlotEnd() {
+   size_t n = 0;
+   const unsigned char* b = metablock::mk.TaPuffer(1, &n);
++#ifdef NEIF_TEST
++  // Pipeline: every stage comes here.  The first stage writes ./.dict, the
++  // others wait until it is complete (a second write would truncate the file
++  // under a stage that reads it); fxcm lives in the coder stage alone.
++  if (neif_test::g_ctl && neif_test::g_stage > 0) {
++    unsigned k = 0;
++    while (!neif_test::g_ctl->dict_done.load()) neif_test::PipeWait(k, 0);
++  } else {
++    dict_article::Schreiben(b, n);
++    if (neif_test::g_ctl) neif_test::g_ctl->dict_done.store(1);
++  }
++  const int w = neif_test::Front() ? 0 : fxcmv1::DictNachladen();
++#else
+   dict_article::Schreiben(b, n);
+   const int w = fxcmv1::DictNachladen();
++#endif
+   if (dict_article::wrt) {
+     run_mode::gram.Init(NULL, dict_article::strom, 0);
+     run_mode::gram.ZoneSperren();
+@@ -456,6 +492,9 @@ __attribute__((noinline)) static void TextStartByte(Predictor* p) {
+   {
+     bool jetzt = metablock::mk.TaSlotEndet() && metablock::mk.TaSlot() == 1;
+     if (jetzt) DictArticleSlotEnd();
++#ifdef NEIF_TEST
++    if (!neif_test::OwnPpmd()) jetzt = false;   // pipeline: the PPMd model lives in another stage
++#endif
+     if (jetzt) p->PpmdWaermen();
+   }
+   if (metablock::mk.TaSlotEndet() && metablock::mk.TaSlot() == 2) {
+@@ -575,6 +614,118 @@ __attribute__((noinline)) static void AfterStreamByte(Predictor* p, unsigned cha
+   (void)p; (void)c;
+ }
+ 
++#ifdef NEIF_TEST
++// ---- pipeline of the chunk mode (NEIF_PIPE=N, see src/neif_test.h) ---------
++#include <sys/prctl.h>
++#include <sys/mman.h>
++namespace ppmd_page { void neif_fork_child(void); }
++static int neif_pipe_n = 0;                    // NEIF_PIPE: number of stages (0, 1: none)
++static const char* neif_stream_path = nullptr;
++static double neif_fork_wall = 0, neif_fork_cpu = 0;   // at the fork (the coder stage: its own)
++static double neif_cpu_model = 0;              // CPU time of this process at the first model byte
++static long neif_pss_peak_kb = 0;              // largest sum of the stages' proportional set sizes seen
++static double NeifCpuNow() {                   // user + system time of this process
++  struct rusage ru;
++  getrusage(RUSAGE_SELF, &ru);
++  return (double)ru.ru_utime.tv_sec + (double)ru.ru_stime.tv_sec +
++         1e-6 * ((double)ru.ru_utime.tv_usec + (double)ru.ru_stime.tv_usec);
++}
++// proportional set size of a process (0 = this one), KiB: a page shared by k
++// processes counts 1/k, so the sum over the stages is the memory they use
++static long NeifPssKb(int pid) {
++  char name[64], line[256];
++  if (pid) snprintf(name, sizeof name, "/proc/%d/smaps_rollup", pid);
++  else snprintf(name, sizeof name, "/proc/self/smaps_rollup");
++  FILE* f = fopen(name, "r");
++  if (!f) return 0;
++  long kb = 0;
++  while (fgets(line, sizeof line, f))
++    if (!strncmp(line, "Pss:", 4)) { kb = strtol(line + 4, nullptr, 10); break; }
++  fclose(f);
++  return kb;
++}
++// the coder stage, about every five seconds: the memory of all stages
++static void NeifPssSample() {
++  if (!neif_test::g_ctl || neif_test::Front()) return;
++  static double next = 0;
++  const double now = console_progress::Now();
++  if (now < next) return;
++  next = now + 5.0;
++  long kb = NeifPssKb(0);
++  for (int k = 0; k < 4; ++k) if (neif_test::g_kids[k] > 0) kb += NeifPssKb(neif_test::g_kids[k]);
++  if (kb > neif_pss_peak_kb) neif_pss_peak_kb = kb;
++}
++// Called once, in front of the first byte the model runs on (behind the
++// structure-only pass, so every stage inherits the automata in step).  Forks
++// the front stages; the calling process stays the coder stage.  A front stage
++// returns into the byte loop of Compress() with its own handle of the stream,
++// positioned behind the block the loop is working on (the handle of the coder
++// stage shares its file position with the copies in the children).
++static void NeifPipeStart(Predictor* p, FILE** is, unsigned long long read_total) {
++  using namespace neif_test;
++  const int n = neif_pipe_n > 3 ? 3 : neif_pipe_n;
++  static const int own[2][3] = {
++      {kOwnPpmd | kOwnTfLo | kOwnTfHi, kOwnMix, 0},
++      {kOwnPpmd | kOwnTfLo, kOwnTfHi, kOwnMix}};
++  p->NeifPipePrepare();
++  g_ctl = (Ctl*)mmap(nullptr, sizeof(Ctl), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++  Ring* q[2] = {RingNew(32ull << 20), n == 3 ? RingNew(32ull << 20) : nullptr};
++  if ((void*)g_ctl == MAP_FAILED || !q[0] || (n == 3 && !q[1])) { g_ctl = nullptr; PipeFail("no shared memory"); }
++  fflush(nullptr);
++  prctl(PR_SET_TIMERSLACK, 1000UL);   // naps of a waiting stage (PipeWait) end on time; inherited
++  for (int s = 0; s + 1 < n; ++s) {
++    const pid_t pid = fork();
++    if (pid < 0) PipeFail("fork failed");
++    if (pid == 0) {
++      prctl(PR_SET_PDEATHSIG, SIGKILL);   // a front stage does not outlive the coder stage
++      g_stage = s;
++      g_own = own[n - 2][s];
++      g_in = s ? q[s - 1] : nullptr;
++      g_out = q[s];
++      for (int k = 0; k < 4; ++k) g_kids[k] = 0;
++      *is = fopen(neif_stream_path, "rb");
++      if (!*is || fseeko(*is, (off_t)read_total, SEEK_SET) != 0) PipeFail("cannot reopen the stream");
++      if (OwnPpmd()) ppmd_page::neif_fork_child();
++      else p->NeifPpmdDisown();
++      p->NeifFrontDrop();
++      neif_fork_wall = console_progress::Now();
++      neif_fork_cpu = NeifCpuNow();
++      ProfReset();
++      return;
++    }
++    g_kids[s] = (int)pid;
++  }
++  g_stage = n - 1;
++  g_own = kOwnMix;
++  g_in = q[n - 2];
++  p->NeifPpmdDisown();
++  neif_fork_wall = console_progress::Now();
++  neif_fork_cpu = NeifCpuNow();
++  ProfReset();
++}
++// A front stage behind the last byte of the chunk: its figures go to the
++// shared block, and the process ends without the end-of-run work of the coder
++// (no output, no destructors: the files and the PPMd heap are not its own).
++[[noreturn]] static void NeifFrontEnd() {
++  using namespace neif_test;
++  const int s = g_stage;
++  struct rusage ru;
++  getrusage(RUSAGE_SELF, &ru);
++  g_ctl->wall_s[s] = console_progress::Now() - neif_fork_wall;
++  g_ctl->cpu_s[s] = NeifCpuNow() - neif_fork_cpu;
++  g_ctl->hwm_kb[s] = ru.ru_maxrss;
++  g_ctl->pss_kb[s] = NeifPssKb(0);
++  char who[16];
++  snprintf(who, sizeof who, "stage%d", s);
++  ProfPrint(stderr, who, g_ctl->wall_s[s]);
++  fprintf(stderr, "neif_pipe stage %d: %.1f s wall, %.1f s cpu, %llu queue waits\n", s, g_ctl->wall_s[s],
++          g_ctl->cpu_s[s], g_waits);
++  fflush(stderr);
++  g_ctl->done[s].store(1);
++  _exit(0);
++}
++#endif
++
+ void Compress(unsigned long long input_bytes, FILE* is,
+     FILE* os, unsigned long long* output_bytes, Predictor* p) {
+   Encoder e(os, p);
+@@ -588,14 +739,88 @@ void Compress(unsigned long long input_bytes, FILE* is,
+   const size_t buffer_size = sizeof buffer;
+   unsigned long long pos = 0;
+   int sem_pb = 0;   // the previous stream byte (0 before the first)
++#ifdef NEIF_TEST
++  unsigned long long neif_tail = 0;   // the last 8 stream bytes
++  unsigned long long neif_read = 0;   // stream bytes read so far (whole blocks)
++  const char* neif_tr = getenv("NEIF_T_TRACE");
++  const unsigned long long neif_trace = (neif_tr && *neif_tr) ? strtoull(neif_tr, nullptr, 10) : 0;
++#endif
+   while (pos < input_bytes) {
+     const size_t chunk = static_cast<size_t>(
+         std::min<unsigned long long>(buffer_size, input_bytes - pos));
+     const size_t got = fread(buffer, 1, chunk, is);
+     if (got == 0) break;
++#ifdef NEIF_TEST
++    neif_read += got;
++#endif
+     for (size_t i = 0; i < got; ++i) {
+       unsigned char c = static_cast<unsigned char>(buffer[i]);
++#ifdef NEIF_TEST
++      if (neif_test::g_on) {
++        // The structure-only pass ends at the first page start at or behind
++        // the warm-up target: the 8 bytes in front are the page anchor
++        // `  </page>\n` (author_block::kAnker), so the model starts on the
++        // first title byte of a page, where the transformer starts a document.
++        if (neif_test::g_skip && pos >= neif_test::g_warm_target &&
++            neif_tail == 0x20204c2fdf984e0aull) {
++          neif_test::g_skip = false;
++          neif_test::g_warm_from = (long long)pos;
++          neif_t_model = console_progress::Now();
++          neif_cpu_model = NeifCpuNow();
++          p->NeifSkipEnd();
++          neif_test::ProfReset();
++        }
++        // pipeline: the stages part in front of the first byte the model runs on;
++        // a front stage goes on in this loop with its own handle of the stream
++        if (!neif_test::g_skip && neif_pipe_n > 1 && !neif_test::g_ctl) NeifPipeStart(p, &is, neif_read);
++        neif_test::g_pos = pos;
++        neif_tail = (neif_tail << 8) | c;
++        // NEIF_T_TRACE=n: a line every n stream bytes with the bits and the
++        // coder output so far (before this byte), for comparison with
++        // doc/stream_rate.tsv
++        if (neif_trace && !neif_test::g_skip && !neif_test::Front() && pos % neif_trace == 0)
++          fprintf(stderr, "neif_trace %llu %.3f %llu\n", pos, neif_test::g_bits_all,
++                  (unsigned long long)e.OutputSize());
++        neif_test::g_hash_on = pos >= neif_test::g_start;
++        neif_test::g_count = !neif_test::g_skip && pos >= neif_test::g_start;
++        // structure events of this stream byte, the same in both passes: the
++        // byte, a forced byte, the forced-bit row of the text start, the mask
++        // of the grammar automaton, the gate zone and the page count
++        const int nzw = p->Tf1ZwangByte();
++        neif_test::H(c);
++        neif_test::H((unsigned)(nzw + 1));
++        neif_test::H(metablock::zw::an ? 1u : 0u);
++        neif_test::H(run_mode::gram.ByteActive(pos) ? (unsigned)run_mode::gram.DbgMask() : 0xffu);
++        neif_test::H(tf_gate::ctx.zone);
++        neif_test::H(tf_gate::ctx.pages);
++        if (nzw >= 0 && nzw != (int)c) ++neif_test::g_zw_mismatch;
++        if (neif_test::g_skip || neif_test::Front()) {
++          // the byte as the branches below treat it, without the coder: in the
++          // structure-only pass without any model, in a front stage of the
++          // pipeline with the models of that stage
++          if (nzw >= 0) {
++            if (run_mode::gram.ByteActive(pos)) run_mode::gram.NextByte((unsigned int)nzw);
++          } else if (metablock::zw::an) {
++          } else if (run_mode::gram.ByteActive(pos)) {
++            run_mode::gram.NextByte(c);
++          }
++          const unsigned int mb = nzw >= 0 ? (unsigned int)nzw : (unsigned int)c;
++          if (neif_test::g_skip) p->NeifSkipByte(mb); else p->NeifFrontByte(mb);
++          sem_pb = c;
++          AfterStreamByte(p, c);
++          if (neif_test::g_skip) p->NeifSkipSync();
++          ++pos;
++          continue;
++        }
++      }
++#endif
++#ifdef NEIF_TEST
++      neif_test::T(14);   // profile mark: semantic cache, byte start
++#endif
+       p->SemByteStart(sem_pb);
++#ifdef NEIF_TEST
++      neif_test::T(0);
++#endif
+       sem_pb = c;
+       const int zw = p->Tf1ZwangByte();
+       if (zw >= 0) {
+@@ -633,11 +858,22 @@ void Compress(unsigned long long input_bytes, FILE* is,
+ 
+         HUGEPAGE_TICK(pos);
+         console_progress::Tick(pos, input_bytes);
++#ifdef NEIF_TEST
++        NeifPssSample();
++#endif
+       }
+       ++pos;
+     }
+   }
++#ifdef NEIF_TEST
++  if (neif_test::Front()) NeifFrontEnd();   // a front stage of the pipeline ends here
++#endif
+   e.Flush();
++#ifdef NEIF_TEST
++  // a chunk ends in the middle of the stream: the end-of-stream checks of the
++  // units below do not apply
++  if (neif_test::g_on) { *output_bytes = ftell(os); return; }
++#endif
+   run_mode::gram.Report("compress");
+   if (!MetablockInert()) {
+     metablock::mk.Report("compress");
+@@ -747,6 +983,133 @@ bool Store(const std::string& input_path, const std::string& temp_path,
+   return true;
+ }
+ 
++#ifdef NEIF_TEST
++static unsigned long long NeifEnv(const char* name, unsigned long long def) {
++  const char* v = getenv(name);
++  return (v && *v) ? strtoull(v, nullptr, 10) : def;
++}
++// `cmix -t STREAM OUT`: codes bytes [warm_from, end) of the coder stream STREAM
++// (the file `-e enwik9` hands to Compress(); training/tf/1_dump: cmix_stream
++// writes it as out.cmix.temp) and writes the coder output to OUT.
++// Environment: NEIF_T_START, NEIF_T_END (the chunk, stream bytes; default the
++// whole stream), NEIF_T_WARM (warm-up bytes in front of START; the model starts
++// at the first page start at or behind START - WARM, or at byte 0 if WARM >=
++// START), NEIF_T_JSON (result file).  The run mirrors RunCompression() from
++// the header on: as in the decoder, everything the coder needs comes from the
++// stream itself (the dictionary is slot 1 of the text start), so no file of
++// the preprocessing is read.  The weights container must lie in the working
++// directory; ./.dict and ./ppm.page are written there (one directory per
++// process).
++static int NeifTestMain(const char* stream_path, const char* out_path) {
++  FILE* in = fopen(stream_path, "rb");
++  if (!in) { fprintf(stderr, "neif_test: cannot open %s\n", stream_path); return 2; }
++  fseek(in, 0L, SEEK_END);
++  const unsigned long long stream_bytes = ftell(in);
++  fseek(in, 0L, SEEK_SET);
++  FILE* out = fopen(out_path, "wb");
++  if (!out) { fprintf(stderr, "neif_test: cannot write %s\n", out_path); return 2; }
++  unsigned long long start = NeifEnv("NEIF_T_START", 0);
++  unsigned long long end = NeifEnv("NEIF_T_END", stream_bytes);
++  const unsigned long long warm = NeifEnv("NEIF_T_WARM", 0);
++  if (end > stream_bytes) end = stream_bytes;
++  if (start >= end) { fprintf(stderr, "neif_test: empty chunk\n"); return 2; }
++  neif_test::g_on = true;
++  neif_test::g_start = start;
++  neif_test::g_end = end;
++  neif_test::g_warm_target = start > warm ? start - warm : 0;
++  neif_test::g_skip = neif_test::g_warm_target > 0;
++  neif_test::g_prof = NeifEnv("NEIF_PROF", 0) != 0;
++  // NEIF_PIPE=N: the model bytes run as a pipeline of N processes (2, or 3 and
++  // more = 3; src/neif_test.h); NEIF_PIPE_SPLIT: the first transformer layer
++  // of the second stage for N = 3 (1..12: the fast weights sit in the last four layers)
++  neif_pipe_n = (int)NeifEnv("NEIF_PIPE", 0);
++  neif_test::g_tf_split = (int)NeifEnv("NEIF_PIPE_SPLIT", 8);
++  if (neif_test::g_tf_split < 1 || neif_test::g_tf_split > 12) { fprintf(stderr, "neif_test: NEIF_PIPE_SPLIT must be 1..12\n"); return 2; }
++  neif_stream_path = stream_path;
++  if (!neif_test::g_skip) neif_test::g_warm_from = 0;
++
++  // from here as RunCompression() behind the preprocessing
++  std::vector<bool> vocab(256, false);
++  vocab_frozen::FillVocab(&vocab);
++  WriteHeaderVocfix(stream_bytes, true, out);   // the length of the whole stream, as in a real run
++  dict_article::strom = stream_bytes;
++  dict_article::wrt = true;
++  dict_article::Verbergen();
++  Predictor p(vocab);
++  HUGEPAGE_COLLAPSE("c-init");
++  malloc_trim(0);
++  const double t0 = console_progress::Now();
++  neif_t_model = t0;
++  neif_cpu_model = NeifCpuNow();
++  neif_test::ProfReset();
++  unsigned long long output_bytes = 0;
++  Compress(end, in, out, &output_bytes, &p);
++  const double t1 = console_progress::Now();
++  neif_test::ProfPrint(stderr, neif_test::g_ctl ? "coder" : "single", t1 - neif_t_model);
++  // pipeline: the front stages have passed the last byte before the coder
++  // stage; take their figures and wait for them (before the Predictor goes:
++  // the PPMd heap is theirs while they live)
++  const int n_front = neif_test::g_ctl ? neif_test::g_stage : 0;
++  double model_cpu = NeifCpuNow() - neif_cpu_model, front_cpu = 0;
++  long pss_end_kb = 0;
++  if (neif_test::g_ctl) {
++    pss_end_kb = NeifPssKb(0);
++    for (int k = 0; k < n_front; ++k) {
++      int st = 0;
++      if (neif_test::g_kids[k] > 0 && (waitpid(neif_test::g_kids[k], &st, 0) != neif_test::g_kids[k] ||
++                                       !WIFEXITED(st) || WEXITSTATUS(st) != 0)) {
++        fprintf(stderr, "neif_test: front stage %d failed\n", k);
++        return 3;
++      }
++      front_cpu += neif_test::g_ctl->cpu_s[k];
++      pss_end_kb += neif_test::g_ctl->pss_kb[k];
++    }
++    if (pss_end_kb > neif_pss_peak_kb) neif_pss_peak_kb = pss_end_kb;
++    fprintf(stderr, "neif_pipe coder stage: %.1f s wall, %.1f s cpu, %llu queue waits\n", t1 - neif_t_model,
++            model_cpu, neif_test::g_waits);
++  }
++  fclose(in);
++  fclose(out);
++  remove(".dict.ta");
++  if (neif_test::g_warm_from < 0) { fprintf(stderr, "neif_test: no page start behind the warm-up target\n"); return 2; }
++
++  struct rusage ru;
++  getrusage(RUSAGE_SELF, &ru);
++  const unsigned long long wf = (unsigned long long)neif_test::g_warm_from;
++  const unsigned long long kept_from = start > wf ? start : wf;   // START itself unless the page start fell behind it
++  const char* jp = getenv("NEIF_T_JSON");
++  FILE* j = (jp && *jp) ? fopen(jp, "w") : stdout;
++  if (!j) j = stdout;
++  fprintf(j, "{\"start\": %llu, \"end\": %llu, \"warm_from\": %llu, \"kept_from\": %llu,\n"
++             " \"stream_bytes\": %llu, \"seconds\": %.1f, \"skip_seconds\": %.1f, \"model_seconds\": %.1f,\n"
++             " \"model_bytes_per_second\": %.1f,\n"
++             " \"coded_bytes\": %llu, \"total_bits\": %.3f, \"kept_bits\": %.3f, \"kept_bytes\": %.3f,\n"
++             " \"coded_bit_count\": %llu, \"kept_bit_count\": %llu, \"coded_vs_bits_ratio\": %.6f,\n"
++             " \"kept_bits_per_byte\": %.5f, \"forced_byte_mismatch\": %llu,\n"
++             " \"structure_hash\": \"%016llx\", \"tf_rows_hashed\": %llu, \"pages_at_end\": %u, \"peak_rss_kb\": %ld,\n",
++          start, end, wf, kept_from, stream_bytes, t1 - t0, neif_t_model - t0, t1 - neif_t_model,
++          (double)(end - wf) / (t1 - neif_t_model > 0 ? t1 - neif_t_model : 1.0),
++          output_bytes - 5, neif_test::g_bits_all, neif_test::g_bits_kept, neif_test::g_bits_kept / 8.0,
++          neif_test::g_n_all, neif_test::g_n_kept,
++          neif_test::g_bits_all > 0 ? (double)(output_bytes - 5) * 8.0 / neif_test::g_bits_all : 0.0,
++          end > kept_from ? neif_test::g_bits_kept / (double)(end - kept_from) : 0.0,
++          neif_test::g_zw_mismatch, (unsigned long long)neif_test::g_hash, neif_test::g_tf_rows,
++          tf_gate::ctx.pages, ru.ru_maxrss);
++  // pipe: number of stages (0 = one process).  model_cpu_seconds: CPU time of
++  // all stages over the model bytes; cpu_seconds: the same plus start-up and
++  // structure pass.  pipe_peak_pss_kb: the largest sum of the stages'
++  // proportional set sizes, sampled every 5 s and at the end (peak_rss_kb
++  // above is the coder stage alone and counts pages shared with the others).
++  fprintf(j, " \"pipe\": %d, \"tf_split\": %d, \"model_cpu_seconds\": %.1f, \"cpu_seconds\": %.1f,\n"
++             " \"front_cpu_seconds\": [%.1f, %.1f], \"pipe_peak_pss_kb\": %ld}\n",
++          n_front ? n_front + 1 : 0, n_front == 2 ? neif_test::g_tf_split : 0, model_cpu + front_cpu,
++          NeifCpuNow() + front_cpu, n_front > 0 ? neif_test::g_ctl->cpu_s[0] : 0.0,
++          n_front > 1 ? neif_test::g_ctl->cpu_s[1] : 0.0, neif_pss_peak_kb);
++  if (j != stdout) fclose(j);
++  return 0;
++}
++#endif
++
+ bool RunCompression(bool enable_preprocess, const std::string& input_path,
+     const std::string& temp_path, const std::string& output_path,
+     FILE* dictionary, unsigned long long* input_bytes,
+@@ -943,6 +1306,9 @@ int main(int argc, char** argv) {
+   if ((argc != 1) && (argc < 4 || argc > 5 || strlen(argv[1]) != 2 || argv[1][0] != '-' ||
+       (argv[1][1] != 'd' && argv[1][1] != 'e'
+       && argv[1][1] != 'D'
++#ifdef NEIF_TEST
++      && argv[1][1] != 't'   // chunk evaluation mode
++#endif
+       ))) {
+     return Help();
+   }
+@@ -1075,6 +1441,9 @@ int main(int argc, char** argv) {
+       return Help();
+     }
+   } else
++#endif
++#ifdef NEIF_TEST
++  if (argv[1][1] == 't') return NeifTestMain(input_path.c_str(), output_path.c_str());
+ #endif
+   if (argv[1][1] == 'e') {
+ #define ENC_FAIL return Help()
+diff --git a/src/tf1/opt/model_opt.cpp b/src/tf1/opt/model_opt.cpp
+index 45828fc..2d5a948 100644
+--- a/src/tf1/opt/model_opt.cpp
++++ b/src/tf1/opt/model_opt.cpp
+@@ -27,6 +27,9 @@
+ #include "model_opt.h"
+ #include "../../cold_size.h"
+ #include "../../semantic_cache.h"
++#ifdef NEIF_TEST
++#include "../../neif_test.h"   // chunk evaluation: pipeline stages
++#endif
+ 
+ #include <immintrin.h>
+ 
+@@ -841,6 +844,30 @@ struct TransformerOptImpl : ZRow {
+     }
+   }
+ 
++#ifdef NEIF_TEST
++  // All layers of the embedded rows r[0, n).  In a pipeline (src/neif_test.h)
++  // the network may be cut between two layers: the stage with the lower
++  // layers sends each row's depth-mix state (ArRow: all a later layer reads of
++  // the layers in front), the stage with the upper layers starts from it.
++  // Every layer does the same arithmetic on the same values as in one process.
++  __attribute__((noinline)) void zb_stage(ZRow* r, int n, bool kv_last) {
++    const bool lo = (neif_test::g_own & neif_test::kOwnTfLo) != 0;
++    const bool hi = (neif_test::g_own & neif_test::kOwnTfHi) != 0;
++    if (lo != hi) {
++      const size_t ar_bytes = (size_t)((const char*)(r->ar_f + D) - (const char*)r->ar_x0);
++      if (lo) {
++        zb_layers(r, n, kv_last, 0, neif_test::g_tf_split, t);
++        for (int j = 0; j < n; j++) neif_test::Put('A', r[j].ar_x0, ar_bytes);
++      } else {
++        for (int j = 0; j < n; j++) neif_test::Get('A', r[j].ar_x0, ar_bytes);
++        zb_layers(r, n, kv_last, neif_test::g_tf_split, NL, t);
++      }
++      return;
++    }
++    zb_layers(r, n, kv_last, 0, NL, t);
++  }
++#endif
++
+   // The queue of unread rows (ZB rows): step() with an unread row only queues
+   // it; the queue runs when the next read row arrives, at begin_article() or
+   // when it is full.  What the rows leave (KV rings, KDA states, t) is written
+@@ -867,12 +894,19 @@ struct TransformerOptImpl : ZRow {
+ #endif
+     fw_gel = false;   // unread rows capture no MLP code
+     const PaketChannels pk_keep = pk;   // paket_token_row() reads pk
++#ifdef NEIF_TEST
++    if (neif_test::g_own & neif_test::kOwnTfLo)   // pipeline: the embedding belongs to the lower layers
++#endif
+     for (int j = 0; j < n; j++) {
+       pk = zr[j].pk;
+       zb_embed(zr[j]);
+     }
+     pk = pk_keep;
++#ifdef NEIF_TEST
++    zb_stage(zr, n, true);
++#else
+     zb_layers(zr, n, true, 0, NL, t);
++#endif
+     std::memcpy(xn, zr[n - 1].xn, sizeof(float) * D);
+     t += n;
+   }
+@@ -1182,8 +1216,17 @@ struct TransformerOptImpl : ZRow {
+     zb_run();
+     fw_gel = true;
+     tok = token;
++#ifdef NEIF_TEST
++    if (neif_test::g_own & neif_test::kOwnTfLo)   // pipeline: the embedding belongs to the lower layers
++#endif
+     zb_embed(*this);
++#ifdef NEIF_TEST
++    zb_stage(this, 1, false);
++    // pipeline: the output heads belong to the stage with the upper layers
++    if (!(neif_test::g_own & neif_test::kOwnTfHi)) { t++; return; }
++#else
+     zb_layers(this, 1, false, 0, NL, t);
++#endif
+     {
+       PSCOPE(PS_EL_RESID);
+       ar_read();                                  // x = the final read (q 2 NL, M.ar_q_final)
+@@ -1215,6 +1258,9 @@ COLD_SIZE_ATTR TransformerOpt::TransformerOpt(const char* weights_path, AttnKind
+ COLD_SIZE_ATTR TransformerOpt::~TransformerOpt() = default;
+ 
+ void TransformerOpt::begin_article(int64_t rope_position_offset) {
++#ifdef NEIF_TEST
++  if (!neif_test::OwnTf()) return;   // pipeline: the network lives in other stages
++#endif
+   impl->begin(rope_position_offset);
+ }
+ 
+@@ -1260,7 +1306,25 @@ const float* TransformerOpt::last_key() const { return impl->sc_key; }
+ 
+ AttnKind TransformerOpt::attn_kind() const { return impl->kind; }
+ 
++#ifdef NEIF_TEST
++void TransformerOpt::fw_update(uint8_t target) {
++  // pipeline: the fast weights live in the stage with the upper layers
++  if (!(neif_test::g_own & neif_test::kOwnTfHi)) return;
++  impl->fw_update(target);
++}
++// Pipeline: what the coder side reads of the network between two driver steps
++// (hidden vector, cache key, second-head row), out of the engine or into it.
++void TransformerOpt::neif_state(float* buf, bool load) {
++  float* const part[3] = {impl->xn, impl->sc_key, impl->fw_probs208};
++  const int n[3] = {D, D, 208};
++  for (int i = 0; i < 3; buf += n[i], i++) {
++    if (load) std::memcpy(part[i], buf, sizeof(float) * n[i]);
++    else std::memcpy(buf, part[i], sizeof(float) * n[i]);
++  }
++}
++#else
+ void TransformerOpt::fw_update(uint8_t target) { impl->fw_update(target); }
++#endif
+ const float* TransformerOpt::fw_probs() const { return impl->fw_probs208; }
+ 
+ }  // namespace opt
+diff --git a/src/tf1/opt/model_opt.h b/src/tf1/opt/model_opt.h
+index a84db37..34491c9 100644
+--- a/src/tf1/opt/model_opt.h
++++ b/src/tf1/opt/model_opt.h
+@@ -99,6 +99,12 @@ struct TransformerOpt {
+   // the V second-head probabilities of the last read row (valid until the
+   // next read row)
+   const float* fw_probs() const;
++#ifdef NEIF_TEST
++  // pipeline (src/neif_test.h): last_hidden(), last_key() and fw_probs() as
++  // one block of kNeifState floats, copied out (load = false) or in
++  static constexpr int kNeifState = 2 * 192 + 208;
++  void neif_state(float* buf, bool load);
++#endif
+ 
+  private:
+   std::unique_ptr<TransformerOptImpl> impl;
+diff --git a/src/tf1/tf1_engine.cpp b/src/tf1/tf1_engine.cpp
+index 00ae038..716f902 100644
+--- a/src/tf1/tf1_engine.cpp
++++ b/src/tf1/tf1_engine.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "../meld.h"
+ #include "tf1_engine.h"
++#ifdef NEIF_TEST
++#include "../neif_test.h"   // chunk evaluation: structure-only pass
++#endif
+ #include "../census_title.h"
+ 
+ #include "../alias_title_subst.h"
+@@ -317,6 +320,24 @@ struct Tf1Engine::Impl {
+   __attribute__((noinline)) void Feed(int tok, const uint16_t* prior, bool inserted, float* out
+             , bool gelesen
+            ) {
++#ifdef NEIF_TEST
++    // chunk evaluation: every row the coder feeds is a structure event (token,
++    // inserted or stream row, read row); in the structure-only pass the row
++    // is booked as below and the network step is left out
++    neif_test::H((unsigned)tok);
++    neif_test::H((inserted ? 1u : 0u) | (gelesen ? 2u : 0u));
++    if (neif_test::g_hash_on) ++neif_test::g_tf_rows;
++    // the same in a pipeline stage behind the network (src/neif_test.h): what
++    // the steps of this byte leave of it came from the queue, in Step()
++    if (neif_test::g_skip || !neif_test::OwnTf()) {
++      pk_prev2 = pk_prev1;
++      pk_prev1 = tok;
++      ++doc_rows;
++      if (doc_rows > max_doc_rows) max_doc_rows = doc_rows;
++      if (gelesen && !neif_test::g_skip) fw_have = true;
++      return;
++    }
++#endif
+     if (opt) opt->set_gelesen(gelesen);
+     fx2::PaketChannels ch;
+     ch.prev1 = pk_prev1;
+@@ -419,10 +440,36 @@ LOAD_PATH_ATTR Tf1Engine::~Tf1Engine() {
+   delete impl_;
+ }
+ 
++#ifdef NEIF_TEST
++// Pipeline (src/neif_test.h), record 'F': everything the coder side reads of
++// the network after one driver step -- the raw output row (Step() makes the
++// slot row from it) and the engine's hidden vector, cache key and second-head
++// row.  The stage with the output heads sends it at the end of Step(); the
++// coder stage, which runs no network step (Feed()), takes it at the start.
++// That is the same: whatever Step() derives from the row and keeps (half,
++// probs) is derived, or derived again, behind the last network step of that
++// Step(), and between two Step() calls nothing changes the engine.
++static void NeifStateIo(float* tf_out, fx2::opt::TransformerOpt* opt, bool load) {
++  float buf[208 + fx2::opt::TransformerOpt::kNeifState];
++  if (load) {
++    neif_test::Get('F', buf, sizeof buf);
++    memcpy(tf_out, buf, sizeof(float) * 208);
++    opt->neif_state(buf + 208, true);
++  } else {
++    memcpy(buf, tf_out, sizeof(float) * 208);
++    opt->neif_state(buf + 208, false);
++    neif_test::Put('F', buf, sizeof buf);
++  }
++}
++#endif
++
+ const float* Tf1Engine::Step(const std::valarray<float>& ppmd,
+     unsigned int byte) {
+   Impl& s = *impl_;
+   if (timestamp_skip::Laeuft()) return s.probs.data();
++#ifdef NEIF_TEST
++  if (neif_test::g_own == neif_test::kOwnMix) NeifStateIo(s.tf_out.data(), s.opt, true);
++#endif
+   if (alias_prompt::Laeuft()) {
+     if (comment_tag::g_j < 2) byte = comment_tag::g_tf[comment_tag::g_j++];
+     const int atok = s.byte_to_index[byte];
+@@ -462,6 +509,9 @@ const float* Tf1Engine::Step(const std::valarray<float>& ppmd,
+     RowToFloats(s.half.data(), s.probs.data());
+     s.probs_from_tf = true;
+     RowFloor(s.probs.data(), ((float)(300) * 1e-10f));
++#ifdef NEIF_TEST
++    if ((neif_test::g_own & neif_test::kOwnTfHi) && neif_test::g_out) NeifStateIo(s.tf_out.data(), s.opt, false);
++#endif
+     return s.probs.data();
+   }
+ 
+@@ -716,6 +766,9 @@ const float* Tf1Engine::Step(const std::valarray<float>& ppmd,
+     }
+   }
+   RowFloor(s.probs.data(), ((float)(300) * 1e-10f));
++#ifdef NEIF_TEST
++  if ((neif_test::g_own & neif_test::kOwnTfHi) && neif_test::g_out) NeifStateIo(s.tf_out.data(), s.opt, false);
++#endif
+   return s.probs.data();
+ }
+ 

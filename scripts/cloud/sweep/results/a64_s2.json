@@ -1,0 +1,23 @@
+{
+ "name": "a64_s2",
+ "data": "/root/slices/A64",
+ "layers": 4,
+ "d_model": 96,
+ "heads": 3,
+ "d_mlp": 192,
+ "window": 1024,
+ "params": 395539,
+ "patch": 0,
+ "trunk_steps": 66977792,
+ "epochs": 75,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 63998707,
+ "tf_bits": 139126519.32230577,
+ "cmix_bits": 137720435.32241282,
+ "mix_bits": 125592136.33791351,
+ "tf_bpc": 2.1738957838992867,
+ "cmix_bpc": 2.151925277528073,
+ "mix_bpc": 1.9624167772313512,
+ "train_seconds": 12935.187702178955
+}
