@@ -1,4 +1,13 @@
 #!/bin/bash
+# split_eval.sh: fast estimate of the full-enwik9 result for one transformer weight set. The
+# preprocessed stream is coded in K independent chunks in parallel (each with a warm-up
+# prefix) and the ideal code lengths of the kept parts are summed. The total is biased upward,
+# so only DIFFERENCES between weight sets (same K, same warm-up) are meaningful. This is the
+# "split" evaluation that decided which weights went into the entry.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Approximate full-enwik9 size for a transformer weight set by coding the
 # preprocessed stream (upload/stream.bin, what the -e pipeline codes) in K
 # chunks in parallel on a many-core CPU pod (2026-11-08).

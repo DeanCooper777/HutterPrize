@@ -1,0 +1,21 @@
+{
+ "name": "b16_s4",
+ "data": "/root/slices/B16",
+ "layers": 8,
+ "d_model": 192,
+ "heads": 3,
+ "d_mlp": 384,
+ "window": 1024,
+ "params": 2791142,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15992856,
+ "tf_bits": 2143635.1010827534,
+ "cmix_bits": 6829339.678110922,
+ "mix_bits": 888223.4420799409,
+ "tf_bpc": 0.13403704135663783,
+ "cmix_bpc": 0.4270243962748693,
+ "mix_bpc": 0.055538763187759646,
+ "train_seconds": 19191.250933647156
+}

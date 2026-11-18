@@ -1,3 +1,12 @@
+# diff_quant.py: debugging aid for the fused fake quantization
+# (cmix-T-dwc/pysrc/quantization.py). Runs one real training micro batch and compares, call by
+# call, the fused implementation with the eager reference of the previous winner. This is how
+# the rounding difference described at _COMPILE_OPTIONS in quantization.py was located.
+# Output: a report on stdout.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Find Quantize calls where the fused and eager fake quantization disagree
 # inside run A's real model on a real micro batch (forward and backward).
 # Run from /workspace/opt:
@@ -38,6 +47,8 @@ class Spy:
         return compare_apply(blocks, flat_scale, quant, return_ints)
 
 
+# Replacement for the recipe's train(): routes every Quantize call through a comparison of
+# the two implementations, runs one forward pass and exits.
 def diff_train(raw_model, model, data, cfg):
     quantization.QuantizeFunction_orig = quantization.QuantizeFunction
     batch = next(iter(data))

@@ -1,0 +1,23 @@
+{
+ "name": "pa64_s3",
+ "data": "/root/slices/A64",
+ "layers": 8,
+ "d_model": 128,
+ "heads": 4,
+ "d_mlp": 256,
+ "window": 1024,
+ "params": 1540588,
+ "patch": 1,
+ "trunk_steps": 40011611,
+ "epochs": 75,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 63998707,
+ "tf_bits": 136666464.4854077,
+ "cmix_bits": 137720435.32241282,
+ "mix_bits": 120834378.05406636,
+ "tf_bpc": 2.135456650482137,
+ "cmix_bpc": 2.151925277528073,
+ "mix_bpc": 1.888075302116125,
+ "train_seconds": 12150.702065944672
+}

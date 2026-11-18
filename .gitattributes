@@ -4,3 +4,5 @@
 makefile text eol=lf
 *.tfwc2 binary
 *.tch binary
+neif/*.patch -text
+neif/BASE_COMMIT -text

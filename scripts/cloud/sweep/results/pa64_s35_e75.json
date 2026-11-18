@@ -1,0 +1,23 @@
+{
+ "name": "pa64_s35_e75",
+ "data": "/root/slices/A64",
+ "layers": 8,
+ "d_model": 160,
+ "heads": 4,
+ "d_mlp": 320,
+ "window": 1024,
+ "params": 2304604,
+ "patch": 1,
+ "trunk_steps": 40011611,
+ "epochs": 75,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 63998707,
+ "tf_bits": 132115581.28506525,
+ "cmix_bits": 137720435.32241282,
+ "mix_bits": 117802429.88329814,
+ "tf_bpc": 2.0643476638530407,
+ "cmix_bpc": 2.151925277528073,
+ "mix_bpc": 1.840700154821849,
+ "train_seconds": 19579.728556871414
+}

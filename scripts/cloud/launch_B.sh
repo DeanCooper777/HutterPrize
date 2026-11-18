@@ -1,4 +1,11 @@
 #!/bin/bash
+# launch_B.sh: start run_B.sh (the smaller-model training experiment) detached on a GPU
+# machine, so it survives the ssh session, and arrange for the machine to stop when it is
+# done.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Start run_B.sh detached on this pod plus the self-stop waiter (2026-11-09).
 #   ssh ... "RUN_DIR=/workspace/B B_EPOCHS=128 bash -s" < launch_B.sh
 # Log: /workspace/logs/gpu_B.txt ("B rc N" then "exit N" at the end).

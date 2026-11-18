@@ -1,0 +1,23 @@
+{
+ "name": "pa16_s2",
+ "data": "/root/slices/A16",
+ "layers": 4,
+ "d_model": 96,
+ "heads": 3,
+ "d_mlp": 192,
+ "window": 1024,
+ "params": 609523,
+ "patch": 1,
+ "trunk_steps": 9508535,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15990385,
+ "tf_bits": 38734481.26106971,
+ "cmix_bits": 35927024.79896886,
+ "mix_bits": 32974333.590899378,
+ "tf_bpc": 2.422360766239819,
+ "cmix_bpc": 2.2467892298383596,
+ "mix_bpc": 2.062135063721066,
+ "train_seconds": 11720.616547107697
+}

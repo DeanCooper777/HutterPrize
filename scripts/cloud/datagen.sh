@@ -1,4 +1,14 @@
 #!/bin/bash
+# datagen.sh: generate the transformer's training data with the compressor itself.
+# Where it fits: first step of retraining. The compressor's test options dump (a) the token
+# stream and PPMD's distribution for every token (inputs of the transformer) and (b) cmix's
+# per-bit predictions made without the transformer (the target-side input of the cmix-aware
+# mixture loss, cmix-T-dwc/pysrc/cmix_loss.py). cmix-T-dwc/pysrc/data.py reads these files.
+# Inputs and outputs are listed below.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Training-data generation on a Linux CPU pod (docs/NEW_TRANSFORMER_PLAN.md).
 #
 # Layout on the network volume (/workspace):
@@ -28,6 +38,7 @@ LOCAL=/root/run
 CLANG=clang++-22
 mkdir -p "$DATA" "$LOCAL" "$W/logs"
 
+# Build the compressor from the uploaded sources and unpack / verify the stream to code.
 build() {
   if ! command -v $CLANG > /dev/null; then
     apt-get update
@@ -38,7 +49,7 @@ build() {
   fi
   rm -rf "$LOCAL/src" && mkdir -p "$LOCAL/src"
   tar xzf "$U/src.tar.gz" -C "$LOCAL/src"
-  cd "$LOCAL/src/fx2-cmix-T"
+  cd "$LOCAL/src/cmix-T-dwc"
   make CC=$CLANG CFLAGS_DEFINES="-DSEED=923 -DUPDATE_LIMIT=3000" cmix
   cp cmix "$LOCAL/cmix"
   [ -f "$U/stream.bin" ] || gunzip -k "$U/stream.bin.gz"
@@ -78,6 +89,8 @@ print('cmix bits differ from Windows (training target only): max |dlogit| %.3f, 
   fi
 }
 
+# PPMD priors and tokens for the whole stream in one run (only PPMD runs: --ppmd-only), then
+# check that the token stream is the expected one and the file sizes agree.
 ppmd() {
   local d=$LOCAL/ppmd
   rm -rf "$d" && mkdir -p "$d" && cd "$d"
@@ -128,6 +141,8 @@ bits() {
   [ -n "${ONLY:-}" ] || bits_concat "$K"
 }
 
+# Join the chunks into one file, dropping each chunk's warm-up part (16 bytes per token:
+# 8 float16 logits).
 bits_concat() {
   local K=${1:-4} d=$LOCAL/bits N
   N=$(stat -c %s "$U/stream.bin")

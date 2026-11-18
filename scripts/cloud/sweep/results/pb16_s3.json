@@ -1,0 +1,23 @@
+{
+ "name": "pb16_s3",
+ "data": "/root/slices/B16",
+ "layers": 8,
+ "d_model": 128,
+ "heads": 4,
+ "d_mlp": 256,
+ "window": 1024,
+ "params": 1540588,
+ "patch": 1,
+ "trunk_steps": 10075975,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15992856,
+ "tf_bits": 4912829.516212501,
+ "cmix_bits": 6829339.678110922,
+ "mix_bits": 2996544.7451232583,
+ "tf_bpc": 0.30718900465385923,
+ "cmix_bpc": 0.4270243962748693,
+ "mix_bpc": 0.18736770625104474,
+ "train_seconds": 11318.093529462814
+}

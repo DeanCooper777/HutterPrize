@@ -1,3 +1,19 @@
+# standin_mixer.py: offline check of the idea behind the cmix-aware training loss
+# (cmix-T-dwc/pysrc/cmix_loss.py), done with numpy on enwik6 before any GPU time was spent.
+#
+# Question: if cmix's own per-bit predictions made WITHOUT the transformer and the
+# transformer's byte distribution (turned into per-bit predictions) are combined by a tiny
+# logistic mixer with fixed, fitted weights, how close does that come to the size the real
+# compressor reaches with the transformer? Close enough (see the numbers in
+# docs/NEW_TRANSFORMER_PLAN.md and SUBMISSION.md), so that mixer was used as the differentiable
+# stand-in for cmix in training.
+#
+# Testing: an analysis tool only; not part of the entry.
+# Inputs (dumps written by test options of the compressor on enwik6): the token stream, cmix's
+# bit logits (--no-transformer --save-cmix-bits) and the transformer's probabilities
+# (--save-transformer-probs). Output: a table of sizes in bytes on stdout.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
 """Stand-in mixer check on enwik6: how well does a tiny logistic mix of
 cmix-without-transformer (per-bit logits) and the transformer (byte
 distribution -> per-bit probabilities along the path) reproduce the real
@@ -21,6 +37,9 @@ tp = np.fromfile(D + r'\tf\tfprobs.f16', dtype=np.float16).reshape(N, 205)
 p205 = np.ones((N, 205), np.float32)
 p205[1:] = tp[:-1].astype(np.float32)
 p205 = np.maximum(p205, 1e-6)
+# Transformer -> bits: spread the 205 probabilities over the 256 byte values, take cumulative
+# sums, and for each of the 8 bits of the actual byte form P(bit = 1 | bits so far) as a ratio
+# of interval masses. This is the numpy counterpart of CmixMixtureLoss.bit_logits.
 p256 = np.zeros((N, 256), np.float32)
 p256[:, vocab] = p205
 cs = np.zeros((N, 257), np.float64)
@@ -40,6 +59,7 @@ for j in range(8):
 y = bits.astype(np.float64)
 
 
+# Ideal code length, in bytes, of the actual bits under the given logits.
 def cost_bytes(logit):
     x = np.where(y == 1, logit, -logit)
     return np.logaddexp(0, -x).sum() / np.log(2) / 8
@@ -73,6 +93,9 @@ def fit_mix(ctx, nctx, feats, iters=30):
     return np.einsum('nkf,nkf->nk', feats, W[ctx])
 
 
+# The stand-in mixers: inputs are (cmix logit, transformer logit, 1), weights chosen per
+# context. The second one (bit position x cmix confidence, 64 contexts) is the one training
+# uses by default.
 ones = np.ones_like(lc)
 feats = np.stack([lc, lt, ones], -1).astype(np.float64)
 pos = np.broadcast_to(np.arange(8), (N, 8))

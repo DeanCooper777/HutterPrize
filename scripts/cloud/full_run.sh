@@ -1,4 +1,13 @@
 #!/bin/bash
+# full_run.sh: full-length single-core coding of the whole preprocessed enwik9 stream, one
+# process per transformer weight set, side by side. Used to compare weight sets on the full
+# file (the split estimate of split_eval.sh only gives differences) and to calibrate against a
+# real run. Uses the compressor's test options -n --raw-stream --official-vocab --transformer.
+# Inputs: the stream and TAG:weights pairs. Outputs: /workspace/full9/TAG.{size,log}.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Full single-process enwik9 runs on a CPU pod (2026-11-09): code the whole
 # preprocessed stream (upload/stream.bin, the Windows build's -e stream) with
 # --raw-stream, one process per weight set, in parallel (one core each).

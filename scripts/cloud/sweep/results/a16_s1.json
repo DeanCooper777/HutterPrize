@@ -1,0 +1,21 @@
+{
+ "name": "a16_s1",
+ "data": "/root/slices/A16",
+ "layers": 2,
+ "d_model": 64,
+ "heads": 2,
+ "d_mlp": 128,
+ "window": 1024,
+ "params": 114087,
+ "epochs": 150,
+ "lr": 0.0005,
+ "batch_tokens": 131072,
+ "scored_tokens": 15990385,
+ "tf_bits": 41178279.79334045,
+ "cmix_bits": 35927024.79896886,
+ "mix_bits": 34351749.482045285,
+ "tf_bpc": 2.5751900153336176,
+ "cmix_bpc": 2.2467892298383596,
+ "mix_bpc": 2.148275321829042,
+ "train_seconds": 8008.86400437355
+}

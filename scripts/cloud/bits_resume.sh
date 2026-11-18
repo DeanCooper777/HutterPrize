@@ -1,4 +1,11 @@
 #!/bin/bash
+# bits_resume.sh: one-off recovery helper for the cmix bit dump (datagen.sh bits): runs the
+# chunks that were still missing, waits for one that was already running, and joins them.
+# Output: data/cmix-bits.float16 on the volume, the target-side input of the mixture loss.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # One-off (2026-11-07): run chunks 0-10 of `datagen.sh bits 12` while the
 # already-running chunk 11 (pid $1) finishes, mark it done, then concatenate.
 cd /workspace

@@ -1,4 +1,10 @@
 #!/bin/bash
+# launch_split.sh: start split_eval.sh (the chunked enwik9 size estimate for one weight set)
+# detached on a many-core CPU machine and arrange for the machine to stop when it is done.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Start split_eval.sh detached on this pod plus the self-stop waiter.
 #   ssh ... "TAG=base WEIGHTS=/workspace/split/w/6m-q4-fp32.tfwc2 bash -s" < launch_split.sh
 set -u

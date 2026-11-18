@@ -1,0 +1,11 @@
+base /workspace/tier0/ckpt/base.tch 6m-q4-fp32-upstream
+ext /workspace/ext/models/6m-q4-fp32-A.tch 6m-q4-fp32-ext
+Afull /workspace/full/models/6m-q4-fp32-A.tch 6m-q4-fp32-Afull
+Aopt /workspace/opt/models/6m-q4-fp32-A.tch 6m-q4-fp32-Aopt
+v1a /workspace/v1a/models/6m-q4-fp32-A.tch 6m-q4-fp32-v1a
+v1b0 /workspace/v1b0/models/6m-q4-fp32-A.tch 6m-q4-fp32-v1b0
+v1b3 /workspace/v1b3/models/6m-q4-fp32-A.tch 6m-q4-fp32-v1b3
+p2c /workspace/p2c/models/6m-q4-fp32-A.tch 6m-q4-fp32-p2c A_MLP_BITS=3
+p2b /workspace/p2b/models/6m-q4-fp32-A.tch 6m-q4-fp32-p2b A_DMLP=512
+p2a /workspace/p2a/models/6m-q4-fp32-A.tch 6m-q4-fp32-p2a A_DMLP=384
+B /workspace/tier0/ckpt/B.tch 6m-q4-fp32-B A_DMLP=384

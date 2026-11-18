@@ -1,3 +1,10 @@
+# split_enwik9.py: cut the standard test prefixes enwik4 .. enwik8 out of enwik9.
+#
+# Testing: a development helper only. Almost every experiment in this entry was first scored
+# on enwik6 / enwik7 (the first 10^6 / 10^7 bytes) before anything was run on the full file.
+# Input: enwik9. Output: data/enwikN. Not used by the submitted programs.
+#
+# Changes from the previous winning entry (fx2-cmix-transformer-v1): New in this entry.
 """Create smaller test files from enwik9.
 
 By default writes the standard prefixes enwik4 .. enwik8 (the first 10^N

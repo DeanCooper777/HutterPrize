@@ -1,3 +1,10 @@
+# bench_loader.py: time the training data loader (cmix-T-dwc/pysrc/data.py) without the model.
+# Used to find out whether training was limited by disk reads rather than by the GPU.
+# Inputs: the training data under data/. Output: seconds per batch on stdout.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Time the training data loader alone (no model): seconds per batch of
 # 8 micro batches x 2**17 tokens, and the raw priors read inside it.
 # Run from /workspace/train: uv run python /workspace/scripts/bench_loader.py

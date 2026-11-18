@@ -1,4 +1,12 @@
 #!/bin/bash
+# bench_gpu.sh: measure the training speed of the cmix-aware fine-tune recipes on one GPU.
+# Used to choose which GPU type to rent and which micro-batch size / gradient-checkpointing
+# setting to train with. Inputs: the staged training data and the code under /workspace/opt.
+# Output: one line per configuration (seconds per step, peak GPU memory) on stdout.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Step-time benchmark of run A's optimized recipes on this pod's GPU, for the
 # GPU price comparison (2026-11-07). Stages the data first if needed, then
 # runs each configuration for a few minutes and records the steady s/it and
@@ -24,6 +32,8 @@ echo "OMP_NUM_THREADS=$OMP_NUM_THREADS nproc=$(nproc) cpu.max=$(cat /sys/fs/cgro
 PY=$W/train/.venv/bin
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# Run one recipe for a fixed time in the background, poll the GPU memory, then pull the last
+# progress-bar rate out of its log.
 bench() {  # recipe ckpt micro_tokens seconds
   local recipe=$1 ckpt=$2 micro=$3 secs=$4 log=/root/bench_$1_$2_$3.log peak=0 m
   TRAIN_GRAD_CKPT=$ckpt TRAIN_MICRO_TOKENS=$micro timeout "$secs" \

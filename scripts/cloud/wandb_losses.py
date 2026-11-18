@@ -1,3 +1,9 @@
+# wandb_losses.py: print the training loss at fixed steps from offline Weights & Biases logs,
+# to compare the loss curves of training runs without uploading anything.
+#
+# Testing: an experiment / testing tool for rented cloud machines; not part of the submitted
+# programs. New in this entry.
+# (Original notes follow.)
 # Print the logged training loss of offline wandb runs at the given steps.
 #   python wandb_losses.py RUN_DIR [RUN_DIR ...]
 # (RUN_DIR = wandb/offline-run-*; reads the .wandb protobuf log directly)
