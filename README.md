@@ -2,16 +2,20 @@
 
 **cmix-T-dwc** compresses enwik9 (the first 10^9 bytes of the English Wikipedia, the file of the
 [Hutter Prize](http://prize.hutter1.net/)) to **99,395,679 bytes** in total (compressor +
-self-extracting archive), **1.025% below the current record**.
+self-extracting archive), **1.025% below fx2-cmix-T (100,424,672 bytes)**, the record it was built
+to beat. It was never submitted: cmix-neif 2.0 has since reached 93,388,956 bytes, about 7% below
+that record and well below this entry. cmix-neif 2.0 is not an official record yet, but the
+contest's discussion group names it as the entry currently in the lead (status as of 18 Nov 2026).
 
 | | |
 |---|---|
 | Program | **cmix-T-dwc** |
 | Authors | Dean W. Cooper, Claude Code AI |
 | Total size S = comp9 + archive9 | 3,264,852 + 96,130,827 = **99,395,679 bytes** |
-| Previous record | 100,424,672 bytes: fx2-cmix-T (Vladimir Ivanov, 24 Jul 2026, 11th prize winner) |
+| Record it was measured against | 100,424,672 bytes: fx2-cmix-T (Vladimir Ivanov, 24 Jul 2026, 11th prize winner) |
+| Smaller since | 93,388,956 bytes: cmix-neif 2.0 (Marcus Woelk), not official yet; see the related repository below |
 | Platform | Linux x86-64 (AVX2), one core, under 10 GB RAM |
-| Status | sizes measured; the end-to-end compress / decompress / md5 run of the official build is in progress (see `cmix-T-dwc/SUBMISSION.md`) |
+| Status (18 Nov 2026) | work stopped, never submitted. Sizes are measured, but the end-to-end compress / decompress / md5 run of the final official build was started on 15 Nov and aborted; only the first version (10 Nov, S = 100,028,258) was decompressed and verified end to end (see `cmix-T-dwc/SUBMISSION.md`) |
 | License | GPL-3.0 (`LICENSE`) |
 
 > **Related repository: [HutterPrize2](https://github.com/DeanCooper777/HutterPrize2).** Our later
@@ -23,7 +27,7 @@ self-extracting archive), **1.025% below the current record**.
 
 ## What it is
 
-cmix-T-dwc is built on **fx2-cmix-T**, the current record holder: fx2-cmix by Kaido Orav and Byron
+cmix-T-dwc is built on **fx2-cmix-T**, the record holder when this work was done: fx2-cmix by Kaido Orav and Byron
 Knoll (the cmix family of context-mixing compressors) with its LSTM replaced by a 6M-parameter
 quantized transformer (<https://github.com/astOwOlfo/fx2-cmix-transformer-v1>, imported at commit
 `83f2603`). The model architecture, the preprocessing and the cmix models are theirs and unchanged.
