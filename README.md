@@ -24,6 +24,8 @@ contest's discussion group names it as the entry currently in the lead (status a
 > verification decode and a parallel split evaluation) that turn a four-day compress-and-check
 > cycle into a few hours. It does not change the compressed size and is not a contest entry. The
 > patch and working notes for that work are also kept here under `neif/` and `runs/neif-par/`.
+>
+> **This project is closed.** What we take from it is in [REFLECTIONS.md](REFLECTIONS.md).
 
 ## What it is
 
