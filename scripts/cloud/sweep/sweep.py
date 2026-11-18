@@ -27,15 +27,20 @@ from pysrc.logger import LoggerConfig
 E = os.environ.get
 
 
-def make_model(layers: int, d_model: int, heads: int, d_mlp: int, window: int, max_len: int) -> Transformer:
+def make_model(layers: int, d_model: int, heads: int, d_mlp: int, window: int, max_len: int,
+               depth: int = 0) -> Transformer:
     pattern = ([True, True, True, False] * layers)[:layers]
     pattern[-1] = False  # the last layer is a window-attention layer, as in the 12-layer model
+    # depth > layers: a deeper network over the same `layers` weight sets; the last
+    # (depth - layers) sets are applied a second time (more compute, no more weights)
+    depth = max(depth, layers)
+    share = list(range(layers)) + list(range(2 * layers - depth, layers))
     return Transformer(
         TransformerConfig(
             vocabulary_size=205, prior_embedding=True, prior_logit_mixing=False,
-            max_variable_sequence_length=max_len, n_layers=layers,
-            attention_weight_sharing_pattern=list(range(layers)),
-            mlp_weight_sharing_pattern=list(range(layers)),
+            max_variable_sequence_length=max_len, n_layers=depth,
+            attention_weight_sharing_pattern=share,
+            mlp_weight_sharing_pattern=share,
             d_model=d_model, kimi_linear=pattern, window_size=window, window_size_multipliers=None,
             n_query_heads=heads, n_key_value_heads=heads, d_head=d_model // heads, d_mla=None,
             rope_base=10_000, half_truncate_rope=False, query_key_norm=True, query_key_norm_gain=False,
@@ -69,7 +74,11 @@ def main() -> None:
     warmup_epochs = int(E("S_WARMUP", str(max(1, epochs // 5))))
     device = torch.device("cuda", 0)
 
-    raw_model = make_model(layers, d_model, heads, d_mlp, window, 2**17).to(device)
+    # a run name ending in _dNN asks for NN layers over the `layers` weight sets (see make_model)
+    import re
+    mdepth = re.search(r"_d(\d+)$", name)
+    depth = int(mdepth.group(1)) if mdepth else int(E("S_DEPTH", "0"))
+    raw_model = make_model(layers, d_model, heads, d_mlp, window, 2**17, depth).to(device)
     patch = E("S_PATCH", "0") != "0"
     if patch:
         # token-step variant (pysrc/patch.py): the layers run once per token of 1 to 4 bytes
@@ -152,7 +161,7 @@ def main() -> None:
             y = pure.path_bits[tg]
             cm += float(torch.where(mask, binary_cross_entropy_with_logits(lc, y, reduction="none").sum(1), 0.0).sum())
             n += int(mask.sum())
-    r = {"name": name, "data": data_dir, "layers": layers, "d_model": d_model, "heads": heads, "d_mlp": d_mlp,
+    r = {"name": name, "data": data_dir, "layers": layers, "depth": max(depth, layers), "d_model": d_model, "heads": heads, "d_mlp": d_mlp,
          "window": window, "params": params, "patch": int(patch), "trunk_steps": steps, "epochs": epochs, "lr": lr, "batch_tokens": batch_tokens,
          "scored_tokens": n, "tf_bits": tf / log(2), "cmix_bits": cm / log(2), "mix_bits": mix / log(2),
          "tf_bpc": tf / log(2) / n, "cmix_bpc": cm / log(2) / n, "mix_bpc": mix / log(2) / n,

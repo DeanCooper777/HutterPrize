@@ -83,3 +83,69 @@ two. Size where one more parameter stops paying (3.5 bits/param, weights counted
 Limits: no quantization; 3.5 bits/param assumed; 75 epochs on 64 MB against 150 on 16 MB, which
 is confounded with data size in a and m; C for the full stream is an estimate from the region
 profile, not a sum; one prose region only; our stream, not cmix-neif's; time limit not modelled.
+
+## Corrections after independent review (2026-11-16)
+
+- The fit is flat between about 4 M and 9 M parameters and cannot rank them: under the fit itself,
+  going from 6.2 M to 9.3 M loses about 0.1-0.3 MB net. "The range the current entries use" was too
+  strong for cmix-neif's 9.3 M.
+- `trunk_steps` of the token runs counts the padding of each micro batch as one-byte tokens. On A64
+  the padding is 2,979,085 positions, so the real token-step count is about 37.03 M for 64.0 M
+  bytes: 42.1 % fewer steps, not 37.5 %.
+- Transformer alone (before mixing with cmix) the token model is further behind its byte twin than
+  the mixed numbers show: 4.2 % on A16 (2.2766 vs 2.1852) and 7.1 % on A64 (2.1355 vs 1.9940) at
+  the s3 size. The mixed gaps were 0.5 % and 1.5 %.
+- Runs are single and unseeded; gaps under about half a percent may be noise (a replicate is in
+  the follow-up).
+- The sweep never spent the saved compute on something free of weights; a wider trunk costs
+  weights, which is what the real target is short of.
+
+## Follow-up (64 MB prose slice, started 2026-11-16 04:02 CST)
+
+| run | what | question |
+|---|---|---|
+| a64_s3_e150 | byte, 1.24 M, 150 epochs | effect of epochs on the fit |
+| pa64_s3_e150 | token, same trunk, 150 epochs | does the gap to byte steps close with training |
+| pa64_s35_e75 | token, 2.30 M, 75 epochs | equal compute by a wider trunk; pass line: mix <= 1.7428 bits/byte (net tie with a64_s3); expected to miss |
+| pa64_s3_d14 | token, s3 trunk run 14 layers deep over its 8 weight sets, 75 epochs | equal compute AND equal parameters to a64_s3: the arm that matches a time-limited, weight-charged target |
+| pa64_s2_e75 | token, 0.61 M, 75 epochs | token vs byte (a64_s2) at the size nearest the slice optimum |
+| a64_s3_r2 | byte, 1.24 M, 75 epochs, repeat of a64_s3 | noise floor |
+
+pa64_s35_e150 was stopped at 16 %: its answer follows from the 75-epoch run and the pass line.
+
+| run | step | params | tf bpc | mix bpc | coded B | net B |
+|---|---|---:|---:|---:|---:|---:|
+| pa64_s2_e75 | token | 609,523 | 2.2731 | 1.9715 | 15,771,596 | 16,304,929 |
+| pa64_s35_e75 | token | 2,304,604 | 2.0643 | 1.8407 | 14,725,304 | 16,741,832 |
+| a64_s3_r2 | byte | 1,238,892 | 1.9867 | 1.8561 | 14,848,363 | 15,932,394 |
+| pa64_s3_d14 | token | 1,540,603 | 2.1369 | 1.8855 | 15,083,939 | 16,431,967 |
+| a64_s3_e150 | byte | 1,238,892 | 1.9407 | 1.8290 | 14,631,725 | 15,715,755 |
+| pa64_s3_e150 | token | 1,540,588 | 2.0900 | 1.8604 | 14,882,847 | 16,230,861 |
+
+All six finished 2026-11-16 11:50 CST; machine deleted (7.9 h, about $21).
+
+### Reading
+
+- Noise floor (a64_s3 vs a64_s3_r2): 26,369 B, 0.18 % mixed, 0.37 % transformer alone.
+- Wide token model at equal compute: 1.8407, pass line 1.7428: missed. Coded 1.0 % better than
+  the byte model (7.1 % on 16 MB), 783 k worse net of weights.
+- Token vs byte, same trunk: s2 size +0.46 % (tf alone +4.6 %); s3 size +1.5 % at 75 epochs
+  (tf alone +7.1 %) and +1.7 % at 150 epochs (tf alone +7.7 %). More training does not close it.
+- 14 layers over the 8 weight sets: 20 k better than the 8-layer token model, inside the noise.
+- Epochs: the byte s3 model gains 1.6 % (243 k B) from 75 to 150 epochs. With both slices at 150
+  epochs the two-term fit for s3 becomes a = 0.1456, m = 77 k B (was 0.1265 and 163 k): more of
+  the gain scales with data than the first fit said, so the first fit understates the optimum
+  size by an unknown amount (only one size was rerun). "Cannot rank 4 M against 9 M" stands.
+
+### Wording after the second review (2026-11-16)
+
+- The conclusion is about THIS token design at this scale, not token steps in general: here the
+  trunk predicts only the first byte of a token (usually the space) and the word-code bytes come
+  from a one-layer head on a stale trunk state; the transformer-alone gap is probably that head.
+  The gap range is 0.5-1.7 %, growing with size; the noise floor rests on one pair of runs.
+- The wide model's pass line is specific to the 64 MB slice: it codes 149,428 B better for
+  932,498 B more weights, break-even at 6.2x the data; the full stream is 7-9x, so at target
+  scale it would be about a tie. A byte model is still far better per parameter.
+- Resizing is not pursued because finding the optimum is not affordable for this purpose, not
+  because the sweep showed it is worthless (the fit cannot rank 4 M against 9 M).
+- cmix-neif 2.0 time limit: 54.52 h (T = 1,284) against 49.18 h compress, about 9.5 % headroom.

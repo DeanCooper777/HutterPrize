@@ -7,9 +7,13 @@ kept as a patch against the commit in `BASE_COMMIT`. Everything is behind the co
 
 | file | what it is |
 |---|---|
-| `neif_test.patch` | chunk test mode (`cmix -t STREAM OUT`, env `NEIF_T_START/END/WARM/JSON/TRACE`) and the multi-stage compress-only pipeline (`NEIF_PIPE=2` or `3`, forked stages, byte-identical output) |
+| `neif_test.patch` | all test-time additions (diff of `src/` against the base commit): chunk test mode (`cmix -t`), chunk decoder and verification decode (`cmix -u`), multi-process pipeline (`NEIF_PIPE=2` or `3`, also opt-in in the real compress path), packed dense kernels (`NEIF_PACKED`), threaded speculative decoder (`NEIF_MT`), 16-bit activation paths (`NEIF_ACT16`) |
 | `neif_tokcount.py` | counts how many transformer steps a coarser tokenisation of their coder stream would save |
 
 Build, run and verification scripts are in `runs/wsl-split/neif_*.sh` (an Ubuntu 24.04 chroot
 inside WSL with their pinned toolchain). The model-size and token-step sweep is in
 `scripts/cloud/sweep/` (`RESULTS.md`).
+
+The same modifications are published as a full tree with portable scripts, results and
+documentation at https://github.com/DeanCooper777/HutterPrize2 . Notes: `runs/neif-par/PROGRESS.md`,
+`runs/neif-par/DESIGN.md`, `runs/wsl-split/NEIF_FAST.md`.
