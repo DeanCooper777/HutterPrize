@@ -3,11 +3,19 @@
 Author: Dean W. Cooper, Claude Code AI
 Email: dwc@usa.com
 
-> **Status (2026-11-15):** the model, the settings and the build are final. The sizes below are
-> measured, but not yet in one run: the compressed enwik9 comes from a full-length run of the final
-> model with a test build, and the executable sizes come from the official build. A full
-> compress-and-decompress run of the official build itself is in progress; the lines marked
-> **TBD** come from it. Fill them in before sending.
+> **Status (2026-11-18): work stopped; this entry was never submitted.** cmix-neif 2.0 (Marcus
+> Woelk) has since reached 93,388,956 bytes, about 7% below the record this entry was measured
+> against and well below this entry; it is not an official record yet, but the contest's discussion
+> group names it as the entry currently in the lead. Our later work is on that code base
+> (<https://github.com/DeanCooper777/HutterPrize2>).
+>
+> The model, the settings and the build described here are final. The sizes below are measured,
+> but not in one run: the compressed enwik9 comes from a full-length run of the final model with a
+> test build, and the executable sizes come from the official build. The full
+> compress-and-decompress run of the official build itself was started on 15 Nov and aborted, so
+> the lines marked **not measured** were never filled in, and the cut-down decompressor of the
+> final build was never proven end to end. Only the first entry (11-10) was decompressed and
+> verified.
 
 ## Result
 
@@ -16,7 +24,7 @@ Email: dwc@usa.com
 | Compressor `comp9` (`run/cmix`, self-contained, includes the transformer weights) | 3,264,852 |
 | Self-extracting archive `archive9` (includes the decompressor and the weights) | 96,130,827 |
 | **Total S = len(comp9) + len(archive9)** | **99,395,679** |
-| Previous record (fx2-cmix-T, 2026) | 100,424,672 |
+| Record at the time (fx2-cmix-T, 2026) | 100,424,672 |
 | **Improvement** | **1,028,993 bytes = 1.025%** (the claim threshold is 1%: S ≤ 99,420,425) |
 
 What is inside:
@@ -32,9 +40,9 @@ What is inside:
 
 | | compress | decompress |
 |---|---:|---:|
-| Wall time, official build, one core | **TBD** | **TBD** |
-| Peak RSS | **TBD** | **TBD** |
-| Verified `enwik9_uncompressed` == `enwik9` (md5 e206c3450ac99950df65bf70ef61a12d) | — | **TBD** |
+| Wall time, official build, one core | **not measured** | **not measured** |
+| Peak RSS | **not measured** | **not measured** |
+| Verified `enwik9_uncompressed` == `enwik9` (md5 e206c3450ac99950df65bf70ef61a12d) | — | **not done** (run aborted) |
 
 Platform: **Linux x86-64**. The binary uses only AVX2/FMA/F16C, which the build script checks. Limits for
 the Linux test machine (AMD Ryzen 7, Geekbench 5 T = 1310): 70,000/T ≈ 53 h per program, 10 GB RAM,
@@ -61,7 +69,7 @@ S), and the packer.
 
 ## What this entry is
 
-This entry, **cmix-T-dwc**, builds on **fx2-cmix-T** (the current record: fx2-cmix by Kaido Orav and Byron Knoll, with
+This entry, **cmix-T-dwc**, builds on **fx2-cmix-T** (the record when this work was done: fx2-cmix by Kaido Orav and Byron Knoll, with
 the LSTM replaced by a 6M-parameter quantized transformer; see `README.md` and `writeup.md`). The
 model architecture, the preprocessing and the cmix models are unchanged. The gain comes from:
 
@@ -235,9 +243,9 @@ test build packs to about 173 KB per copy. Now: 98,440 bytes in `comp9` and 93,3
 | run (one core) | machine | compress | decompress | peak RSS |
 |---|---|---:|---:|---:|
 | first entry, 11-10 | cloud, AMD EPYC 9655 | 33.8 h | 34.3 h | 10.2 GB (before the PPMD budget) |
-| st2, 11-13 | cloud, AMD EPYC 9654 | 41.2 h | running | 9.10 GB |
-| final model, test build | cloud, AMD EPYC 9654 | running (pace: about 40 h) | — | — |
-| final, official build | laptop, Intel Core Ultra 9 288V (WSL2) | **TBD** | **TBD** | **TBD** |
+| st2, 11-13 | cloud, AMD EPYC 9654 | 41.2 h | result not recorded here | 9.10 GB |
+| final model, test build | cloud, AMD EPYC 9654 | completed (pace: about 40 h; final time not recorded here) | — | — |
+| final, official build | laptop, Intel Core Ultra 9 288V (WSL2) | aborted (started 15 Nov) | not run | not measured |
 
 - The rule is 70,000/T hours per program, with T the Geekbench 5 score of the machine that runs
   it. Measured scores: the EPYC 9655P cloud host 1,762 (39.7 h allowed there), the laptop 1,717
@@ -262,8 +270,8 @@ test build packs to about 173 KB per copy. Now: 98,440 bytes in `comp9` and 93,3
   `-mrecip=none`.
 - **Same stream on Intel and AMD.** See the note under the table of full-length runs.
 - **Decompression verified end to end** for the first entry (11-10: md5 match after 34.3 h). For
-  the final official build: **TBD**. That run is also the end-to-end proof of the cut-down
-  decompressor; until it finishes, the split rests on the call-graph analysis and on start tests
+  the final official build: **not done**; the run was aborted. That run would also have been the
+  end-to-end proof of the cut-down decompressor; without it, the split rests on the call-graph analysis and on start tests
   (the decompressor form starts, extracts and verifies its dictionary, and decodes a small file).
 - **Dynamic linking.** As upstream, the binary uses the machine's libc and libstdc++.
 - **Also verified on Windows** (first entry). A Windows build of the same code produced an archive
@@ -356,14 +364,13 @@ size than it saved in weight bytes, and every growth cost more than it gained.
   submission pipeline (<https://github.com/astOwOlfo/fx2-cmix-transformer-v1>).
 - This entry's changes are listed above. Licensed under GPL-3.0, as the original (`LICENSE`).
 
-## Before sending (checklist)
+## Not sent
 
-- [ ] Fill in the **TBD** times, peak RSS and the verification line from the full run of the
-      official build, and replace the status note at the top.
-- [ ] Confirm that run's `comp9` and `archive9` sizes equal the Result table (3,264,852 and
-      96,130,827).
-- [x] Commit the submitted weights as `models/6m-q4-fp32.tfwc2` (C2, 2026-11-15).
-- [ ] Publish the source (public repo or release), with `comp9` and `archive9` as downloadable
-      assets.
-- [ ] Add the author's name and contact details, and email the entry as described on
-      <http://prize.hutter1.net/hrules.htm>.
+This entry was never submitted (see the status note at the top). What was still open when work
+stopped:
+
+- The full compress-and-decompress run of the official build: times, peak RSS, the md5
+  verification, and confirmation that its `comp9` and `archive9` sizes equal the Result table
+  (3,264,852 and 96,130,827).
+- `comp9` and `archive9` as downloadable assets (the source is public in this repository; the
+  submitted weights are committed as `models/6m-q4-fp32.tfwc2`, C2, 2026-11-15).
