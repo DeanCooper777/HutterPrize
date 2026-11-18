@@ -14,6 +14,13 @@ self-extracting archive), **1.025% below the current record**.
 | Status | sizes measured; the end-to-end compress / decompress / md5 run of the official build is in progress (see `cmix-T-dwc/SUBMISSION.md`) |
 | License | GPL-3.0 (`LICENSE`) |
 
+> **Related repository: [HutterPrize2](https://github.com/DeanCooper777/HutterPrize2).** Our later
+> work on cmix-neif 2.0 (by Marcus Woelk; total size 93,388,956 bytes) is published there:
+> cmix-neif 2.0 with test-time speed modes (packed dense kernels, a multi-process pipeline, a
+> verification decode and a parallel split evaluation) that turn a four-day compress-and-check
+> cycle into a few hours. It does not change the compressed size and is not a contest entry. The
+> patch and working notes for that work are also kept here under `neif/` and `runs/neif-par/`.
+
 ## What it is
 
 cmix-T-dwc is built on **fx2-cmix-T**, the current record holder: fx2-cmix by Kaido Orav and Byron
